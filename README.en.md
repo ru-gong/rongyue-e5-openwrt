@@ -1,53 +1,54 @@
-# Rongyue E5 · Portable OpenWrt with on-device controls
+# Rongyue E5 · Portable OpenWrt Wi-Fi
 
-[中文](README.md) · [Shareable introduction](docs/project-intro.en.md) · [中文项目介绍](docs/project-intro.zh-CN.md)
+[中文](README.md) · [Project introduction](docs/project-intro.en.md)
 
-An E5 portable network device that runs OpenWrt, exposes status and OpenClash controls on its own screen, and retains Android. This repository collects the local integration code, development history, device validation notes, and screenshots, building on [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and other upstream projects.
+OpenWrt network management and on-device controls for the Rongyue E5: share a cellular connection over Wi-Fi, check signal and data usage, control OpenClash from the built-in screen, and switch between Android and OpenWrt.
 
-## What the device currently does
+## Features
 
-- **Cellular Wi-Fi hotspot:** China Unicom SIM2 is the current uplink. A phone with its own mobile data disabled was tested through the E5 hotspot against domestic and overseas websites.
-- **On-device status:** connection state, 5G signal and band, data usage, battery, memory, and temperatures.
-- **OpenClash on the screen:** direct, GFW-list, mainland-whitelist, and global routing modes; node selection; manual HTTPS latency tests. Saved choices take effect through the existing core API.
-- **Android and OpenWrt switching:** use the E5 screen to switch from OpenWrt to Android, and the Magisk module's **Action** button to return from Android to OpenWrt. Routine switching after installation needs no computer, microSD card, or reflashing.
+- **Portable hotspot:** share the cellular connection with phones, computers and other devices connected to the E5's Wi-Fi.
+- **On-device status:** view connectivity, signal strength, radio band, data usage, battery level, temperatures and memory usage.
+- **OpenClash screen controls:** change routing modes, select a proxy and run manual HTTPS latency checks.
+- **System switching:** reboot into Android from the OpenWrt screen, then use a Magisk module in Android to reboot back into OpenWrt.
 
-![E5 interface overview](docs/images/e5-interface-overview.png)
+![Overview, signal, OpenClash, data usage and system-switch screens](docs/images/e5-interface-overview.png)
 
-## Explore the project
+## Control OpenClash on the device
 
-| Topic | Entry |
+Open **Apps → OpenClash** to see the service status, routing mode and selected proxy. Use touch or the direction and confirm keys to:
+
+- Switch between **Direct, GFW, Mainland whitelist and Global** modes.
+- Select a proxy from the list; the selection is saved and applied automatically.
+- Choose **Test all** to see each proxy's HTTPS request latency and test time.
+
+Mode and proxy changes do not require a device reboot. Latency tests run on request and do not automatically select a different proxy.
+
+![OpenClash status, routing controls and proxy selection](docs/images/e5-openclash-focus.png)
+
+## Switch between Android and OpenWrt
+
+| Direction | Control |
 | --- | --- |
-| Introduction to send with the screenshots | [English](docs/project-intro.en.md) / [中文](docs/project-intro.zh-CN.md) |
-| OpenClash screen integration and build | [Component](components/openclash-screen/README.md) |
-| System-switch behavior and implementation boundaries | [System switch](components/system-switch/README.md) |
-| Installation, recovery, and development history | [Timeline](docs/history/timeline.en.md) / [中文](docs/history/timeline.zh-CN.md) |
-| Historical development source | [Source archive](archive/README.md) |
-| Tests and remaining work | [Validation](docs/validation.md) |
-| Attribution and licensing | [Third-party notices](THIRD_PARTY_NOTICES.md) |
+| OpenWrt → Android | Built-in screen: Advanced → System → Switch to Android |
+| Android → OpenWrt | Magisk → Modules → E5 System Switch · Enter OpenWrt → Action |
 
-## Repository scope
+Switching reboots the device and interrupts its hotspot connection. Once installation is complete, routine switching needs no computer, microSD card or reflashing.
 
-`components/openclash-screen/` contains the screen plugin used on the device. `components/system-switch/reference/` preserves sanitized checks and rollback logic but **exits immediately and cannot be installed as a working module**. `archive/` contains development source and a version index; historical code is not a current deployment recipe.
+## Documentation and source
 
-The repository excludes Android/baseband firmware, partition images, NV calibration data, real proxy configurations, SSH credentials, device identities, and raw private backups. Upstream firmware, the base screen application, and third-party cores are referenced by source and license. This is not a complete firmware image or a universal flashing package.
+- **Project introduction:** [English](docs/project-intro.en.md) / [中文](docs/project-intro.zh-CN.md)
+- **OpenClash screen plugin:** [Source, build instructions and compatibility requirements](components/openclash-screen/README.md)
+- **System switching:** [Usage and implementation reference](components/system-switch/README.md)
+- **Development history:** [English timeline](docs/history/timeline.en.md) / [中文记录](docs/history/timeline.zh-CN.md)
+- **Development source:** [Source catalog by stage](archive/CATALOG.md) · [Host tools and tests](tools/README.md)
+- **Validation:** [Device tests, known issues and screenshot notes](docs/validation.md)
 
-## Validation status
+## Project status
 
-As of **2026-10-20**, hotspot connectivity, OpenClash routing/node operations, screen display, round-trip system switching, and ordinary reboot behavior have been verified on this device. SIM2 is currently usable. SIM1 was not detected after a later recovery and requires another physical check. Actual SMS reception and sustained use with USB disconnected remain unverified.
+This repository documents the integration and development work on one Rongyue E5. Known storage reliability issues and remaining tests are detailed in the [validation record](docs/validation.md). Published system-switching code is a sanitized implementation reference; the repository does not provide a complete firmware image or an installable switching module.
 
-The no-microSD arrangement using shared userdata/F2FS and an internal ext4 image has experienced storage corruption. Long-term recurrence remains unresolved. Results from this single device do not establish compatibility or reliability for every E5.
+## Sources and license
 
-## Host-only checks
+The base system and screen UI build on [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and [Enceka/infoscreen](https://github.com/Enceka/infoscreen). This project adds OpenClash screen controls and device-specific system-switching integration using [OpenClash](https://github.com/vernesong/OpenClash), [Mihomo](https://github.com/MetaCubeX/mihomo) and [Magisk](https://github.com/topjohnwu/Magisk).
 
-Requires Python 3.10+, Ruby with YAML/Psych, and a POSIX shell:
-
-```sh
-python3 scripts/check_publication.py
-python3 -m unittest discover -s components/openclash-screen -p 'test_*.py' -v
-```
-
-These checks use temporary files and simulated controllers. They do not connect to an E5 or use real proxy nodes. Additional historical tooling has its own test documentation.
-
-## License and credits
-
-New code and documentation are licensed under the [MIT License](LICENSE). Third-party works retain their own copyright and license; see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) and `LICENSES/`. The base screen UI belongs to its upstream authors. This project's additions are the OpenClash screen integration, node controls, and device-specific switching adaptation.
+Original code and documentation use the [MIT License](LICENSE). Third-party works retain their own copyrights and licenses; see the [third-party notices](THIRD_PARTY_NOTICES.md) for exact versions and attribution.
