@@ -1,6 +1,6 @@
 # From backups to screen controls: the project history
 
-This records work on **one RongYue E5 from 13–20 October 2026**, including successes, stops and recoveries. It describes what happened; it is not an automatic flashing guide or a claim of compatibility with every E5.
+This records work on **one RongYue E5 from 13–21 October 2026**, including successes, stops and recoveries. It describes what happened; it is not an automatic flashing guide or a claim of compatibility with every E5.
 
 The foundation is a [fixed revision of Enceka/e5-linux](https://github.com/Enceka/e5-linux/tree/569f13d4ce15585f70817c2a1e03bb574a84720b). The kernel, cellular support and screen framework come from upstream. This repository collects device-specific execution tools, compatibility fixes, a system-switching wrapper and the OpenClash screen app. The installed build contains documented local changes and is not an unmodified upstream release.
 
@@ -31,5 +31,24 @@ The local wrapper reused [upstream system-switching support](https://github.com/
 [OpenClash](https://github.com/vernesong/OpenClash) and [Mihomo](https://github.com/MetaCubeX/mihomo) were then installed and tested for proxy selection, forwarding, DNS and recovery after disabling the service. The screen app first added four routing modes, then proxy selection and manual HTTPS latency checks. The user confirmed the display on the actual device. Overview, signal, traffic, system-switching and OpenClash screenshots were finally assembled into presentation images without changing the captured status.
 
 The current connection uses China Unicom SIM2. After the earlier dual-SIM success, China Mobile SIM1 was not detected following a later recovery and needs retesting. Actual SMS reception, sustained use without USB and long-term F2FS reliability on the installation without a microSD card remain unverified.
+
+## Late 20 October into 21 October: hotspot password and client controls
+
+The hotspot page gained password editing with QR refresh and a client manager
+showing state, traffic and connection or observation time, with disconnect,
+block and unblock controls. Dedicated bridge counters do not use DHCP lease
+time as connection time or equate local/proxy bytes with cellular billing.
+
+Real counters, disconnection, list synchronization and user password changes
+were observed. One previously tested phone disconnected after the initial
+password hot reload while other phones worked. Complete radio reinitialization
+restored access, so that step and runtime-password verification became part of
+the password path. The exact lower-level cause was not uniquely established.
+
+Version 1.0.3 removes redundant deauthentication and timed bans for persistent
+blocks and passes 19 host-only tests. The separate reconnect-after-unblock
+trial stopped before a new block because its phone was no longer associated;
+the user deferred it. Published validation retains that open result and
+excludes raw credentials, QR codes, device identities and logs.
 
 See [components](../../components/) for implementation code, [archive](../../archive/) for historical tools and materials, and the [project introduction](../project-intro.en.md) for current features. Historical passes apply to the observations made at that time; later evidence can change the current conclusion.

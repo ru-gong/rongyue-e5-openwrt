@@ -18,7 +18,15 @@ jobs:
         run: python scripts/check_publication.py
       - name: Test modes, persistence, rollback and node operations
         run: python -m unittest discover -s components/openclash-screen -p 'test_*.py' -v
-      - name: Build the screen plugin locally
+      - name: Test hotspot credentials, counters, rollback and native ACL behavior
+        run: python -m unittest discover -s components/hotspot-screen -p 'test_*.py' -v
+      - name: Check screen JavaScript and init-service syntax
+        run: |
+          node --check components/openclash-screen/app.js
+          node --check components/hotspot-screen/app.js
+          sh -n components/hotspot-screen/e5-hotspot
+      - name: Build both screen plugins locally
         run: |
           mkdir -p dist
           python components/openclash-screen/build.py dist
+          python components/hotspot-screen/build.py dist

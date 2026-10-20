@@ -10,6 +10,22 @@ The Rongyue E5 OpenWrt project brings a portable Wi-Fi hotspot, on-device networ
 
 The overview shows connectivity, hotspot status, traffic rates, battery level, memory usage and temperatures. The signal page shows network technology, radio band and signal measurements. The data usage page shows daily, monthly and historical usage.
 
+## Manage hotspot credentials and connected clients
+
+Use **Hotspot → Change hotspot password** to edit the password with the screen
+keyboard or physical number keys. Saving reinitializes the radio and refreshes
+the QR code, so clients need to reconnect.
+
+**Hotspot → Manage clients / Blacklist** shows client names, IP/MAC addresses,
+state, upload/download totals and rates, and connection or observation time.
+Clients can be disconnected, blocked or unblocked. Counters start after
+discovery, include proxy/local traffic, reset after restart, and do not replace
+cellular billing records.
+
+See the [hotspot plugin guide](../components/hotspot-screen/README.md) for the
+implementation and validation limits. A separate end-to-end reconnection
+after native-ACL unblock remains deferred.
+
 ## Control OpenClash from the screen
 
 Open **Apps → OpenClash** to see the core status, routing mode and selected proxy. Touch controls or the direction and confirm keys provide three main actions:
@@ -40,6 +56,6 @@ Routine switching needs no computer, microSD card or reflashing. The hotspot dis
 
 ## Project and open-source information
 
-The project builds on [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and [Enceka/infoscreen](https://github.com/Enceka/infoscreen), adding OpenClash screen controls and device-specific switching integration. The repository includes plugin source, development history and sanitized implementation references.
+The project builds on [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and [Enceka/infoscreen](https://github.com/Enceka/infoscreen), adding hotspot and OpenClash screen controls and device-specific switching integration. The repository includes plugin source, development history and sanitized implementation references.
 
 Original code and documentation use the [MIT License](../LICENSE). Upstream components retain their own licenses; see the [third-party notices](../THIRD_PARTY_NOTICES.md). This is an integration project for a single device. Known issues, including storage reliability, are documented in the [validation record](validation.md). Published switching code is a reference, not an installable module.

@@ -7,6 +7,7 @@
 ## 主要功能
 
 - **随身热点：** 将蜂窝网络共享给连接 E5 Wi-Fi 的手机、电脑等设备。
+- **热点屏幕管理：** 修改密码并同步二维码，查看连接设备、流量和连接时长，执行踢下线、拉黑与解除。
 - **屏幕状态面板：** 查看网络连接、信号强度、频段、流量、电量、温度和内存使用情况。
 - **OpenClash 屏幕控制：** 切换分流模式、选择代理节点、手动测试 HTTPS 延迟。
 - **双系统切换：** 从 OpenWrt 屏幕重启进入 Android，通过 Android 的 Magisk 模块重启返回 OpenWrt。
@@ -25,6 +26,14 @@
 
 ![OpenClash 状态、模式调整与节点选择](docs/images/e5-openclash-focus.png)
 
+## 管理热点密码和连接设备
+
+打开 **热点 → 修改热点密码**，通过屏幕键盘或实体数字键设置新密码；保存后刷新二维码，客户端需用新密码重新连接。
+
+打开 **热点 → 管理连接设备 / 黑名单**，查看当前设备、上传下载累计与速率，以及连接或观察时长。统计从发现连接后开始，含代理及本地通信，重启清零，不等于运营商计费流量。可踢下线或保存黑名单，也可在黑名单页解除。
+
+当前插件为 **1.0.3-local**；[源码与接入说明](components/hotspot-screen/README.md)包含兼容前提、19 项主机测试及尚待补测的“解除后直接重连”边界。
+
 ## Android 与 OpenWrt 切换
 
 | 切换方向 | 操作入口 |
@@ -38,6 +47,7 @@
 
 - **项目介绍：** [中文](docs/project-intro.zh-CN.md) / [English](docs/project-intro.en.md)
 - **OpenClash 屏幕插件：** [源码、构建与适配要求](components/openclash-screen/README.md)
+- **热点屏幕插件：** [密码、二维码、设备统计与黑名单](components/hotspot-screen/README.md)
 - **双系统切换：** [操作说明与实现参考](components/system-switch/README.md)
 - **开发过程：** [中文记录](docs/history/timeline.zh-CN.md) / [English timeline](docs/history/timeline.en.md)
 - **过程代码：** [分阶段源码目录](archive/CATALOG.md) · [主机工具与测试](tools/README.md)
@@ -49,6 +59,6 @@
 
 ## 来源与许可证
 
-基础系统与屏幕界面基于 [Enceka/e5-linux](https://github.com/Enceka/e5-linux) 和 [Enceka/infoscreen](https://github.com/Enceka/infoscreen)。本项目增加 OpenClash 屏幕控制与本机双系统切换适配，使用 [OpenClash](https://github.com/vernesong/OpenClash)、[Mihomo](https://github.com/MetaCubeX/mihomo) 和 [Magisk](https://github.com/topjohnwu/Magisk) 的相关能力。
+基础系统与屏幕界面基于 [Enceka/e5-linux](https://github.com/Enceka/e5-linux) 和 [Enceka/infoscreen](https://github.com/Enceka/infoscreen)。本项目增加热点及 OpenClash 屏幕控制与本机双系统切换适配，使用 [OpenClash](https://github.com/vernesong/OpenClash)、[Mihomo](https://github.com/MetaCubeX/mihomo) 和 [Magisk](https://github.com/topjohnwu/Magisk) 的相关能力。
 
 新增代码和文档采用 [MIT 许可证](LICENSE)。第三方作品保留各自版权与许可证，具体版本和引用范围见[第三方来源与许可证](THIRD_PARTY_NOTICES.md)。

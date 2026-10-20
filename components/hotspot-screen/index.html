@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>热点管理</title><style>
+*{box-sizing:border-box}body{margin:0;padding:7px;background:#0b0e13;color:#edf2fa;font:14px "Noto Sans CJK SC",sans-serif;cursor:none}button,input{font:inherit}button{background:#192638;color:#edf2fa;border:1px solid #35465e;border-radius:8px;padding:7px 9px;min-height:36px}button:focus,input:focus{outline:2px solid #cde6ff;outline-offset:-2px}button:disabled{opacity:.45}button.active{background:#173e33;border-color:#5dcba3}header{display:flex;justify-content:space-between;align-items:center;font-weight:bold;font-size:17px;margin-bottom:6px}.tabs,.actions{display:flex;gap:5px}.tabs button{flex:1;min-width:0;padding:7px 2px;font-size:12px}.card{background:#151e2b;border:1px solid #29394e;border-radius:10px;padding:8px;margin-top:7px}.sub{color:#a8b8cc;font-size:11px;line-height:1.55;overflow-wrap:anywhere}.title{font-weight:bold;font-size:14px;overflow-wrap:anywhere}.values{font-size:12px;line-height:1.7}.actions{margin-top:6px}.actions button{flex:1;font-size:12px}.danger{color:#ffc7ba;background:#432a2c}#message{font-size:12px;min-height:20px;color:#8fdfba;margin:6px 0;overflow-wrap:anywhere}#message.error{color:#ffc7ba}.empty{padding:16px 5px;color:#a8b8cc;font-size:12px}#qr svg{display:block;width:150px;height:150px;margin:7px auto;background:white;padding:5px}#password{display:block;width:100%;min-height:35px;background:#0b111b;color:#fff;border:1px solid #496581;border-radius:7px;padding:6px;margin:5px 0}#keyboard{display:grid;grid-template-columns:repeat(6,1fr);gap:3px;margin-top:6px}#keyboard button{min-height:29px;padding:3px;font-size:13px}.wide{width:100%;margin:5px 0}#editor[hidden],[hidden]{display:none!important}.hint{font-size:10px;color:#8d9cb2;line-height:1.5;margin:6px 0}#confirm{border:1px solid #f4bc82;background:#372a22;padding:9px;border-radius:9px;margin:8px 0}#confirm-text{font-size:13px;line-height:1.5}.rate{color:#85d6b1}#status{font-size:11px;color:#a9c8e7;font-weight:normal}.name{word-break:break-all}
+</style></head><body>
+<header><span>热点管理</span><span id="status">读取中</span></header>
+<div class="tabs"><button data-tab="password">修改密码</button><button data-tab="devices">连接设备</button><button data-tab="blocked">黑名单</button></div>
+<div id="message" role="status"></div>
+<section id="confirm" hidden><div id="confirm-text"></div><div class="actions"><button id="confirm-yes" class="danger">确认</button><button id="confirm-no">取消</button></div></section>
+<section id="password-pane" hidden>
+ <div class="card"><div class="title" id="ssid">--</div><div class="sub">新密码保存后会自动更新二维码；所有 Wi-Fi 设备需使用新密码重新连接。</div>
+ <button id="edit" class="wide">输入新密码</button>
+ <div id="editor" hidden><input id="password" type="password" readonly maxlength="63" autocomplete="new-password" aria-label="新热点密码"><div class="actions"><button id="show">显示</button><button id="delete">删除</button><button id="clear">清空</button></div>
+ <div class="actions"><button data-layout="lower">abc</button><button data-layout="upper">ABC</button><button data-layout="symbols">符号</button></div><div id="keyboard"></div><button id="save" class="wide">保存并更新二维码</button></div>
+ <div class="sub">8–63 位字母、数字或英文符号；可按实体数字键输入。</div><div id="qr"></div><button id="qr-show" class="wide">查看当前连接二维码</button></div>
+</section>
+<section id="devices-pane" hidden><div id="device-list"></div><div class="hint">↑ 设备上传 · ↓ 设备下载，含代理及本地通信。连接时长优先使用关联事件；已有连接显示“已观察”。统计从发现后开始，重启清零，非运营商计费。每 2 秒更新。</div></section>
+<section id="blocked-pane" hidden><div id="blocked-list"></div><div class="hint">拉黑会断开连接并阻止这个 MAC 再连接；解除后可以重新接入。名单保存到热点配置。</div></section>
+<div class="hint">方向键选择 · 确认操作 · 返回上页</div>
+<script src="/sdk/e5.js"></script><script src="app.js?v=1.0.3"></script></body></html>

@@ -1,6 +1,6 @@
 # 验证记录 / Validation
 
-记录日期 / Record date: **2026-10-20**.
+记录日期 / Record date: **2026-10-21**.
 
 ## Publication checks / 本次发布检查
 
@@ -19,6 +19,16 @@ The screen runtime source matches the local 1.1.1 integration. Publication chang
 
 Independent historical tooling is documented in [tools](../tools/README.md). Its host tests are separate from firmware installation or device acceptance.
 
+The [hotspot screen component](../components/hotspot-screen/README.md), version
+**1.0.3-local**, additionally passes **19 host-only tests**. Coverage includes
+password/MAC input rejection, private backups, configuration conflicts and
+rollback, counter/session baselines, radio stop/start and readiness checks,
+keeping a disabled AP disabled, avoiding redundant deauthentication on normal
+unblock, and clearing a legacy timed ban only when present. Public runtime
+assets match the device-used source; the public builder adds the license,
+notice and separate init-service file. CI builds both screen plugins and checks
+their JavaScript syntax. These publication checks do not contact the device.
+
 The published occupancy scanner passed **128 tests**, with **4 Linux-specific tests skipped** on macOS. The snapshot validator passed **11 tests**. Commands, environment limits and results are recorded in [host validation](../tools/VALIDATION.md).
 
 ## Historical device observations / 历史实机验证
@@ -27,7 +37,7 @@ These are records from the original project, **not new device tests run while pu
 
 | 功能 / Feature | Observed result |
 | --- | --- |
-| Local versions | OpenWrt 25.12.5; OpenClash v0.48.002; Mihomo v1.19.32 ARM64; screen plugin 1.1.1-local; local switch module 1.0.2-local |
+| Local versions | OpenWrt 25.12.5; OpenClash v0.48.002; Mihomo v1.19.32 ARM64; OpenClash screen 1.1.1-local; hotspot screen 1.0.3-local; local switch module 1.0.2-local |
 | Proxy core | Native candidate configuration validation passed; the local CN rules loaded |
 | Two configured proxy nodes | Independent HTTPS delay requests and node selection succeeded; Google returned 204 and Baidu returned 200 after each selection |
 | Routing modes | Four-mode switching and source/UCI readback were exercised; global Google returned 204, while one global-mode Baidu request timed out after 18 seconds |
@@ -37,6 +47,25 @@ These are records from the original project, **not new device tests run while pu
 | Screen | User confirmed the mode controls, both nodes, latency values and test button appeared on the E5 screen |
 | System switching | OpenWrt screen to Android, Android Magisk action back to OpenWrt, default behavior and ordinary reboot had device observations |
 | Configuration preservation | Unrelated hotspot/network configuration and switch implementation were checked against their local baselines |
+
+### Hotspot controls, 20–21 October / 热点管理补充
+
+| Feature | Observation |
+| --- | --- |
+| Screen and counters | The user confirmed client display; real upload/download counters and connection time increased |
+| Disconnect | The selected phone was deauthenticated; the 30-second timed restriction expired, after which the phone was manually reconnected |
+| Block/unblock | Persistent UCI, native hostapd ACL and the dedicated nft set were checked during a controlled block, then cleared; this earlier test used the preceding implementation |
+| Password/QR | The user changed the password; the QR response changed and other phones connected successfully |
+| Phone-specific failure | One previously tested phone connected then disconnected after the initial password hot reload; forgetting the saved network did not resolve it. Full radio reinitialization restored access; the exact lower-level cause was not uniquely established |
+| New password path | Version 1.0.3 includes complete radio reinitialization and runtime-password verification rather than treating a hot reload acknowledgement as success |
+| Short observation | After recovery, the same phone remained connected for about two minutes with increasing counters; domestic HTTP 200 and proxy HTTP 204 checks passed |
+| Preservation | Only the hotspot password changed in wireless configuration; network/OpenClash settings and the protected system-switch implementation matched their baselines |
+
+**Still deferred by the user:** independently reconnecting a real phone after
+the 1.0.3 native-ACL unblock, without changing the password or restarting the
+hotspot. The trial stopped at its no-client precondition before issuing a block.
+Version 1.0.3 removes redundant deauthentication/timed bans for persistent
+blocks. Its host tests are not a substitute for this remaining hardware test.
 
 ## Current limits / 当前边界
 
@@ -48,6 +77,7 @@ The latest evening state supersedes earlier observations where they differ:
 - **Long-term operation:** sustained operation with USB disconnected is not established.
 - **Storage:** F2FS/shared-userdata and the internal ext4 image have suffered recurring corruption. Snapshot preservation and targeted recovery do not establish that the underlying cause is fixed.
 - **Other devices:** these observations do not validate another E5, a different storage layout, arbitrary firmware, or arbitrary OpenClash configuration.
+- **Hotspot unblock:** the independent 1.0.3 reconnection test above remains deferred; the other hotspot observations do not complete it.
 
 ## Screenshots / 截图
 

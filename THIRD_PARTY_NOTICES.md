@@ -6,9 +6,9 @@ Versions and licenses below are tied to the cited source revision, not inferred 
 
 ## 本仓库的授权范围 / Scope of this repository's license
 
-[根目录 MIT 许可证](LICENSE)，Copyright (c) 2026 ru-gong，适用于本项目原创的 OpenClash 屏幕插件、集成与检查工具、测试和整理文档。第三方代码、保留的上游片段和截图所展示的上游界面仍保留其原作者版权及对应许可证。本项目的 MIT 授权不能替代 OpenWrt、Linux、Mihomo、Magisk 等依赖自身的条款，也不为商标、厂商固件或其他未收录材料授予额外权利。
+[根目录 MIT 许可证](LICENSE)，Copyright (c) 2026 ru-gong，适用于本项目原创的热点及 OpenClash 屏幕插件、集成与检查工具、测试和整理文档。第三方代码、保留的上游片段和截图所展示的上游界面仍保留其原作者版权及对应许可证。本项目的 MIT 授权不能替代 OpenWrt、Linux、Mihomo、Magisk 等依赖自身的条款，也不为商标、厂商固件或其他未收录材料授予额外权利。
 
-The root MIT license, Copyright (c) 2026 ru-gong, covers this project's original OpenClash screen plugin, integration and inspection tools, tests, and authored documentation. Third-party code, retained source excerpts, and upstream UI depicted in screenshots keep their original copyrights and licenses. It does not relicense external dependencies, trademarks, vendor firmware, or materials not included here.
+The root MIT license, Copyright (c) 2026 ru-gong, covers this project's original OpenClash and hotspot screen plugins, integration and inspection tools, tests, and authored documentation. Third-party code, retained source excerpts, and upstream UI depicted in screenshots keep their original copyrights and licenses. It does not relicense external dependencies, trademarks, vendor firmware, or materials not included here.
 
 ## 组件与来源 / Components and sources
 
@@ -46,6 +46,8 @@ E5 的上游启动控制 helper 是 Enceka 的 [`magisk/e5-linux-switch/bootctl.
 The boot-control helper comes from Enceka's pinned `bootctl.c`. Its locally recorded binary was unchanged; this repository does not bundle that binary or the device-bound installation ZIP. Local contributions add identity/integrity checks, integration, and documented operation. The underlying E5 Linux adaptation and screen framework are credited to their upstream authors.
 
 OpenClash 屏幕插件的四模式控制、节点选择与 HTTPS 延迟操作依据 [Mihomo API 文档](https://wiki.metacubex.one/en/api/)和 [GLOBAL 策略组文档](https://wiki.metacubex.one/en/config/proxy-groups/built-in/)，调用已有核心接口。本项目是独立的设备集成与记录仓库，不代表这些上游项目的官方发布。
+
+热点插件 `components/hotspot-screen` 为本项目新增代码，调用独立安装的 hostapd、nftables、UCI/ucode 和 infoscreen SDK，不打包这些程序或 SDK。`patch_parent.py` 含少量 Enceka MIT 屏幕 HTML/JS 匹配锚点与上下文，保留原作者权利和上述 MIT 许可证；不包含完整上游界面。原生 ACL/ubus 与桥接计数属于接口使用，没有复制 hostapd 或 nftables 的 GPL 实现代码。具体说明见组件 NOTICE。
 
 The screen plugin uses the documented Mihomo API for modes, proxy selection, and HTTPS delay checks. This is an independent device-integration and documentation project, not an official release of the upstream projects.
 

@@ -7,6 +7,7 @@ OpenWrt network management and on-device controls for the Rongyue E5: share a ce
 ## Features
 
 - **Portable hotspot:** share the cellular connection with phones, computers and other devices connected to the E5's Wi-Fi.
+- **Hotspot screen controls:** change the password and refresh its QR code, view clients, traffic and connection time, disconnect clients, and manage a blacklist.
 - **On-device status:** view connectivity, signal strength, radio band, data usage, battery level, temperatures and memory usage.
 - **OpenClash screen controls:** change routing modes, select a proxy and run manual HTTPS latency checks.
 - **System switching:** reboot into Android from the OpenWrt screen, then use a Magisk module in Android to reboot back into OpenWrt.
@@ -25,6 +26,22 @@ Mode and proxy changes do not require a device reboot. Latency tests run on requ
 
 ![OpenClash status, routing controls and proxy selection](docs/images/e5-openclash-focus.png)
 
+## Manage the hotspot and its clients
+
+Open **Hotspot → Change hotspot password** and use the screen keyboard or
+physical number keys. Saving refreshes the join QR code; clients must reconnect
+with the new password.
+
+Open **Hotspot → Manage clients / Blacklist** to view connected devices,
+upload/download totals and rates, and connection or observation time. Counters
+start after discovery, include proxy/local traffic, reset after restart, and
+are not cellular billing figures. Clients can be disconnected or added to a
+persistent blacklist, with an unblock control in the blacklist tab.
+
+The current plugin is **1.0.3-local**. Its [source and integration guide](components/hotspot-screen/README.md)
+list compatibility requirements, 19 host-only tests, and the deferred separate
+reconnection-after-unblock device test.
+
 ## Switch between Android and OpenWrt
 
 | Direction | Control |
@@ -38,6 +55,7 @@ Switching reboots the device and interrupts its hotspot connection. Once install
 
 - **Project introduction:** [English](docs/project-intro.en.md) / [中文](docs/project-intro.zh-CN.md)
 - **OpenClash screen plugin:** [Source, build instructions and compatibility requirements](components/openclash-screen/README.md)
+- **Hotspot screen plugin:** [Password, QR code, client accounting and blacklist](components/hotspot-screen/README.md)
 - **System switching:** [Usage and implementation reference](components/system-switch/README.md)
 - **Development history:** [English timeline](docs/history/timeline.en.md) / [中文记录](docs/history/timeline.zh-CN.md)
 - **Development source:** [Source catalog by stage](archive/CATALOG.md) · [Host tools and tests](tools/README.md)
@@ -49,6 +67,6 @@ This repository documents the integration and development work on one Rongyue E5
 
 ## Sources and license
 
-The base system and screen UI build on [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and [Enceka/infoscreen](https://github.com/Enceka/infoscreen). This project adds OpenClash screen controls and device-specific system-switching integration using [OpenClash](https://github.com/vernesong/OpenClash), [Mihomo](https://github.com/MetaCubeX/mihomo) and [Magisk](https://github.com/topjohnwu/Magisk).
+The base system and screen UI build on [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and [Enceka/infoscreen](https://github.com/Enceka/infoscreen). This project adds hotspot and OpenClash screen controls and device-specific system-switching integration using [OpenClash](https://github.com/vernesong/OpenClash), [Mihomo](https://github.com/MetaCubeX/mihomo) and [Magisk](https://github.com/topjohnwu/Magisk).
 
 Original code and documentation use the [MIT License](LICENSE). Third-party works retain their own copyrights and licenses; see the [third-party notices](THIRD_PARTY_NOTICES.md) for exact versions and attribution.
