@@ -1,0 +1,80 @@
+"""Reduced-size synthetic source-chain fixtures; no current credentials/results created."""
+import test_sim as s
+import copy,json,datetime as dt,unittest
+from pathlib import Path
+from unittest.mock import patch
+c,e,nv,origin=s.c,s.e,s.nv,s.origin
+BOOT,TX=s.BOOT,s.TX
+class OriginTests(s.Tests):pass
+for n in s.Tests.__dict__:
+ if n.startswith('test_'):setattr(OriginTests,n,None)
+def add(fn):setattr(OriginTests,fn.__name__,fn);return fn
+@add
+def source_fixture(self):
+ b,tr,_=self.fixture();v=c.obj(b);nvdir=self.root/'physical-nv-before';(self.root/'nv').rename(nvdir);deps=c.dependencies();g=origin.render_guard(c.LIVE/'android_directory_adapter.py',deps['first_install_sources']['adapter_sha256'],BOOT);idx=0
+ items=[]
+ for r in self.rows:
+  a={'path':str(nvdir/(r['name']+'.bin')),'bytes':r['bytes'],'sha256':c.sha(self.data[r['name']])};items.append({**r,'artifact':a,'inode':100,'host_dev':200,'two_complete_passes_match':True})
+  for hashed in (False,True):
+   idx+=1;op=f'{idx:032x}';head=f'NV\t{op}\t{BOOT}\t{r["node"]}\t0\t4096\t100 200'.encode();data=(c.sha(self.data[r['name']])+'  -\n').encode() if hashed else self.data[r['name']];raw=head+b'\n'+data+b'\n'+head+b'\n';label='nv-hash-chunk' if hashed else 'nv-read-chunk';p=tr/f'{800000+idx:06d}-{label}-{op}';p.mkdir();argv=e.argv(g+origin.legacy_script(r,0,4096,op,BOOT,hashed))
+   q={'schema':'e5-bounded-transport-v1','status':'COMPLETE','validated':True,'serial':c.SERIAL,'boot_id':BOOT,'txid':TX,'mutating':False,'reconciliation_only':False,'recovery_context':None,'payload_bytes':0,'payload_sha256':c.sha(b''),'deadline_seconds':8,'automatic_retry':False,'op_id':op,'label':label,'argv':argv,'argv_sha256':c.sha(c.canonical(argv)),'stdout_sha256':c.sha(raw),'output_limit':(68 if hashed else 4096)+4096}
+   for name,x in [('COMPLETE.json',q),('IN_FLIGHT.json',{**q,'status':'IN_FLIGHT'}),('stdout.bin',raw),('stderr.bin',b''),('transport-result.json',{'failure':None,'returncode':0,'elapsed_seconds':.01,'host_child_reaped':True,'stdin_bytes_sent':0,'stdout_bytes':len(raw),'stdout_sha256':c.sha(raw),'stderr_bytes':0})]:self.save(p/name,x)
+ v={'schema':'e5-nine-nv-baseline-v1','serial':c.SERIAL,'boot_id':BOOT,'txid':TX,'source_sha256':deps['first_install_sources']['nv_baseline_sha256'],'geometry_sha256':nv.GEOMETRY_SHA,'read_only':True,'device_mutations':0,'approved_to_flash':False,'items':items};b=self.save(nvdir/'COMPLETE.json',v)
+ return b,tr,deps
+@add
+def linux_fixture(self,expected):
+ con=json.loads(c.read(c.HERE/'acceptance-contract.json',origin.CONTRACT_SHA));boot='00000000-0000-4000-8000-000000000001'
+ rows={'identity-observation':{'contract':con,'boot_id':boot},'gpt-prefix':{},'misc-outside32-and-CRC':{},'bootB-outside-diagnostic':{},'NV-upstream-verify':{},'NV-this-boot-source':expected,'NV-working-copy-origin':{'origin_sha256':expected,'origin_matches_this_boot_source':True},'next-boot-status':{'exit_code':0,'stdout':'default boot: android\nnext boot: android\n'},'release-image':{}}
+ for prefix,items in [('protected',con['protected_hashes']),('map',con['partitions']),('runtime-script',con['runtime_scripts'])]:
+  for name in items:rows[prefix+':'+name]={}
+ for n,h in expected.items():
+  mapping={'sysfs_ro':'1','block_ro':1,'loop_backing':'/opt/e5/nv/'+n};rows['NV-first:'+n]={'sha256':h,'this_boot_source_sha256':h,'mapping':mapping};rows['NV-second:'+n]={'sha256':h,'stable_two_reads':True,'mapping':mapping}
+ raw=b''.join(c.canonical({'id':k,'ok':True,'data':v})+b'\n' for k,v in rows.items());return self.save(self.root/'linux.jsonl',raw)
+@add
+def test_first_Android_exact_source_transcript(self):
+ b,tr,deps=self.source_fixture();hashes,digest=origin.first_baseline(b,tr,BOOT,TX,deps);self.assertEqual(hashes,{k:c.sha(v) for k,v in self.data.items()});self.assertTrue(c.validsha(digest))
+@add
+def test_first_Android_producer_changed(self):
+ b,tr,deps=self.source_fixture();v=c.obj(b);v['source_sha256']='f'*64;b=self.save(Path(b['path']),v)
+ with self.assertRaisesRegex(RuntimeError,'source'):origin.first_baseline(b,tr,BOOT,TX,deps)
+@add
+def test_first_Android_missing_full_pass(self):
+ b,tr,deps=self.source_fixture();p=next(p for p in tr.iterdir() if '-nv-hash-chunk-' in p.name);p.rename(p.with_name('unknown'))
+ with self.assertRaisesRegex(RuntimeError,'count'):origin.first_baseline(b,tr,BOOT,TX,deps)
+@add
+def test_first_Linux_exact_fresh_origin(self):
+ expected={r['name']:'a'*64 for r in nv.rows()};b=self.linux_fixture(expected);self.assertEqual(origin.linux_origin(b,expected),'00000000-0000-4000-8000-000000000001')
+@add
+def test_retained_first_origin_rejected(self):
+ expected={r['name']:'a'*64 for r in nv.rows()};b=self.linux_fixture(expected);r=[json.loads(x) for x in c.read(b['path']).splitlines()];next(x for x in r if x['id']=='NV-working-copy-origin')['data']['origin_matches_this_boot_source']=False;b=self.save(Path(b['path']),b''.join(c.canonical(x)+b'\n' for x in r))
+ with self.assertRaisesRegex(RuntimeError,'not fresh'):origin.linux_origin(b,expected)
+@add
+def test_old_candidate_or_failed_protection_rejected(self):
+ expected={r['name']:'a'*64 for r in nv.rows()};b=self.linux_fixture(expected);rows=[json.loads(x) for x in c.read(b['path']).splitlines()]
+ for which in ('old','protect'):
+  r=copy.deepcopy(rows)
+  if which=='old':r[0]['data']['contract']['boot_sha256']='0'*64
+  else:next(x for x in r if x['id']=='protected:boot_a')['ok']=False
+  x=self.save(self.root/('linux-'+which),b''.join(c.canonical(q)+b'\n' for q in r))
+  with self.assertRaises(RuntimeError):origin.linux_origin(x,expected)
+@add
+def test_NV_review_requires_raw_current_and_first_source(self):
+ b,tr,_=self.fixture();result=self.save(self.root/'READONLY_RESULT.json',{'purpose':'rearm-with-sim','boot_id':BOOT,'txid':TX,'nv_baseline':b});proof=nv.validate_capture(b,c.now(),BOOT,TX,tr);first={'hashes':proof['hashes'],'linux_boot_id':'00000000-0000-4000-8000-000000000001'};fb=self.save(self.root/'first-reference',{})
+ review={'schema':'e5-sim-nv-network-review-v1','collector':'collector','reviewer':'reviewer','captured_at':c.now().isoformat(),'expires_at':(c.now()+dt.timedelta(seconds=890)).isoformat(),'first_reference':fb,'readonly_result':result,'current_baseline':b,'raw_evidence_sha256':proof['raw_evidence_sha256'],'difference':origin.difference(first['hashes'],proof['hashes']),'decision':'SOURCE_DIFF_REVIEWED_FOR_BC32_ONLY','android_registered_both_slots':True,'android_cellular_data_validated':True,'raw_network_records_reviewed':proof['network']}
+ with patch.object(origin,'validate_first',return_value=first):
+  rb=self.save(self.root/'review',review);self.assertEqual(origin.validate_gate(result,rb)['hashes'],proof['hashes'])
+  for key,val in [('raw_evidence_sha256','0'*64),('android_cellular_data_validated',False),('raw_network_records_reviewed',{}),('collector','reviewer')]:
+   bad={**review,key:val};rb=self.save(self.root/('bad-'+key),bad)
+   with self.assertRaises(RuntimeError):origin.validate_gate(result,rb)
+ # The real first-source validator cannot be skipped by an empty/trusted object.
+ with self.assertRaises(RuntimeError):origin.validate_gate(result,self.save(self.root/'real-empty',review))
+@add
+def test_first_install_linkage_full_fixture(self):
+ b,tr,deps=self.source_fixture();hashes,digest=origin.first_baseline(b,tr,BOOT,TX,deps);linux=self.linux_fixture(hashes)
+ req={'boot_id':BOOT,'txid':TX,'manifest_sha256':deps['core_manifest']['sha256'],'runner_sha256':deps['first_install_sources']['workflow_sha256']};reqb=self.save(self.root/'REQUEST.json',req)
+ complete=self.save(self.root/'COMPLETE.json',{'schema':'e5-nextphase-workflow-result-v1','phase':'install','serial':c.SERIAL,'complete':True,'request_sha256':reqb['sha256'],'boot_id':BOOT,'txid':TX,'result':{'complete':True,'boot_b_sha256':origin.BOOT_SHA}});self.save(self.root/'NV_BASELINE_BINDING.json',b)
+ review=self.save(self.root/'first-review',{'schema':'e5-first-linux-origin-review-v1','collector':'collector','reviewer':'independent','install_complete':complete,'linux_collection':linux,'baseline':b,'raw_nv_evidence_sha256':digest,'decision':'FIRST_FRESH_ORIGIN_VERIFIED_NO_REARM_AUTHORITY','reviewed_at':c.now().isoformat()});ref=self.save(self.root/'first-reference',{'schema':'e5-sim-first-linux-source-v1','install_complete':complete,'linux_collection':linux,'review':review})
+ self.assertEqual(origin.validate_first(ref)['hashes'],hashes)
+ bad=c.obj(review);bad['baseline']={'path':'/unknown','sha256':'0'*64};self.save(Path(review['path']),bad)
+ with self.assertRaises(RuntimeError):origin.validate_first(ref)
+if __name__=='__main__':unittest.main()

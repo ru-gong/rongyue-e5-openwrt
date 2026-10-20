@@ -1,0 +1,55 @@
+"""Validate resealed source/material contracts only; process/network audit barrier installed first."""
+import sys
+def sentinel(event,args):
+    if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':
+        raise RuntimeError('runtime I/O forbidden during host smoke')
+sys.addaudithook(sentinel)
+import hashlib,importlib.util,json
+from pathlib import Path
+HERE=Path(__file__).resolve().parent
+sha=lambda raw:hashlib.sha256(raw).hexdigest()
+
+def run(result_path,result_sha):
+    path=Path(result_path).resolve();raw=path.read_bytes()
+    if sha(raw)!=result_sha:raise RuntimeError('explicit result binding differs')
+    result=json.loads(raw)
+    if result['device_io_performed'] is not False:raise RuntimeError('copy result scope')
+    for item in result['files'].values():
+        p=Path(item['path']);data=p.read_bytes()
+        if p.is_symlink() or p.stat().st_nlink!=1 or len(data)!=item['bytes'] or sha(data)!=item['sha256']:
+            raise RuntimeError('source drift')
+    dirs={k:Path(v) for k,v in result['directories'].items()}
+    imported_before=dict(sys.modules);paths_before=list(sys.path)
+    def load(name,path):
+        spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec)
+        sys.modules[name]=module;spec.loader.exec_module(module);return module
+    try:
+        sys.path.insert(0,str(dirs['core']))
+        workflow=load('_tmpfix_smoke_workflow',dirs['core']/'workflow.py')
+        manifest=workflow.verify_materials()
+        workflow.verify_support_bindings(manifest)
+        modules=workflow.load_modules(manifest)
+        contract=modules['cold_bridge']._module()
+        common=contract.c
+        common.verify_manifest(result['files']['recovery/MANIFEST.json']['sha256'])
+        runtime=common.load_runtime();common.material_check(runtime['bounded_boot_control'])
+        runner=load('_tmpfix_smoke_runner',dirs['scanner']/'runner.py')
+        scanner_manifest=runner.material_manifest({k:result['files']['scanner/ARTIFACT_MANIFEST.json'][k] for k in ('path','sha256')})
+        for name,item in scanner_manifest['artifacts'].items():
+            p=Path(item['path']);data=p.read_bytes()
+            if len(data)!=item['bytes'] or sha(data)!=item['sha256']:raise RuntimeError('scanner artifact drift '+name)
+        # Never call state/closure mutation, capture, observer, adapter constructor, execute, native binary, or subprocess.
+        return {'schema':'e5-resealed-host-smoke-v1','result_sha256':result_sha,
+                'source_count':len(result['files']),'core_modules':sorted(modules),
+                'material_contracts':'PASS','common_runtime_pins':'PASS','scanner_artifacts':'PASS',
+                'cold_contract_import':'PASS','device_io_performed':False,
+                'field_reviews_or_requests_created':False,'shared_state_or_ledger_modified':False}
+    finally:
+        for name in tuple(sys.modules):
+            if name not in imported_before:del sys.modules[name]
+        for name,module in imported_before.items():sys.modules[name]=module
+        sys.path[:]=paths_before
+
+if __name__=='__main__':
+    if len(sys.argv)!=3:raise SystemExit('host_smoke.py RESULT_JSON SHA256')
+    print(json.dumps(run(sys.argv[1],sys.argv[2]),ensure_ascii=False,sort_keys=True,indent=2))

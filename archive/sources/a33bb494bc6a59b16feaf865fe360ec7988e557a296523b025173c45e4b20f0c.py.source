@@ -1,0 +1,43 @@
+import ast
+import contextlib
+import io
+from pathlib import Path
+import sys
+import unittest
+import triage
+
+def deny(event,args):
+    if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.posix_spawnp'):
+        raise AssertionError('external operation blocked')
+sys.addaudithook(deny)
+
+class TestTriage(unittest.TestCase):
+    def sample(self):
+        d={k:'fixture' for k in triage.KEYS};d.update(boot_id_start='00000000-0000-4000-8000-000000000001',boot_id_end='00000000-0000-4000-8000-000000000001',root_uid='0',uptime='60.00 1.00',slot='_a',boot_completed='1',zygote='running',surfaceflinger='running',adbd='running',data_mount='/dev/block/mmcblk0p70|f2fs|rw,seclabel',monitor='hang_detect_enabled: 1 ,hang_detect_timeout = 120 s hang_detect_counter: 119')
+        return d
+    def render(self,d):return ''.join(k+'\t'+v+'\n' for k,v in d.items())
+    def test_good_not_approval(self):
+        r=triage.parse_health(self.render(self.sample()));self.assertFalse(r['approved_to_restore']);self.assertFalse(r['stable_over_time']);self.assertEqual(r['monitor']['counter'],119)
+    def test_changed_boot(self):
+        d=self.sample();d['boot_id_end']='00000000-0000-4000-8000-000000000001'
+        with self.assertRaises(ValueError):triage.parse_health(self.render(d))
+    def test_monitor_expired_or_disabled(self):
+        for v in ['hang_detect_enabled: 1 ,hang_detect_timeout = 120 s hang_detect_counter: -1','hang_detect_enabled: 0 ,hang_detect_timeout = 120 s hang_detect_counter: 119','unknown']:
+            d=self.sample();d['monitor']=v
+            with self.assertRaises(ValueError):triage.parse_health(self.render(d))
+    def test_missing_and_duplicate(self):
+        d=self.sample();del d['monitor']
+        with self.assertRaises(ValueError):triage.parse_health(self.render(d))
+        with self.assertRaises(ValueError):triage.parse_health(self.render(self.sample())+'slot\t_a\n')
+    def test_bad_mount_and_service(self):
+        for k,v in [('data_mount','/dev/block/dm-1|f2fs|rw'),('zygote','restarting'),('root_uid','2000'),('slot','_b')]:
+            d=self.sample();d[k]=v
+            with self.assertRaises(ValueError):triage.parse_health(self.render(d))
+    def test_plan_no_transport(self):
+        p=triage.plan();self.assertFalse(p['device_execution_implemented']);self.assertIsNone(p['live_adb_argv']);self.assertEqual(len(p['schedule']['health_seconds_from_first_sample']),21)
+        tree=ast.parse(Path(triage.__file__).read_text());imports={x.names[0].name.split('.')[0] for x in ast.walk(tree) if isinstance(x,ast.Import)}
+        self.assertFalse(imports & {'subprocess','socket','ctypes','importlib'});self.assertFalse(hasattr(triage,'execute'))
+        with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):triage.main(['execute'])
+    def test_output_limit(self):
+        with self.assertRaises(ValueError):triage.parse_health('x'*17000)
+if __name__=='__main__':unittest.main(verbosity=2)

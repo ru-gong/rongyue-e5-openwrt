@@ -1,0 +1,109 @@
+"""Host temporary filesystem fault tests; never ADB, USB, /data or real blocks."""
+import json, os, signal, subprocess, tempfile, time, unittest
+from pathlib import Path
+HERE=Path(__file__).resolve().parent
+BOOT='00000000-0000-4000-8000-000000000001';TX='1234567890abcdef';OP='a'*32;CHUNK=4<<20
+class NativeIO(unittest.TestCase):
+ @classmethod
+ def setUpClass(cls):
+  cls.build=tempfile.TemporaryDirectory(prefix='e5-io-build-',dir='/tmp');cls.binary=Path(cls.build.name)/'test';cls.production=Path(cls.build.name)/'production'
+  for dst,flags in [(cls.binary,['-DE5_IO_HOST_TEST']),(cls.production,[])]:subprocess.run(['cc','-std=c11','-O2','-Wall','-Wextra','-Werror',*flags,str(HERE/'native_io.c'),'-o',str(dst)],check=True,capture_output=True)
+ @classmethod
+ def tearDownClass(cls):cls.build.cleanup()
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(prefix='e5-io-test-',dir='/tmp');self.root=Path(self.tmp.name).resolve();self.stage=self.root/('e5linux.stage.'+TX);self.stage.mkdir(mode=0o700);(self.root/'boot_id').write_text(BOOT+'\n')
+ def tearDown(self):self.tmp.cleanup()
+ def args(self,action='write-file',name='boot-os',offset=0,length=8,total=8,inode=0,deadline=None,d1=None,d2=None):
+  st=self.stage.stat();d1=st.st_dev if d1 is None else d1;d2=st.st_ino if d2 is None else d2;deadline=int(time.clock_gettime(time.CLOCK_MONOTONIC)*1000)+5000 if deadline is None else deadline
+  return [str(self.binary),'--test-root',str(self.root),action,TX,BOOT,OP,str(deadline),str(d1),str(d2),str(inode),str(offset),str(length),str(total),name]
+ def runio(self,args=None,data=b'openwrt\n',fault=None):
+  env=dict(os.environ);env.pop('E5_IO_TEST_FAULT',None)
+  if fault:env['E5_IO_TEST_FAULT']=fault
+  r=subprocess.run(args or self.args(),input=data,capture_output=True,timeout=8,env=env);return r,[json.loads(x) for x in r.stdout.splitlines()]
+ def block(self,name):
+  p=self.root/(name+'.bin')
+  with p.open('wb') as f:f.truncate((64<<20) if name=='boot_b' else (1<<20))
+  return p
+ def test_file_create_and_receipt(self):
+  r,x=self.runio();self.assertEqual(r.returncode,0,r.stdout);self.assertEqual((self.stage/'boot-os').read_bytes(),b'openwrt\n');self.assertEqual([z['event'] for z in x],['START','DONE'])
+  for z in x:self.assertEqual((z['boot_id'],z['txid'],z['op_id']),(BOOT,TX,OP))
+  self.assertEqual(x[-1]['size'],8);self.assertTrue(x[-1]['fsync_completed'])
+ def test_exclusive_create_no_overwrite(self):
+  p=self.stage/'boot-os';p.write_bytes(b'original');r,_=self.runio();self.assertNotEqual(r.returncode,0);self.assertEqual(p.read_bytes(),b'original')
+ def test_short_input_never_creates(self):
+  r,x=self.runio(data=b'a');self.assertNotEqual(r.returncode,0);self.assertFalse((self.stage/'boot-os').exists());self.assertFalse(x[-1]['possibly_modified'])
+ def test_extra_input_never_creates(self):
+  r,_=self.runio(data=b'openwrt\nX');self.assertNotEqual(r.returncode,0);self.assertFalse((self.stage/'boot-os').exists())
+ def test_append_two_chunks(self):
+  p=self.stage/'openwrt.ext4';r,_=self.runio(self.args(name=p.name,length=CHUNK,total=2<<30),b'x'*CHUNK);self.assertEqual(r.returncode,0,r.stdout)
+  r,_=self.runio(self.args(name=p.name,offset=CHUNK,length=CHUNK,total=2<<30,inode=p.stat().st_ino),b'y'*CHUNK);self.assertEqual(r.returncode,0,r.stdout);self.assertEqual(p.read_bytes(),b'x'*CHUNK+b'y'*CHUNK)
+ def test_wrong_inode_no_append(self):
+  p=self.stage/'openwrt.ext4';p.write_bytes(b'a'*CHUNK);p.chmod(0o600);r,_=self.runio(self.args(name=p.name,offset=CHUNK,length=CHUNK,total=2<<30,inode=p.stat().st_ino+1),b'b'*CHUNK);self.assertNotEqual(r.returncode,0);self.assertEqual(p.stat().st_size,CHUNK)
+ def test_wrong_current_size_no_append(self):
+  p=self.stage/'openwrt.ext4';p.write_bytes(b'a');p.chmod(0o600);r,_=self.runio(self.args(name=p.name,offset=CHUNK,length=CHUNK,total=2<<30,inode=p.stat().st_ino),b'b'*CHUNK);self.assertNotEqual(r.returncode,0);self.assertEqual(p.read_bytes(),b'a')
+ def test_symlink_refused(self):
+  other=self.root/'other';other.write_bytes(b'unchanged');(self.stage/'boot-os').symlink_to(other);r,_=self.runio();self.assertNotEqual(r.returncode,0);self.assertEqual(other.read_bytes(),b'unchanged')
+ def test_stage_symlink_refused(self):
+  self.stage.rmdir();other=self.root/'elsewhere';other.mkdir();self.stage.symlink_to(other,target_is_directory=True);r,_=self.runio();self.assertNotEqual(r.returncode,0);self.assertFalse((other/'boot-os').exists())
+ def test_hardlink_refused(self):
+  p=self.stage/'openwrt.ext4';p.write_bytes(b'a'*CHUNK);p.chmod(0o600);os.link(p,self.root/'linked');r,_=self.runio(self.args(name=p.name,offset=CHUNK,length=CHUNK,total=2<<30,inode=p.stat().st_ino),b'b'*CHUNK);self.assertNotEqual(r.returncode,0);self.assertEqual(p.stat().st_size,CHUNK)
+ def test_unknown_file_name_refused(self):
+  r,_=self.runio(self.args(name='../boot-os'));self.assertNotEqual(r.returncode,0);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_unknown_total_refused(self):
+  r,_=self.runio(self.args(total=9));self.assertNotEqual(r.returncode,0);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_wrong_stage_identity(self):
+  r,_=self.runio(self.args(d2=self.stage.stat().st_ino+1));self.assertNotEqual(r.returncode,0);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_expired_deadline(self):
+  r,_=self.runio(self.args(deadline=int(time.clock_gettime(time.CLOCK_MONOTONIC)*1000)-1));self.assertNotEqual(r.returncode,0);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_excessive_deadline(self):
+  r,_=self.runio(self.args(deadline=int(time.clock_gettime(time.CLOCK_MONOTONIC)*1000)+60000));self.assertNotEqual(r.returncode,0);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_wrong_boot(self):
+  (self.root/'boot_id').write_text('00000000-0000-4000-8000-000000000001\n');r,_=self.runio();self.assertNotEqual(r.returncode,0);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_input_stall_times_out_without_create(self):
+  p=subprocess.Popen(self.args(deadline=int(time.clock_gettime(time.CLOCK_MONOTONIC)*1000)+250),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE);p.wait(timeout=2);p.stdin.close();raw=p.stdout.read();p.stdout.close();p.stderr.close();self.assertNotEqual(p.returncode,0);self.assertIn(b'ERROR',raw);self.assertEqual(list(self.stage.iterdir()),[])
+ def signal_case(self,sig):
+  p=subprocess.Popen(self.args(),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE);self.assertEqual(json.loads(p.stdout.readline())['event'],'START');p.send_signal(sig);p.wait(timeout=2);p.stdin.close();raw=p.stdout.read();p.stdout.close();p.stderr.close();self.assertIn(b'ERROR',raw);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_sigterm_during_input(self):self.signal_case(signal.SIGTERM)
+ def test_sigint_during_input(self):self.signal_case(signal.SIGINT)
+ def test_sighup_during_input(self):self.signal_case(signal.SIGHUP)
+ def test_cancel_before_write_has_no_payload(self):
+  r,x=self.runio(fault='cancel-before-write');self.assertNotEqual(r.returncode,0);self.assertEqual((self.stage/'boot-os').stat().st_size,0);self.assertTrue(x[-1]['possibly_modified'])
+ def test_deadline_before_write_has_no_payload(self):
+  r,_=self.runio(fault='deadline-before-write');self.assertNotEqual(r.returncode,0);self.assertEqual((self.stage/'boot-os').stat().st_size,0)
+ def test_short_write_partial_retained(self):
+  r,x=self.runio(fault='short-write');self.assertNotEqual(r.returncode,0);self.assertEqual((self.stage/'boot-os').read_bytes(),b'open');self.assertEqual(x[-1]['event'],'ERROR')
+ def test_after_write_error_no_success(self):
+  r,x=self.runio(fault='after-write');self.assertNotEqual(r.returncode,0);self.assertEqual((self.stage/'boot-os').read_bytes(),b'openwrt\n');self.assertEqual(x[-1]['event'],'ERROR')
+ def test_cancel_after_write_no_rollback_claim(self):
+  r,x=self.runio(fault='cancel-after-write');self.assertNotEqual(r.returncode,0);self.assertTrue(x[-1]['possibly_modified']);self.assertEqual((self.stage/'boot-os').stat().st_size,8)
+ def test_fsync_error_no_success(self):
+  r,x=self.runio(fault='fsync');self.assertNotEqual(r.returncode,0);self.assertTrue(x[-1]['possibly_modified']);self.assertEqual(x[-1]['event'],'ERROR')
+ def test_block_b_exact_chunk_only(self):
+  p=self.block('boot_b');r,x=self.runio(self.args(action='write-block',name='boot_b',d1=259,d2=30,inode=p.stat().st_ino,length=CHUNK,total=64<<20),b'b'*CHUNK);self.assertEqual(r.returncode,0,r.stdout)
+  with p.open('rb') as f:self.assertEqual(f.read(CHUNK),b'b'*CHUNK);self.assertEqual(f.read(16),b'\0'*16)
+  self.assertEqual(p.stat().st_size,64<<20);self.assertEqual((x[-1]['major'],x[-1]['minor']),(259,30))
+ def test_misc32_exact_outside_preserved(self):
+  p=self.block('misc32');p.write_bytes(b'a'*(1<<20));r,_=self.runio(self.args(action='write-block',name='misc32',d1=179,d2=3,inode=p.stat().st_ino,offset=2048,length=32,total=1<<20),b'b'*32);self.assertEqual(r.returncode,0,r.stdout);self.assertEqual(p.read_bytes(),b'a'*2048+b'b'*32+b'a'*((1<<20)-2080))
+ def test_misc_offset_refused(self):
+  p=self.block('misc32');r,_=self.runio(self.args(action='write-block',name='misc32',d1=179,d2=3,inode=p.stat().st_ino,offset=2049,length=32,total=1<<20),b'b'*32);self.assertNotEqual(r.returncode,0);self.assertEqual(p.read_bytes(),b'\0'*(1<<20))
+ def test_wrong_block_rdev_refused(self):
+  p=self.block('boot_b');r,_=self.runio(self.args(action='write-block',name='boot_b',d1=259,d2=29,inode=p.stat().st_ino,length=CHUNK,total=64<<20),b'b'*CHUNK);self.assertNotEqual(r.returncode,0);self.assertEqual(p.read_bytes(),b'\0'*(64<<20))
+ def test_android_a_name_refused(self):
+  r,_=self.runio(self.args(action='write-block',name='boot_a',d1=259,d2=29,inode=1,length=CHUNK,total=64<<20),b'b'*CHUNK);self.assertNotEqual(r.returncode,0)
+ def test_production_disabled(self):
+  r=subprocess.run([str(self.production),*self.args()[3:]],input=b'openwrt\n',capture_output=True,timeout=2);self.assertNotEqual(r.returncode,0);self.assertIn(b'production-device-execution-disabled',r.stdout);self.assertEqual(list(self.stage.iterdir()),[])
+ def test_host_binary_cannot_use_data(self):
+  r=subprocess.run([str(self.binary),'--test-root','/data',*self.args()[3:]],input=b'openwrt\n',capture_output=True,timeout=2);self.assertNotEqual(r.returncode,0);self.assertIn(b'test-root-refused',r.stdout)
+ def test_signal_seen_before_create_admission_no_create(self):
+  r,x=self.runio(fault='cancel-before-create');self.assertNotEqual(r.returncode,0);self.assertFalse((self.stage/'boot-os').exists());self.assertFalse(x[-1]['possibly_modified'])
+ def test_pending_signal_at_create_admission_no_create(self):
+  r,x=self.runio(fault='pending-before-create');self.assertNotEqual(r.returncode,0);self.assertFalse((self.stage/'boot-os').exists());self.assertFalse(x[-1]['possibly_modified'])
+ def test_signal_races_create_leaves_empty_unknown_no_payload(self):
+  r,x=self.runio(fault='cancel-after-create');self.assertNotEqual(r.returncode,0);self.assertEqual((self.stage/'boot-os').stat().st_size,0);self.assertTrue(x[-1]['possibly_modified'])
+ def test_pending_signal_at_pwrite_admission_no_payload(self):
+  r,x=self.runio(fault='pending-before-pwrite');self.assertNotEqual(r.returncode,0);self.assertEqual((self.stage/'boot-os').stat().st_size,0);self.assertTrue(x[-1]['possibly_modified'])
+ def test_pending_signal_blocks_existing_block_pwrite(self):
+  p=self.block('misc32');before=p.read_bytes();r,x=self.runio(self.args(action='write-block',name='misc32',d1=179,d2=3,inode=p.stat().st_ino,offset=2048,length=32,total=1<<20),b'b'*32,fault='pending-before-pwrite');self.assertNotEqual(r.returncode,0);self.assertEqual(p.read_bytes(),before);self.assertFalse(x[-1]['possibly_modified'])
+ def test_signal_during_pwrite_critical_region_unknown_no_fsync_ack(self):
+  r,x=self.runio(fault='cancel-while-pwrite-masked');self.assertNotEqual(r.returncode,0);self.assertEqual((self.stage/'boot-os').read_bytes(),b'openwrt\n');self.assertTrue(x[-1]['possibly_modified']);self.assertEqual(x[-1]['event'],'ERROR')
+if __name__=='__main__':unittest.main()

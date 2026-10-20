@@ -1,0 +1,179 @@
+"""Host-only parser/request fixtures. No ADB, USB, sockets or child processes."""
+import importlib.util,json,sys,tempfile,time,unittest,uuid
+from pathlib import Path
+from unittest.mock import patch
+from types import SimpleNamespace
+
+def deny(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('external operation forbidden')
+sys.addaudithook(deny)
+spec=importlib.util.spec_from_file_location('observer',Path(__file__).with_name('observe_diagnose.py'));o=importlib.util.module_from_spec(spec);spec.loader.exec_module(o)
+c,t=o.load_sources()
+REAL_CHECK=o.check_markers
+BOOT='00000000-0000-4000-8000-000000000001'
+def result(stdout=b'OK',stderr=b'',returncode=0,failure=None,elapsed_seconds=.1):return locals()
+def health():
+ fields={k:'' for k in t.KEYS};fields.update(boot_id_start=BOOT,boot_id_end=BOOT,root_uid='0',uptime='30.00 40.00',serial=o.SERIAL,model='E5',platform='ums9621',build='TS305_V03_20241128_2301',kernel='5.4.0',slot='_a',boot_completed='1',verifiedbootstate='orange',flash_locked='0',sim_states='ABSENT,ABSENT',ro_boot_reason='power_key',sys_boot_reason='cold',zygote='running',zygote_secondary='running',surfaceflinger='running',adbd='running',data_mount='/dev/block/by-name/userdata|f2fs|rw,nosuid',monitor='hang_detect_enabled: 1,hang_detect_timeout = 120 s  hang_detect_counter: 25')
+ fields.update(data_device_resolved='/dev/block/mmcblk0p70',data_rdev='103:3f',data_sysdev='259:63')
+ return ('\n'.join(k+'\t'+v for k,v in fields.items())+'\n').encode()
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.markers=patch.object(o,'check_markers',return_value=dict(o.MARKER_PINS));self.markers.start();self.addCleanup(self.markers.stop)
+ def test_devices_fixed_serial_states(self):
+  self.assertEqual(o.parse_devices(b'List of devices attached\n\n'),'absent')
+  for state in ('device','offline','unauthorized'):
+   self.assertEqual(o.parse_devices(('List of devices attached\n'+o.SERIAL+'\t'+state+'\n').encode()),state)
+  with self.assertRaises(o.Stop):o.parse_devices(('List of devices attached\n'+o.SERIAL+'\tdevice\n'+o.SERIAL+'\tdevice\n').encode())
+ def test_nonroot_new_boot_and_complete(self):
+  fields={'boot_id':BOOT,'boot_id_end':BOOT,'uptime':'20.00 0.00','boot_complete':'1','serial':o.SERIAL,'slot':'_a'}
+  raw=('\n'.join(k+'\t'+v for k,v in fields.items())+'\n').encode()
+  self.assertEqual(o.parse_nonroot(raw)['uptime_seconds'],20)
+  with self.assertRaises(o.Stop):o.parse_nonroot(raw.replace(BOOT.encode(),b'bad',1))
+ def test_health_alias_identity_and_no_sim(self):
+  self.assertEqual(o.parse_health(health(),t,BOOT)['boot_id'],BOOT)
+  for raw in (health().replace(b'103:3f',b'103:3e'),health().replace(b'ABSENT,ABSENT',b'LOADED,LOADED'),health().replace(b'|rw,nosuid',b'|ro,nosuid'),health().replace(b'power_key',b'kernel_panic')):
+   with self.subTest(raw=raw[-80:]),self.assertRaises((o.Stop,ValueError)):o.parse_health(raw,t,BOOT)
+ def make(self,path,reply):
+  ob=o.Observer.__new__(o.Observer);ob.out=path;ob.until=time.monotonic()+120;ob.index=0;ob.progress_index=0;ob.boot=BOOT
+  ob.c=SimpleNamespace(collect_process=lambda argv,limit:reply,ADB=Path('/fixed/adb'),BB='/fixed/busybox',SU='/debug_ramdisk/su',BOOT_ID='00000000-0000-4000-8000-000000000001',guard=lambda:'set -eu\n');ob.t=t
+  return ob
+ def test_root_shell_timeout_quote_and_exit37(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result(b'X',b'Y',37));raw,_=ob.shell('probe',"printf 'quoted value'\n",10,root=True,expected=37)
+   record=json.loads(next(Path(tmp).glob('*.request.json')).read_text());self.assertEqual(record['argv'][3:5],['shell','-T'])
+   self.assertIn('timeout -s TERM 6',record['argv'][-1]);self.assertIn('/debug_ramdisk/su -c',record['argv'][-1]);self.assertEqual(raw,b'X')
+ def test_timeout_saved_and_never_disconnect_wait(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result(b'',b'',-9,'deadline',8.004))
+   with self.assertRaisesRegex(o.Stop,'timeout'):ob.query('probe',['fake'],20,allow_disconnect=True)
+   self.assertEqual(len(list(Path(tmp).glob('*.result.json'))),1)
+ def test_only_expected_nonroot_disconnection_waits(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result(b'',b'error: device offline\n',1));raw,_=ob.query('nonroot',['fake'],20,allow_disconnect=True);self.assertIsNone(raw)
+   with self.assertRaises(o.Stop):ob.query('root',['fake'],20,allow_disconnect=False)
+ def test_nonroot_missing_timeout_applet_is_error(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result(b'',b'toybox: Unknown command timeout\n',127))
+   with self.assertRaises(o.Stop):ob.query('nonroot',['fake'],100,allow_disconnect=True)
+ def test_root_stderr_and_truncation_rejected(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result(b'OK',b'warning',0))
+   with self.assertRaises(o.Stop):ob.query('root',['fake'],20)
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result(b'x'*20,b'',0,'output_limit'))
+   with self.assertRaises(o.Stop):ob.query('root',['fake'],20)
+ def test_output_files_exclusive(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   p=Path(tmp)/'same';o.save(p,b'old')
+   with self.assertRaises(FileExistsError):o.save(p,b'new')
+   self.assertEqual(p.read_bytes(),b'old')
+ def test_default_plan_is_no_transport(self):
+  with patch.object(o.Observer,'run',side_effect=AssertionError('no run')):self.assertEqual(o.main(['plan']),0)
+
+
+def procstat(start='0',pid='1',comm='init',state='S',flags='4194560'):
+ f=[state]+['0']*19;f[6]=flags;f[19]=start
+ return (pid+' ('+comm+') '+' '.join(f)+'\n').encode()
+
+class DiagnosticTests(unittest.TestCase):
+ setUp=Tests.setUp
+ make=Tests.make
+ def test_zero_valid_missing_not_zero(self):
+  self.assertEqual(o.parse_pid1_stat(procstat())['starttime'],0)
+  with self.assertRaises(o.Stop):o.parse_pid1_stat(procstat().rsplit(b' ',1)[0]+b'\n')
+ def test_comm_spaces_parentheses_positive(self):
+  p=o.parse_pid1_stat(procstat('123',comm='init (nested) name'))
+  self.assertEqual((p['comm'],p['starttime']),('init (nested) name',123))
+ def test_invalid_stat(self):
+  for b in [procstat('-1'),procstat('18446744073709551616'),procstat('x'),procstat(pid='2'),procstat(state='AB'),procstat(state='Z'),procstat(flags='-1'),b'x'*8193,procstat()+b'\0']:
+   with self.subTest(raw=b[:32]),self.assertRaises((o.Stop,ValueError)):o.parse_pid1_stat(b)
+ def test_namespace(self):
+  self.assertEqual(o.parse_namespace(b'mnt:[4026531840]\n'),'mnt:[4026531840]')
+  for b in [b'net:[1]\n',b'mnt:[x]\n',b'mnt:[1]',b'mnt:[18446744073709551616]\n']:
+   with self.subTest(raw=b),self.assertRaises(o.Stop):o.parse_namespace(b)
+ def test_mountinfo_source_dash_escape(self):
+  for raw in [b'1 2 0:1 / / rw - tmpfs tmpfs rw\n',b'1 2 0:1 / /a\040b rw shared:1 - tmpfs - rw\n'.replace(b'/a b',b'/a\\040b')]:
+   self.assertEqual(o.parse_mountinfo(raw)['lines'],1)
+ def test_mountinfo_malformed_truncated(self):
+  for raw in [b'',b'1 2 0:1 / / rw - tmpfs tmpfs rw',b'1 2 0:1 / / rw bad tmpfs tmpfs rw\n',b'1 2 0:1 / /a\\999b rw - tmpfs tmpfs rw\n',b'1 2 0:1 / / rw - tmpfs tmpfs rw extra\n']:
+   with self.subTest(raw=raw),self.assertRaises((o.Stop,ValueError)):o.parse_mountinfo(raw)
+ def test_diagnostics_sequence_zero_raw_bound(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result());jobs=[]
+   raws=[procstat(),b'mnt:[1]\n',b'1 2 0:1 / / rw - tmpfs tmpfs rw\n',b'mnt:[1]\n',procstat()]
+   def shell(label,script,limit,**kw):
+    jobs.append((label,script,limit,kw));return raws[len(jobs)-1],{'started_at':'2026-10-15T00:00:00+08:00'}
+   ob.shell=shell;ob.pid1_diagnostics('initial')
+   p=json.loads((Path(tmp)/'initial-pid1-diagnostic.json').read_text())
+   self.assertTrue(p['current_boot_zero_starttime_observed']);self.assertFalse(p['full_occupancy_checked']);self.assertFalse(p['proves_exact_prior_failure_cause'])
+   self.assertEqual(len(jobs),5);self.assertTrue(all('test "$(cat /proc/sys/kernel/random/boot_id)"' in x[1] for x in jobs))
+ def test_diagnostic_identity_drift(self):
+  for last,ns in [(procstat('1'),b'mnt:[1]\n'),(procstat(),b'mnt:[2]\n')]:
+   with tempfile.TemporaryDirectory() as tmp:
+    ob=self.make(Path(tmp),result());raws=iter([procstat(),b'mnt:[1]\n',b'1 2 0:1 / / rw - tmpfs tmpfs rw\n',ns,last]);ob.shell=lambda *a,**kw:(next(raws),{'started_at':'x'})
+    with self.assertRaises(o.Stop):ob.pid1_diagnostics('initial')
+    self.assertFalse((Path(tmp)/'initial-pid1-diagnostic.json').exists())
+ def test_parse_failure_saved_stops_next_jobs(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result());count=[]
+   def shell(*a,**kw):count.append(1);return procstat('-1'),{'started_at':'x'}
+   ob.shell=shell
+   with self.assertRaises(o.Stop):ob.pid1_diagnostics('initial')
+   self.assertEqual(len(count),1);self.assertTrue((Path(tmp)/'initial-pid1-PARSE_FAILURE.json').exists())
+ def test_marker_changes_refused_never_removed(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   p=Path(tmp).resolve();(p/'ACTIVE.json').write_bytes(b'a');(p/'UNCERTAIN.json').write_bytes(b'u');pins={n:o.sha((p/n).read_bytes()) for n in ('ACTIVE.json','UNCERTAIN.json')}
+   with patch.object(o,'SHARED_STATE',p),patch.object(o,'MARKER_PINS',pins):
+    self.assertEqual(REAL_CHECK(),pins)
+    (p/'ACTIVE.json').write_bytes(b'changed')
+    with self.assertRaises(o.Stop):REAL_CHECK()
+    self.assertEqual((p/'ACTIVE.json').read_bytes(),b'changed')
+ def test_recovery_marker_refused(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   p=Path(tmp).resolve();(p/'ACTIVE.json').write_bytes(b'a');(p/'UNCERTAIN.json').write_bytes(b'u');pins={n:o.sha((p/n).read_bytes()) for n in ('ACTIVE.json','UNCERTAIN.json')};(p/'RECOVERY_ONLY.json').write_bytes(b'{}')
+   with patch.object(o,'SHARED_STATE',p),patch.object(o,'MARKER_PINS',pins),self.assertRaisesRegex(o.Stop,'different recovery state'):REAL_CHECK()
+ def test_plan_no_dependency_import(self):
+  with patch.object(o,'load_sources',side_effect=AssertionError('must not import')):self.assertEqual(o.main([]),0)
+ def test_observe_disabled_before_sources_files(self):
+  with patch.object(o,'load_sources',side_effect=AssertionError('must not import')):self.assertEqual(o.main(['observe']),2)
+ def test_new_boot_guard(self):
+  with tempfile.TemporaryDirectory() as tmp:
+   ob=self.make(Path(tmp),result());ob.c.guard=lambda:'test boot = '+ob.c.BOOT_ID+'\n'
+   ob.shell('root','printf OK\n',20,root=True)
+   script=next(Path(tmp).glob('*.sh.txt')).read_text();self.assertIn(BOOT,script);self.assertNotIn(ob.c.BOOT_ID,script)
+
+ def run_full_fixture(self,broken=False):
+  with tempfile.TemporaryDirectory() as tmp:
+   path=Path(tmp).resolve();ob=self.make(path,result());clock=[10.0];ob.until=2000
+   labels=[]
+   def stamp():return (o.dt.datetime(2026,10,15,tzinfo=o.dt.timezone.utc)+o.dt.timedelta(seconds=clock[0])).isoformat()
+   def wait(target):clock[0]=max(clock[0],target)
+   def query(label,*a,**kw):
+    self.assertEqual(label,'devices');return ('List of devices attached\n'+o.SERIAL+'\tdevice\n').encode(),{}
+   def shell(label,script,limit,**kw):
+    ob.index+=1;labels.append(label);meta={'started_at':stamp()}
+    if label=='nonroot-startup':
+     return ('boot_id\t'+BOOT+'\nuptime\t10.00 0.00\nboot_complete\t1\nserial\t'+o.SERIAL+'\nslot\t_a\nboot_id_end\t'+BOOT+'\n').encode(),meta
+    if label=='root-exit-calibration':
+     (path/f'{ob.index:05d}-root-exit-calibration.stderr').write_bytes(b'E5_STDERR_PROBE\n');return b'E5_STDOUT_PROBE\n',meta
+    if label.startswith('health-'):return health().replace(b'30.00 40.00',f'{clock[0]:.2f} 40.00'.encode()),meta
+    if '-pstore-' in label:return b'MISSING\n',meta
+    if label.endswith('-crash'):return b'',meta
+    if '-pid1-stat-' in label:return procstat('-1' if broken else '0'),meta
+    if '-pid1-namespace-' in label:return b'mnt:[1]\n',meta
+    if label.endswith('-pid1-mountinfo'):return b'1 2 0:1 / / rw - tmpfs tmpfs rw\n',meta
+    raise AssertionError(label)
+   ob.query=query;ob.shell=shell;ob.wait_until=wait
+   with patch.object(o.time,'monotonic',side_effect=lambda:clock[0]),patch('builtins.print'):
+    if broken:
+     with self.assertRaises(o.Stop):ob.run()
+     self.assertFalse((path/'COMPLETE.json').exists());self.assertEqual(sum(x.startswith('health-') for x in labels),1)
+    else:
+     ob.run();complete=json.loads((path/'COMPLETE.json').read_text())
+     self.assertEqual(complete['samples'],21);self.assertGreaterEqual(complete['span_seconds'],600)
+     self.assertTrue(complete['diagnostics_completed']);self.assertFalse(complete['device_writes']);self.assertFalse(complete['approved_to_flash'])
+     self.assertTrue((path/'initial-pid1-diagnostic.json').exists());self.assertTrue((path/'final-pid1-diagnostic.json').exists())
+ def test_full_fake_cold_run_retains_diagnostics(self):self.run_full_fixture()
+ def test_full_fake_bad_diagnostic_stops_observation(self):self.run_full_fixture(broken=True)
+
+if __name__=='__main__':unittest.main(verbosity=2)

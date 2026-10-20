@@ -1,0 +1,354 @@
+"""Host proof replay and fixed current readback for separately executed phases.
+
+No uploader, mutation, marker cleanup, retry, grant or CLI. Historical receipts
+do not refresh a lease or authorize a phase. The caller owns a fresh gate, the
+global transaction lock and the separately reviewed request.
+"""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+BASE = Path(__file__).resolve().parent
+ROOT = BASE.parents[1]
+SERIAL = 'DEVICE_SERIAL_REDACTED'
+LOCK = '/data/local/tmp/e5-clean-directory.lock'
+OLD_TX = '171634616886fc1a'
+MAX_TRANSPORT_OUTPUT = (16 << 20) + 65536
+PHASE_KEYS = {p: {'deployment'} for p in ('probe', 'inventory', 'backup')}
+PHASE_KEYS.update({p: {'deployment', 'probe'} for p in ('stage', 'activate', 'rollback')})
+PHASE_KEYS['install'] = {'deployment', 'probe', 'activation'}
+STAT = '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T'
+STOP_NAMES = ('STOP', 'STOP.json', 'ACTIVE.json', 'UNCERTAIN.json', 'SESSION_UNCERTAIN.json', 'RECOVERY_PENDING.json', 'RECOVERY_ONLY.json')
+
+class Refusal(RuntimeError): pass
+def need(ok, why):
+    if not ok: raise Refusal(why)
+def sha(raw): return hashlib.sha256(raw).hexdigest()
+def canonical(value): return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+def read(path, digest=None, limit=16 << 20):
+    p = Path(path)
+    need(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents), 'unsafe proof path')
+    s = p.stat(); need(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and s.st_size <= limit, 'proof type/link/size')
+    raw = p.read_bytes(); need(digest is None or sha(raw) == digest, 'proof digest changed')
+    after = p.stat()
+    need(all(getattr(after, k) == getattr(s, k) for k in ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_size', 'st_mtime_ns', 'st_ctime_ns')) and len(raw) == s.st_size, 'proof changed during read'); return raw
+def bind(path): return {'path': str(path), 'sha256': sha(read(path))}
+def obj(binding):
+    need(isinstance(binding, dict) and set(binding) == {'path', 'sha256'} and re.fullmatch('[a-f0-9]{64}', binding['sha256']), 'exact proof binding')
+    return json.loads(read(binding['path'], binding['sha256']))
+def load(name, manifest):
+    p = BASE / (name + '.py'); read(p, manifest['modules'][name])
+    old = sys.modules.get(name)
+    if old is not None:
+        need(Path(old.__file__).resolve() == p, 'foreign core proof parser'); return old
+    spec = importlib.util.spec_from_file_location(name, p); module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module; spec.loader.exec_module(module); return module
+def unstopped(folder):
+    need(folder.is_dir() and not folder.is_symlink() and all(not q.is_symlink() for q in folder.parents), 'unsafe proof folder')
+    for name in STOP_NAMES:
+        need(not (folder / name).exists() and not (folder / name).is_symlink(), 'proof folder stopped/uncertain')
+def identity(row, owner=False):
+    mode = row['mode']; mode = int(mode, 8) if isinstance(mode, str) else mode
+    value = {k: row[k] for k in ('mode_bits', 'dev', 'inode', 'uid', 'gid')}; value['mode'] = mode
+    need(all(type(v) is int and v >= 0 for v in value.values()) and value['inode'] > 0, 'invalid identity')
+    need(stat.S_ISREG(value['mode_bits']) if owner else stat.S_ISDIR(value['mode_bits']), 'identity type')
+    if owner:
+        value.update({k: row[k] for k in ('bytes', 'nlink', 'mtime', 'ctime')})
+        value['mtime_text'] = row.get('mtime_text', row.get('mtime_ns_text'))
+        value['ctime_text'] = row.get('ctime_text', row.get('ctime_ns_text'))
+        need(value['bytes'] == 17 and value['nlink'] == 1 and value['uid'] == value['gid'] == 0 and mode == 0o600, 'owner identity')
+    return value
+def normalized_state(rows, deployment=False):
+    out = {k: identity(rows[k]) for k in ('data', 'local', 'tmp')}
+    out['lock'] = identity(rows['new_lock' if deployment else 'lock'])
+    out['owner'] = identity(rows['new_owner' if deployment else 'owner'], True)
+    need(len({v['dev'] for v in out.values()}) == 1 and out['lock']['uid'] == out['lock']['gid'] == 0 and out['lock']['mode'] == 0o700, 'mixed filesystem/lock identity')
+    return out
+
+def transport_proof(folder, serial, txid, boot_id):
+    """Replay completed framing, actual raw hashes, followup receipts and scopes."""
+    unstopped(folder); binding = obj(bind(folder / 'binding.json'))
+    need(binding['serial'] == serial and binding['txid'] == txid and binding['boot_id'] == boot_id and
+         binding['state_dir'] == str(ROOT / ('evidence/e5-clean-v3-device-state-' + SERIAL)) and
+         binding['reconciliation_only'] is False and binding['recovery_context'] is None, 'wrong phase transport')
+    rows = []; seen = set()
+    for operation in sorted(p for p in folder.iterdir() if p.is_dir() and re.fullmatch(r'\d{6}-.+', p.name)):
+        unstopped(operation)
+        begin = obj(bind(operation / 'IN_FLIGHT.json')); done = obj(bind(operation / 'COMPLETE.json'))
+        need(type(begin['output_limit']) is int and 0 < begin['output_limit'] <= MAX_TRANSPORT_OUTPUT, 'operation output bound')
+        raw = read(operation / 'stdout.bin', limit=begin['output_limit']); err = read(operation / 'stderr.bin'); result = obj(bind(operation / 'transport-result.json'))
+        need(begin['schema'] == done['schema'] == 'e5-bounded-transport-v1' and begin['status'] == 'IN_FLIGHT' and
+             done['status'] == 'COMPLETE' and done['validated'] is True and all(done.get(k) == v for k, v in begin.items() if k != 'status'), 'operation missing complete binding')
+        need((begin['serial'], begin['txid'], begin['boot_id']) == (serial, txid, boot_id) and
+             begin['reconciliation_only'] is False and begin['recovery_context'] is None and begin['automatic_retry'] is False and
+             begin['op_id'] not in seen and begin['evidence_directory'] == str(operation), 'operation identity/replay')
+        need(begin['argv_sha256'] == sha(canonical(begin['argv'])) and 0 < begin['deadline_seconds'] <= 8 and
+             done['stdout_sha256'] == sha(raw), 'operation command/hash/deadline')
+        need(result['failure'] is None and result['returncode'] == 0 and not err and result['stderr_bytes'] == 0 and
+             result['stdout_bytes'] == len(raw) and result['stdout_sha256'] == sha(raw) and
+             result['stdin_bytes_sent'] == begin['payload_bytes'] and result['host_child_reaped'] is True and
+             0 <= result['elapsed_seconds'] <= 8, 'operation failed or raw mismatch')
+        need(type(begin['mutating']) is bool, 'operation mutation type')
+        if not begin['mutating']: need(begin['payload_bytes'] == 0 and begin['payload_sha256'] == sha(b''), 'read payload')
+        parts = sorted(p for p in operation.iterdir() if p.is_dir() and re.fullmatch(r'part-\d{3}-.+', p.name))
+        if begin['mutating']: need(parts, 'mutation without independent followup')
+        for index, part in enumerate(parts, 1):
+            unstopped(part); p = obj(bind(part / 'IN_FLIGHT.json')); v = obj(bind(part / 'PART_VERIFIED.json'))
+            need(type(p['output_limit']) is int and 0 < p['output_limit'] <= MAX_TRANSPORT_OUTPUT, 'followup output bound')
+            r = obj(bind(part / 'transport-result.json')); data = read(part / 'stdout.bin', limit=p['output_limit']); stderr = read(part / 'stderr.bin')
+            need(v == {'op_id': begin['op_id'], 'part_index': index, 'validated': True} and p['part_index'] == index and
+                 all(p[k] == begin[k] for k in ('serial', 'txid', 'boot_id', 'op_id')) and p['payload_bytes'] == 0 and
+                 p['payload_sha256'] == sha(b'') and p['argv_sha256'] == sha(canonical(p['argv'])) and 0 < p['deadline_seconds'] <= 8,
+                 'followup binding')
+            need(r['failure'] is None and r['returncode'] == 0 and not stderr and r['stderr_bytes'] == 0 and
+                 r['stdin_bytes_sent'] == 0 and r['stdout_bytes'] == len(data) and r['stdout_sha256'] == sha(data) and
+                 r['host_child_reaped'] is True and 0 <= r['elapsed_seconds'] <= 8, 'followup raw mismatch')
+        seen.add(begin['op_id']); rows.append({'begin': begin, 'raw': raw, 'folder': operation})
+    need(rows, 'no completed transport operations'); return rows
+
+
+RETAINED_PATHS = {'stage2-retained-ancestor-archive-old_lock': '/data/local/tmp/e5-clean-directory.lock.archive.fad8a60f84aa4268.7d125fa2bd1c4e63', 'stage2-retained-ancestor-archive-old_owner': '/data/local/tmp/e5-clean-directory.lock.archive.fad8a60f84aa4268.7d125fa2bd1c4e63/owner', 'stage2-retained-ancestor-program-archiver': '/data/local/tmp/e5-clean-lock-archive.7d125fa2bd1c4e63', 'stage2-retained-ancestor-program-helper': '/data/local/tmp/e5-clean-helper.7d125fa2bd1c4e63', 'stage2-retained-ancestor-program-io_helper': '/data/local/tmp/e5-clean-io.7d125fa2bd1c4e63', 'stage2-retained-ancestor-program-scanner': '/data/local/tmp/e5-clean-scanner.7d125fa2bd1c4e63', 'stage2-retained-previous-archive-old_lock': '/data/local/tmp/e5-clean-directory.lock.archive.7d125fa2bd1c4e63.722b7e1f5956cc07', 'stage2-retained-previous-archive-old_owner': '/data/local/tmp/e5-clean-directory.lock.archive.7d125fa2bd1c4e63.722b7e1f5956cc07/owner', 'stage2-retained-previous-program-archiver': '/data/local/tmp/e5-clean-lock-archive.722b7e1f5956cc07', 'stage2-retained-previous-program-helper': '/data/local/tmp/e5-clean-helper.722b7e1f5956cc07', 'stage2-retained-previous-program-io_helper': '/data/local/tmp/e5-clean-io.722b7e1f5956cc07', 'stage2-retained-previous-program-scanner': '/data/local/tmp/e5-clean-scanner.722b7e1f5956cc07', 'stage2-retained-generation4-archive-old_lock': '/data/local/tmp/e5-clean-directory.lock.archive.722b7e1f5956cc07.4d6efbbcd48f2d73', 'stage2-retained-generation4-archive-old_owner': '/data/local/tmp/e5-clean-directory.lock.archive.722b7e1f5956cc07.4d6efbbcd48f2d73/owner', 'stage2-retained-generation4-program-archiver': '/data/local/tmp/e5-clean-lock-archive.4d6efbbcd48f2d73', 'stage2-retained-generation4-program-helper': '/data/local/tmp/e5-clean-helper.4d6efbbcd48f2d73', 'stage2-retained-generation4-program-io_helper': '/data/local/tmp/e5-clean-io.4d6efbbcd48f2d73', 'stage2-retained-generation4-program-scanner': '/data/local/tmp/e5-clean-scanner.4d6efbbcd48f2d73', 'stage2-retained-latest-archive-old_lock': '/data/local/tmp/e5-clean-directory.lock.archive.4d6efbbcd48f2d73.171634616886fc1a', 'stage2-retained-latest-archive-old_owner': '/data/local/tmp/e5-clean-directory.lock.archive.4d6efbbcd48f2d73.171634616886fc1a/owner', 'stage2-retained-latest-program-archiver': '/data/local/tmp/e5-clean-lock-archive.171634616886fc1a', 'stage2-retained-latest-program-helper': '/data/local/tmp/e5-clean-helper.171634616886fc1a', 'stage2-retained-latest-program-io_helper': '/data/local/tmp/e5-clean-io.171634616886fc1a', 'stage2-retained-latest-program-scanner': '/data/local/tmp/e5-clean-scanner.171634616886fc1a'}
+RETAINED_LABELS = tuple(RETAINED_PATHS)
+
+def partial_retained_proof(rows, result, before, manifest):
+    binding=manifest['closure_case']
+    need(set(binding)=={'path','sha256','bytes'} and binding['path']=='/REDACTED_HOST_PATH' and binding['sha256']=='0000000000000000000000000000000000000000000000000000000000000000','postdeployment fixed case binding')
+    raw=read(binding['path'],binding['sha256']);need(len(raw)==binding['bytes'],'case length');case=json.loads(raw)
+    need(case['schema']=='e5-fixed-closed-fd-probe-stop-case-v1' and case['txid']==OLD_TX,'fixed postdeployment probe-stop case')
+    known=case['retained_device_state']
+    for key,oldkey in (('old_lock','new_lock'),('old_owner','new_owner')):
+        expected=known['current_lock'][oldkey];got=before[key]
+        for field in ('dev','inode','uid','gid','bytes','nlink'):need(got[field]==int(expected[field]),'current lock identity')
+        need(got['mode_bits']==int(expected['mode_bits'],16) and got['mode']==expected['mode'],'current lock mode')
+        for field in ('mtime','ctime','mtime_text','ctime_text'):need(got[field]==expected[field],'current lock time identity')
+    items=case['retained_read_items'];need([x['label'] for x in items]==list(RETAINED_PATHS),'retained case item order')
+    expected={x['label']:x for x in items}
+    selected=[(i,r) for i,r in enumerate(rows) if r['begin']['label'] in RETAINED_LABELS]
+    need([r['begin']['label'] for _,r in selected]==list(RETAINED_LABELS)*2,'two exact retained groups')
+    writes=[i for i,r in enumerate(rows) if r['begin']['mutating']];scans=[i for i,r in enumerate(rows) if r['begin']['label']=='occupancy']
+    n=len(RETAINED_LABELS)
+    need(writes and len(scans)==1 and selected[n-1][0]<min(writes)<=max(writes)<scans[0]<selected[n][0],'retained read bracketing')
+    records={}
+    for _,r in selected:
+        b=r['begin'];need(b['mutating'] is False and b['payload_bytes']==0 and b['payload_sha256']==sha(b''),'retained read scope')
+        item=expected[b['label']];path=RETAINED_PATHS[b['label']];need(item['path']==path,'retained fixed path')
+        need(r['raw']==('\n'.join(item['expected_lines'])+'\n').encode(),'retained raw/identity differs')
+        records[b['label']]={'path':path,'stdout_sha256':sha(r['raw'])}
+    need(result.get('partial_deployment_preserved')==records,'retained result/raw disconnected')
+    return records
+
+
+
+
+def deployment(binding, manifest, txid):
+    complete = obj(binding); folder = Path(binding['path']).parent; unstopped(folder)
+    need(Path(binding['path']).name == 'COMPLETE.json' and complete['schema'] == 'e5-stage2-complete-v1' and
+         complete['all_requests_completed'] is True and complete['result']['path'] == str(folder / 'RESULT.json'), 'deployment complete')
+    result = obj(complete['result']); need(result['schema'] == 'e5-next-scanner-deployment-result-v1' and
+         result['serial'] == SERIAL and result['txid'] == txid and result['manifest'] == manifest['deployment_manifest'], 'deployment identity/manifest')
+    source = obj(result['manifest']); request = obj(result['request']); review = obj(result['review'])
+    need(request['txid'] == txid and request['boot_id'] == result['boot_id'] and request['manifest'] == result['manifest'] and
+         review['request'] == result['request'] and review['manifest'] == result['manifest'] and
+         review['decision'] == 'FIXED_OLD_LOCK_ARCHIVE_NEW_HELPERS_SCANNER_ONLY', 'deployment request/review chain')
+    need(result['scanner_real_full_scan_passed'] is True and result['no_partition_or_rootfs_write'] is True and
+         result['no_reboot'] is True and result['automatic_cleanup_retry_or_resume'] is False and
+         result['noreplace_probe_passed'] is False and result['approved_to_activate'] is False, 'deployment scope')
+    need(result['archive'] == LOCK + '.archive.' + OLD_TX + '.' + txid and
+         result['lock']['old_owner_hex'] == (OLD_TX + '\n').encode().hex(), 'old lock archive identity')
+    need(read(folder / 'old-owner.bin') == (OLD_TX + '\n').encode(), 'old owner bytes')
+    archived = obj(bind(folder / 'OLD_LOCK_ARCHIVED.json')); before = obj(bind(folder / 'OLD_LOCK_BEFORE.json'))
+    need(archived['before'] == before and archived['native']['complete'] is True and archived['native']['renamed'] is True and
+         archived['native']['fsync_completed'] is True and archived['native']['owner_unchanged'] is True, 'archive incomplete')
+    need(identity(before['old_lock']) == identity(result['lock']['old_lock']) and
+         before['old_owner'] == result['lock']['old_owner'], 'old lock not preserved')
+    rows = transport_proof(folder.parent / 'transport', SERIAL, txid, result['boot_id'])
+    mutations = [r['begin'] for r in rows if r['begin']['mutating']]
+    expected = {'stage2-upload-archiver', 'stage2-upload-scanner', 'stage2-upload-io_helper', 'stage2-upload-helper', 'stage2-archive-old-lock', 'stage2-new-lock'}
+    need(len(mutations) == 6 and {r['label'] for r in mutations} == expected and
+         result['operations'] == [{'label': r['label'], 'opid': r['op_id']} for r in mutations], 'deployment write scope/sequence')
+    by_label = {r['begin']['label']: r for r in rows if r['begin']['mutating']}
+    for key in ('archiver', 'scanner', 'io_helper', 'helper'):
+        begin = by_label['stage2-upload-' + key]['begin']; item = source['artifacts'][key]
+        need(begin['payload_bytes'] == item['bytes'] and begin['payload_sha256'] == item['sha256'] and
+             result['uploads'][key]['artifact'] == item, 'deployment uploaded payload differs')
+    for label in ('stage2-archive-old-lock', 'stage2-new-lock'):
+        need(by_label[label]['begin']['payload_bytes'] == 0, 'unexpected archive/owner stdin')
+    archive_rows = [json.loads(line) for line in by_label['stage2-archive-old-lock']['raw'].splitlines()]
+    need(len(archive_rows) >= 2 and archive_rows[0].get('event') == 'BEGIN' and archive_rows[-1].get('event') == 'RESULT' and
+         archive_rows[-1] == archived['native'], 'archive summary/raw disconnected')
+    scan = [r for r in rows if r['begin']['label'] == 'occupancy']; need(len(scan) == 1, 'exact successful full scan required')
+    native = [json.loads(line) for line in scan[0]['raw'].splitlines()]
+    need(native[-1] == result['scanner'] and native[-1]['event'] == 'RESULT' and native[-1]['complete'] is True and
+         native[-1]['unknown'] == [] and native[-1]['processes'] > 0 and native[-1]['namespaces'] > 0, 'scanner raw result')
+    partial_retained_proof(rows,result,before,manifest)
+    need({r['begin']['label'] for r in rows} <= expected | set(RETAINED_LABELS) | {'hash-chunk', 'read-chunk', 'clock', 'occupancy',
+         'stage2-geometry', 'stage2-state-old', 'stage2-state-archive', 'stage2-program-readback', 'stage2-program-independent-sha'}, 'unexpected deployment operation')
+    programs = {}
+    for key, stem, rootkey in (('scanner', 'scanner', 'scanner'), ('io_helper', 'io', 'io_helper'), ('helper', 'helper', 'directory_helper')):
+        u = result['uploads'][key]; artifact = manifest['artifacts'][rootkey]
+        need(u['artifact'] == source['artifacts'][key] == artifact and u['remote_path'] == '/data/local/tmp/e5-clean-' + stem + '.' + txid,
+             'deployment helper differs')
+        programs[u['remote_path']] = {'bytes': artifact['bytes'], 'sha256': artifact['sha256'], 'metadata': u['remote_metadata']}
+    return {'binding': binding, 'boot_id': result['boot_id'], 'state': normalized_state(result['lock'], True),
+            'programs': programs, 'result': result}
+
+def workflow_complete(binding, phase, manifest, txid):
+    complete = obj(binding); folder = Path(binding['path']).parent; unstopped(folder)
+    need(Path(binding['path']).name == 'COMPLETE.json' and complete['schema'] == 'e5-nextphase-workflow-result-v1' and
+         complete['phase'] == phase and complete['serial'] == SERIAL and complete['txid'] == txid and complete['complete'] is True and
+         complete['reboot_performed'] is False and complete['automatic_next_phase'] is False and complete['automatic_retry'] is False, 'wrong workflow completion')
+    request = json.loads(read(folder / 'REQUEST.json', complete['request_sha256']))
+    need(request['phase'] == phase and request['txid'] == txid and request['boot_id'] == complete['boot_id'] and
+         request['manifest_sha256'] == manifest['_bound_manifest_sha256'] and
+         request['runner_sha256'] == sha(read(BASE / 'workflow.py')), 'historical workflow request/source')
+    review = obj(request['technical_review']); proposal = {k: v for k, v in request.items() if k != 'technical_review'}
+    need(review['schema'] == 'e5-nextphase-workflow-review-v1' and review['decision'] == 'EXACT_ONE_PHASE_ONLY' and
+         review['request_binding_sha256'] == sha(canonical(proposal)), 'historical workflow independent review')
+    return complete, request, folder
+
+def probe(binding, manifest, txid, deployed):
+    complete, request, folder = workflow_complete(binding, 'probe', manifest, txid)
+    need(request['requirements'] == {'deployment': deployed['binding']}, 'probe deployment lineage')
+    result = obj(bind(folder / 'transport/NOREPLACE_HOST_RESULT.json'))
+    need(result == complete['result'] and result['schema'] == 'e5-noreplace-probe-host-result-v1' and
+         result['serial'] == SERIAL and result['txid'] == txid and result['boot_id'] == complete['boot_id'], 'probe actual result')
+    need(result['three_probe_paths_absent'] is True and result['approved_to_activate'] is False and
+         result['device_rootfs_or_block_writes'] is False and result['power_loss_safety_proven'] is False, 'probe scope')
+    artifact = manifest['artifacts']['probe']; need((result['helper_sha256'], result['helper_bytes']) == (artifact['sha256'], artifact['bytes']), 'probe helper changed')
+    rows = transport_proof(folder / 'transport', SERIAL, txid, complete['boot_id'])
+    writes = [r for r in rows if r['begin']['mutating']]
+    need([r['begin']['label'] for r in writes] == ['upload-noreplace-probe', 'noreplace-probe'], 'probe writes differ')
+    need(writes[0]['begin']['payload_bytes'] == artifact['bytes'] and writes[0]['begin']['payload_sha256'] == artifact['sha256'] and
+         writes[1]['begin']['payload_bytes'] == 0, 'probe uploaded payload')
+    native = [json.loads(line) for line in writes[1]['raw'].splitlines()]
+    need(len(native) == 9 and [r['event'] for r in native] == ['BEGIN'] + ['PHASE'] * 7 + ['RESULT'] and
+         native[-1] == result['native_result'], 'probe native sequence')
+    expected_phases = ['open-bindings', 'create-source', 'create-destination', 'existing-destination-test', 'missing-destination-test', 'cleanup-destination', 'cleanup-renamed']
+    need([r['phase'] for r in native[1:-1]] == expected_phases, 'probe native phases')
+    for row in native:
+        need(row['schema'] == 'e5-noreplace-probe-v1' and row['txid'] == txid and row['boot_id'] == complete['boot_id'] and
+             row['opid'] == writes[1]['begin']['op_id'] and row['cancel_signal'] == 0, 'probe native identity')
+    pid = native[0].get('self_pid'); start = native[0].get('self_starttime'); deadline = native[0].get('deadline_ms')
+    need(type(pid) is int and pid > 0 and type(start) is int and start > 0 and type(deadline) is int and deadline > 0, 'probe process/deadline')
+    lasttime = -1
+    for row in native:
+        need(row.get('self_pid') == pid and row.get('self_starttime') == start and row.get('deadline_ms') == deadline, 'probe process drift')
+        for role in ('data', 'lock'):
+            need(row.get(role + '_dev') == deployed['state'][role]['dev'] and row.get(role + '_ino') == deployed['state'][role]['inode'], 'probe native filesystem')
+        tick = row.get('checked_boottime_ms')
+        need(type(tick) is int and lasttime <= tick < deadline, 'probe native deadline'); lasttime = tick
+    final = native[-1]
+    need(final.get('phase') == 'complete' and final.get('power_loss_safety_proven') is False and final.get('mutation_attempted') is True and
+         type(final.get('source_inode')) is int and type(final.get('destination_inode')) is int and
+         0 < final['source_inode'] != final['destination_inode'] > 0, 'probe final node identities')
+    need(final['complete'] is True and final['outcome'] == 'COMPLETED' and final['errno'] == 0 and
+         all(final[x] is True for x in ('existing_dest_eexist', 'existing_inodes_unchanged', 'missing_dest_rename', 'cleanup_completed', 'f2fs_confirmed')),
+         'probe semantic proof missing')
+    state = normalized_state(result['after']); need(state == deployed['state'], 'probe/deployment filesystem or owner differs')
+    need(result['after']['owner_sha256'] == sha((txid + '\n').encode()), 'probe owner bytes')
+    return {'binding': binding, 'state': state, 'program': {'path': '/data/local/tmp/e5-clean-noreplace-probe.' + txid,
+            'bytes': artifact['bytes'], 'sha256': artifact['sha256']}, 'result': result}
+
+def activation(binding, manifest, txid, deployed, probed):
+    complete, request, folder = workflow_complete(binding, 'activate', manifest, txid)
+    need(request['requirements'] == {'deployment': deployed['binding'], 'probe': probed['binding']}, 'activation phase lineage')
+    inner = obj(request['inputs']['directory_request']); ds = load('directory_session', manifest)
+    need(inner['mode'] == 'activate' and inner['txid'] == txid and inner['boot_id'] == complete['boot_id'] and
+         inner['candidate'] == manifest['candidate'], 'activation exact candidate')
+    review = obj(inner['technical_review'])
+    need(review['schema'] == 'e5-clean-directory-session-review-v1' and review['bindings'] == ds.review_binding(inner) and
+         review['conclusion'] == 'exact_directory_transaction_reviewed', 'directory independent review binding')
+    original = ds._inventory(inner['original_inventory'], txid, 'active', complete['boot_id'])
+    staged = ds._inventory(inner['stage_inventory'], txid, 'stage', complete['boot_id'])
+    ds._stage_matches(staged, obj(manifest['candidate'])); ds._backup(inner['original_backup'], original)
+    d = folder / 'directory-session'; unstopped(d); plan = obj(bind(d / 'plan.json'))
+    need(plan == {'schema': 'e5-clean-directory-session-plan-v1', 'request_sha256': request['inputs']['directory_request']['sha256'],
+                  'request': inner, 'device_execution_authorized_by_this_document': False}, 'directory plan differs')
+    ph = sha(canonical(plan)); raw = read(d / 'journal.jsonl'); need(raw.endswith(b'\n'), 'torn directory journal')
+    previous = '0' * 64; events = []
+    for index, line in enumerate(raw.splitlines(), 1):
+        row = json.loads(line); h = row.pop('record_hash')
+        need(row['seq'] == index and row['previous'] == previous and row['plan_hash'] == ph and sha(canonical(row)) == h, 'directory journal chain')
+        previous = h; events.append(row['event'])
+    need(events == ['SESSION_BOUND', 'ARCHIVE_BEGIN', 'ARCHIVE_DONE', 'ACTIVATE_BEGIN', 'ACTIVATE_DONE', 'ACTIVATED'], 'full activation lifecycle missing')
+    for name in ('ARCHIVE', 'ACTIVATE'):
+        begin = obj(bind(d / ('MOVE-' + name + '-IN_FLIGHT.json'))); done = obj(bind(d / ('MOVE-' + name + '-COMPLETE.json')))
+        need(done['request_sha256'] == request['inputs']['directory_request']['sha256'] and done['begin_sha256'] == sha(canonical(begin)) and done['verified'] is True,
+             'directory move not complete')
+    receipt_binding = complete['result']['activation_receipt']; need(receipt_binding['path'] == str(d / 'ACTIVATION_COMPLETE.json'), 'activation receipt path')
+    receipt = obj(receipt_binding); active = obj(receipt['active_inventory'])
+    need(complete['result']['state'] == 'ACTIVE' and receipt['schema'] == 'e5-clean-activation-v3' and
+         receipt['serial'] == SERIAL and receipt['status'] == 'ACTIVATED' and receipt['txid'] == txid and receipt['boot_id'] == complete['boot_id'] and
+         receipt['candidate_sha256'] == manifest['candidate']['sha256'] and receipt['request_sha256'] == request['inputs']['directory_request']['sha256'] and
+         receipt['default_boot'] == 'android' and receipt['original_B_misc_verified'] is True and receipt['flash_authorization'] is False and
+         receipt['active_inventory']['path'] == str(d / 'active.inventory.json') and active['rows'] == staged['rows'] and
+         active['role'] == 'active' and active['boot_id'] == complete['boot_id'] and active['txid'] == txid and
+         active['tree_sha256'] == receipt['tree_sha256'] == staged['tree_sha256'], 'activation receipt/tree mismatch')
+    for filename in ('directory_session.py', 'android_directory_adapter.py', 'bounded_transport.py', 'bounded_boot_control.py'):
+        need(receipt['source_versions'][filename] == manifest['modules'][filename[:-3]], 'activation source version')
+    need(receipt['source_versions']['native_io'] == manifest['artifacts']['io_helper']['sha256'], 'activation native version')
+    rows = transport_proof(folder / 'transport', SERIAL, txid, complete['boot_id'])
+    writes = [r for r in rows if r['begin']['mutating']]
+    need(len(writes) == 4 and all(r['begin']['label'] == 'directory-helper' for r in writes), 'activation mutation scope')
+    actions = [json.loads(r['raw'].splitlines()[-1]) for r in writes]
+    need([r['action'] for r in actions] == ['seal', 'move-active-to-archive', 'move-stage-to-active', 'seal'] and
+         all(r['ok'] is True and r['fsync_completed'] is True for r in actions), 'activation native lifecycle')
+    return {'binding': binding, 'receipt': receipt_binding, 'boot_id': complete['boot_id'], 'txid': txid}
+
+def validate_requirements(requirements, manifest, phase, txid):
+    need(phase in PHASE_KEYS and isinstance(requirements, dict) and set(requirements) == PHASE_KEYS[phase], 'exact phase prerequisite set')
+    need(re.fullmatch('[a-f0-9]{16}', txid), 'transaction identity')
+    deployed = deployment(requirements['deployment'], manifest, txid)
+    result = {'schema': 'e5-phase-prerequisites-validated-v1', 'phase': phase, 'txid': txid, 'deployment': deployed,
+              'requirements': requirements, 'current_readback_required': True, 'execution_authorized': False}
+    if 'probe' in requirements: result['probe'] = probe(requirements['probe'], manifest, txid, deployed)
+    if 'activation' in requirements: result['activation'] = activation(requirements['activation'], manifest, txid, deployed, result['probe'])
+    return result
+
+def verify_current(adapter, validated, manifest):
+    """Fixed read-only operation after fresh_gate, under its enclosing host lock."""
+    need(validated['schema'] == 'e5-phase-prerequisites-validated-v1' and validated['txid'] == adapter.txid, 'prerequisite transaction')
+    module = load('android_directory_adapter', manifest)
+    need(type(adapter) is module.AndroidDirectoryAdapter and adapter._part is None, 'fixed real adapter outside mutation')
+    transport = adapter._ensure_transport()
+    need(transport.recovery_context is None and transport.reconciliation_only is False and not transport.poisoned and
+         transport.state == ROOT / ('evidence/e5-clean-v3-device-state-' + SERIAL) and
+         transport.serial == SERIAL and transport.txid == adapter.txid and transport.boot_id == adapter.boot_id, 'ordinary current transport only')
+    expected = validated['deployment']['state']; programs = dict(validated['deployment']['programs'])
+    if 'probe' in validated:
+        p = validated['probe']['program']; programs[p['path']] = p
+    paths = {'data': '/data', 'local': '/data/local', 'tmp': '/data/local/tmp', 'lock': LOCK, 'owner': LOCK + '/owner'}
+    script = adapter._locked()
+    for key, path in paths.items():
+        script += f'test ! -L {path}; test "$(readlink -f {path})" = {path}; test -' + ('f' if key == 'owner' else 'd') + f' {path}\nprintf "{key}\\t"; stat -c \'{STAT}\' {path}\n'
+    script += f'printf "OWNER\\t"; /data/adb/magisk/busybox sha256sum {LOCK}/owner\n'
+    for index, (path, item) in enumerate(sorted(programs.items())):
+        need(re.fullmatch(r'/data/local/tmp/e5-clean-(scanner|io|helper|noreplace-probe)\.' + adapter.txid, path), 'fixed current helper path')
+        script += f'test ! -L {path}; test -f {path}; test "$(readlink -f {path})" = {path}\nprintf "PROGRAM{index}\\t"; stat -c \'{STAT}\' {path}\n'
+        script += f'/data/adb/magisk/busybox sha256sum {path}\nprintf "AFTER{index}\\t"; stat -c \'{STAT}\' {path}\n'
+    def parse(raw):
+        lines = raw.splitlines(); need(len(lines) == 6 + len(programs) * 3, 'current proof framing')
+        def record(line, prefix):
+            name, sep, value = line.partition(b'\t'); need(sep and name.decode() == prefix, 'current row order')
+            fields = value.decode('ascii').split('|'); need(len(fields) == 14, 'current stat fields')
+            return {'mode_bits': int(fields[0], 16), 'dev': int(fields[1]), 'inode': int(fields[2]), 'bytes': int(fields[3]), 'mode': fields[4],
+                    'uid': int(fields[5]), 'gid': int(fields[6]), 'nlink': int(fields[7]), 'mtime': fields[8], 'ctime': fields[9],
+                    'mtime_text': fields[10], 'ctime_text': fields[11], 'rdev_major': int(fields[12], 16), 'rdev_minor': int(fields[13], 16)}
+        rows = {key: record(lines[index], key) for index, key in enumerate(paths)}
+        need(normalized_state(rows) == expected, 'current filesystem/lock/owner differs from completed deployment/probe')
+        need(lines[5] == ('OWNER\t' + sha((adapter.txid + '\n').encode()) + '  ' + LOCK + '/owner').encode(), 'current owner bytes changed')
+        for index, (path, item) in enumerate(sorted(programs.items())):
+            at = 6 + index * 3; before = record(lines[at], 'PROGRAM' + str(index)); after = record(lines[at + 2], 'AFTER' + str(index))
+            need(before == after and stat.S_ISREG(before['mode_bits']) and before['dev'] == expected['data']['dev'] and
+                 before['bytes'] == item['bytes'] and before['nlink'] == 1 and before['uid'] == before['gid'] == 0 and before['mode'] == '700' and
+                 lines[at + 1] == (item['sha256'] + '  ' + path).encode(), 'current helper identity/hash differs')
+            if 'metadata' in item:
+                saved = item['metadata']; need(before['dev'] == saved['dev'] and before['inode'] == saved['inode'], 'helper replaced since deployment')
+        return {'schema': 'e5-phase-current-readback-v1', 'boot_id': adapter.boot_id, 'txid': adapter.txid,
+                'same_deployment_identities': True, 'helper_hashes_verified': True, 'device_writes': False}
+    return adapter._request('phase-prerequisites-current', script, limit=16384, validator=parse)

@@ -1,0 +1,42 @@
+# 有限大文件预算准备副本
+
+本包仅完成 Mac 离线修订、材料核验和回归。没有调用设备、改变共享 marker/ledger、创建现场批准或延长任何历史证据。源基底是冻结的 `e5_activation_bundle_176656abb97d4b2c/RESULT.json`。四个新目录和全部 28 项 SHA 在 RESULT.json；CHANGES.patch 是相对该基底的完整差异。原目录保持不变。
+
+写入、目录事务、部署、恢复、rearm、验收入口均恢复禁用。observe.py 为保持历史原始记录的来源链，保留原 enabled 字节（c71aa30…8ceb8），本轮没有运行它。原生 helper 二进制也仅字节复制、未执行。因此不能把本包称为“所有 I/O 入口均禁用”，也不能直接用作已批准实机副本。未来须机械启用并重新封装、独审固定来源；不得改变已经用于 probe/activate 的同一套执行来源。
+
+| 阶段 | 总预算上限（秒） |
+| --- | ---: |
+| probe | 900（不变） |
+| inventory | 3600 |
+| backup | 5400 |
+| stage | 7200 |
+| activate / rollback | 5400 |
+| install-linux | 3600 |
+
+这些是上限，实际单阶段请求可取更短预算。所有 PHASES 在创建 adapter 前要求 `total_seconds + 5 < 当前证据剩余时间`，包括 inventory、backup、stage。剩余不足时须先获取真实同 boot refresh、新双读及独立复审；不自动续传、降低校验或延长旧租约。逐请求远端 6 秒、主机 8 秒、16 MiB 读/4 MiB 写、原生期限、身份/双读/哈希、保护区与写入范围没有变化。
+
+## 长租约的来源与有效期
+
+只对 purpose=directory 提供最多 10800 秒的证据有效期。recovery/rearm 的 raw 900 秒与 wrapper 600 秒保持不变；boot Budget 默认仍 900，只有 exact install-linux 的内部调用可到 3600。
+
+长 cold/refresh/original review 必须绑定 `evidence_contract.directory_budget_policy()` 返回的精确 policy（含源码 SHA 和 not_before）。实际观察首、末样本均须在 policy 产生之后，review 必须在证据结束后 900 秒内真实产生。directory 的新 reconcile 额外记录真实 `capture_started_at`，长 original review 要求它不早于 policy 且不晚于 raw captured_at。raw producer 源 SHA、四 runtime pins、全部实际 raw/130 请求仍逐项重验。旧 transport 没有逐请求 wall-clock 字段；本包不声称能从旧请求推导开始时点。
+
+没有显式长 policy 的 review 永远保留 `min(签署 expiry, 证据结束+900)`，即使 review 晚 800 秒生成、签署到结束后 1700 秒，也不会使已过期旧证据重新有效。旧 signed expiry 不改写。新目录证据必须来自实际新冷观察/或已审同 boot refresh、新 raw、新 review；历史 cold1 仅可按既有规则作 boot 排除来源。
+
+workflow 技术 review 仍在首次 dispatch 按真实当前时间检查 15 分钟。DirectorySession 同一已 open 实例固定首次 admitted_at、request 路径/SHA、绝对 monotonic deadline；后续 move 用该首次时刻检查同份 review，同时重新核实际 cold expiry、取消与总 deadline。新实例/open/resume 必须重新通过当前 15 分钟门，不存在可落盘复用的 admission。
+
+## 实测依据与边界
+
+`evidence/clean-reinstall-check-20261014/session-01/directory-02` 的 7 文件共 2,425,201,148 字节，148 次 data +148 次独立 hash 请求耗时合计 592.3026 秒。activate 的旧树与候选树两次完整检查仅文件部分已约 1184.6 秒，尚未算保护区、scanner 和备份。
+
+冻结调用计数给出 activate 最少返回 6,090,966,131 字节，install 最少返回 3,614,417,527 字节；前者已有约 12.18 GB 设备读取，后者约 6.56 GB，加上传 67,108,896 字节。stage 还有 583 次有界普通文件写、每块 scanner/fsync/readback。900 秒是结构性不足。本次有限上限根据已有速率留余量，不能保证更慢或发生树变化的现场必定完成；超时仍停止、保留 UNKNOWN，不自动重试。
+
+## 校验与重封
+
+运行 `python3 -B tools/e5_largefile_budget_prepare_20261015/test_budget.py`：120 项 host/fake 测试通过。包含真实文件构造的 cold/raw 重放、旧 lease 反例、policy 起点、缺失/错误 producer、purpose 隔离、全 phase fit、同实例超过 15 分钟与新实例拒绝、总 deadline/取消/请求变化。测试进程在导入前禁止 subprocess/socket。
+
+`host_verify.py` 重算 28 新文件、28 基底文件、全部固定材料及 8 项候选，导入实际重封模块检查 dependency；不调用设备方法。HOST_VERIFY.json 记录结果。源码业务变更仅七文件：workflow、adapter、cold_bridge、boot Budget、DirectorySession、evidence_contract、recovery（directory-only 起始时间元数据）。其他源码差异仅 gates/paths/pins，原生文件和 transport/observer 字节不变。
+
+build_prepare.py 是首次创建脚本；reseal_prepare.py 只允许尚未有 DELIVERY 的这四个固定准备目录，补齐依赖 SHA、manifest 与 diff；DELIVERY 存在后拒绝重封。初期失败日志是测试 harness 调用/组合 namespace 的问题，保留供审阅；最终 120 项通过。不得用测试 fixture 作为现场证据。
+
+补充记录：首次冻结后的机械启用预检发现 collect.sh 的内嵌 gate 未跟 collect.py 同步禁用，尚无任何设备调用。已改为精确内嵌同一禁用源码，补专门测试；旧 MANIFEST/DELIVERY 以 superseded-embedded-gate 后缀保留，唯一有效清单为当前无后缀文件。

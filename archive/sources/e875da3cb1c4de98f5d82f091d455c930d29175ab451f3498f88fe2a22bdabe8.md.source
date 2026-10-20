@@ -1,0 +1,48 @@
+# 已批准试启的临时被动日志
+
+仅主代理操作设备。本目录是独立启用副本；`observer.py` 相对已审准备版唯一修改为 `DEVICE_EXECUTION_ENABLED = True`，原准备文件不改。固定 `@modemd`，零发送载荷；CP 观察器保持原 600 秒上限。`trial_logs.py` 负责脱离 SSH 后保存在 RAM 的有限日志，不修改固件、服务配置、网络、频段或默认启动，不执行 AT、MM 或屏幕 RPC、不启用 e5-modemd、不 reset CP、不重启设备。
+
+用户试用时长由用户决定。本采集器只采集启动后的**约 600 秒**，之后停止自己和自己的 CP 子进程，设备正常继续运行。采用 CLOCK_BOOTTIME 截止，记录 UTC/monotonic/boottime/boot ID；快照和命令超时可能令截止略延后，系统若休眠则期间无法采样，唤醒后才处理停止。CP engine 使用 monotonic，休眠计时特性不等同 boottime。超过日志窗口后的故障需重接读取系统现存环日志，不能声称持续监测整个试用期。
+
+## 接入与已有采集器
+
+- SSH：`root@192.0.2.1`。固定 known_hosts：[原文件](/REDACTED_HOST_PATH `0000000000000000000000000000000000000000000000000000000000000000`；ED25519 fingerprint `SHA256:ZpjI7g8G5Ncfqq5FvWcDW09v6JzZKAJCcJ5d6cFcyqo`。采用 `StrictHostKeyChecking=yes` 与此专用 known_hosts，密钥变化即停，不用自动接受策略。认证沿主代理已建立的私密认证对象；本工具不携带、读取或输出密码。
+- 热点 SSID/密码沿现有私密安装配置和实际设备，不打印无线配置整对象；`ubus network.wireless status` 可能包含 PSK，不纳入新采集器。热点/LuCI 同 LAN 地址 `192.0.2.1`，但 Wi-Fi SSH 放行与客户端路由须实际核对，不能假设拔 USB 后 Mac 必然可 SSH。
+- 原 [firstboot collector](/REDACTED_HOST_PATH 不发 AT；固定命令仅 busybox 列表/dmesg/logread、固定源码 `next-boot status` 和 `NV verify`。它的物理分区多次读取适合一次基线/复核，不循环运行。本轮持续采集不调 ModemManager，也不调屏幕 status（原屏幕链会主动工程小区/QoS 查询）。
+
+## 最小临时内容与运行卡
+
+设备目录唯一固定 `/tmp/e5-d0-trial-20261013`，必须是 tmpfs 中新建的普通独占目录，开始时只有 `trial_logs.py`、`observer.py` 两普通文件。主代理用既有 SSH/SFTP 将本目录两源文件上传；创建目录使用原子 `mkdir`，若已存在则停，不能 rm 后冒充首次运行。上传后先按本机 manifest 校验两源 SHA，再启动。
+
+设备端由主代理执行的命令（此文档本身不运行）：
+
+```sh
+/usr/bin/python3 -B /tmp/e5-d0-trial-20261013/trial_logs.py start
+/usr/bin/python3 -B /tmp/e5-d0-trial-20261013/trial_logs.py status
+```
+
+start 返回 PID **不代表已 ready**。拔 USB 前必须核：identity.json 对应本次 boot ID、cp.jsonl 含 start/connected 或明确 connect_error/end、system-initial.jsonl 已生成、launcher.log 没有异常，且已镜像回 Mac。CP 未连接时只代表 CP 原始取证缺口，不能显示成已连接；由主代理明确处理，不自动重试或启用别的服务。collector 本身不经 PID 文件杀进程。
+
+主代理的首次镜像及重接后读取可经已固定 SSH 会话执行以下单一读取命令，将二进制 stdout 原样写入**主机新文件**：
+
+```sh
+/opt/e5/bin/busybox tar -C /tmp -cf - e5-d0-trial-20261013
+```
+
+正在写入时的镜像不是一致性快照，应记录时刻；CP/JSONL 尾行可能尚未完整。最终先 status；若仍在运行且要停止，执行：
+
+```sh
+/usr/bin/python3 -B /tmp/e5-d0-trial-20261013/trial_logs.py stop
+```
+
+stop 仅创建本次 boot ID 目录内 STOP 文件，不通过 PID 发信号；循环发现后只停止自身拥有的 CP Popen 子进程。等待 `complete.json`/status complete，再镜像。无需删除目录；不要运行 pkill/killall，不中断任何现有服务。若采集已达到约 600 秒会自行 complete。**断电/回 Android/重启后所有 RAM 日志丢失，务必先镜像。**
+
+## 边界与证据
+
+一个 collector 后台进程、一个 CP 子进程（前约 600 秒），以及串行短暂只读命令。每约 20 秒读取 dmesg/logread、netifd WAN status、`iw dev` 与固定 `wlan0 station dump`，加 sysfs 供电/UDC/extcon/温度/网卡状态、proc 路由和计数、DHCP leases、vendor 日志末尾。命令不存在或异常会逐项记录，不能算验收通过；不自动试探新命令。
+
+原始 CP 分片和 NUL/nonUTF-8 由 observer base64 保留，最多 1 MiB 原始/2 MiB JSONL。系统初始快照最多 512 KiB；最近日志为两个各最多 2 MiB 的 JSONL 环文件。每个 dmesg/logread/vendor 片段最多保留末尾 64 KiB并标记截断；并非无损全量系统日志。内核 RLIMIT_FSIZE 还限制各输出文件最多 2 MiB，含 CP stderr、launcher。全部固定文件的上界低于 11 MiB（低于 16 MiB），没有无限后台监测。complete/exit 是采集结束证据，**不是蜂窝功能通过**。
+
+固定源码的 `e5-usb-watch` 只在 extcon USB=1 且 SDP/CDP 主机端口未配置时执行有限次数 USB soft reconnect；拔线时清零计数，不见因此改蜂窝策略/触发系统 suspend 的代码。`t551m-screen-power` 只处理背光和触摸；power_supply 事件可触发屏幕唤醒。该静态范围不证明整个内核/基带不会进入低功耗；本采集器只记录供电/UDC/时间轴，不改电源或无线策略。
+
+8 项主机 fake 测试通过：启用单行差异、严格 subprocess allowlist、环日志边界、原始 tail 数据、主机拒执行、状态模拟、STOP 不杀外部 PID、无 shell/AT/reset/网络变更。真实脱离 SSH/拔线持续性和 vendor modemd 兼容性仍需本次现场核验，不以离线测试替代。

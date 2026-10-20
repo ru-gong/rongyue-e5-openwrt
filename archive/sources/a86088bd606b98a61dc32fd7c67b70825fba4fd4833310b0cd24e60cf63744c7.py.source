@@ -1,0 +1,29 @@
+import sys
+def audit(e,a):
+ if e.startswith(('subprocess.','socket.')) or e in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('external IO')
+sys.addaudithook(audit)
+from pathlib import Path
+import importlib.util,unittest
+from unittest.mock import patch
+import cold_bridge as b
+SOURCE=b.ROOT/'tools/e5_next_recovery_prepare_20261015/test_next.py'
+spec=importlib.util.spec_from_file_location('_integration_recovery_fixture',SOURCE);f=importlib.util.module_from_spec(spec);spec.loader.exec_module(f)
+class BridgeTests(unittest.TestCase):
+ def test_three_actual_sources_load_without_external_IO(self):
+  module=b._module();self.assertEqual(Path(module.__file__),b.SOURCE)
+ def test_source_and_dependency_tamper_stops_before_loader(self):
+  with patch.object(b,'SOURCE_SHA256','f'*64),self.assertRaises(b.Refusal):b._module()
+  with patch.object(b,'DEPENDENCIES',{**b.DEPENDENCIES,'common.py':'f'*64}),self.assertRaises(b.Refusal):b._module()
+ def test_missing_dependency_and_old_schema_refused(self):
+  with patch.object(b,'DEPENDENCIES',{}),self.assertRaises(b.Refusal):b._module()
+  with self.assertRaises(b.Refusal):b.validate_directory_ready({'old_plan':True},f.NEW)
+ def test_real_provider_replays_raw_fixture_through_bridge(self):
+  case=f.Tests();case.setUp()
+  try:
+   env,rb,out=case.raw_fixture();provider=b._module();p=f.e.profile()
+   with patch.object(provider,'profile',side_effect=f.e.profile),patch.object(b,'ORIGINAL_B',p['original_boot_b_sha256']),patch.object(b,'ORIGINAL_MISC',p['original_misc_sha256']):
+    value=b.validate_directory_ready(env,f.NEW,case.clock);self.assertEqual(value['status'],'ORIGINALS_VERIFIED');self.assertFalse(value['approved_to_flash'])
+    (sorted((out/'transport').glob('*-read-boot_b-*'))[-1]/'COMPLETE.json').unlink()
+    with self.assertRaises(FileNotFoundError):b.validate_directory_ready(env,f.NEW,case.clock)
+  finally:case.doCleanups()
+if __name__=='__main__':unittest.main()

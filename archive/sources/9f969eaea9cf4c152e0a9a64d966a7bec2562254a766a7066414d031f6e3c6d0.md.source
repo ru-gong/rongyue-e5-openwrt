@@ -1,0 +1,76 @@
+# 下一轮只读观察、原 B 恢复及 BC32 再试启（准备版）
+
+本目录只做 Mac 准备，三个设备入口均有字面禁用门，无环境变量或 CLI 开关。没有执行 E5 / ADB / USB / 手机 SSH，也没有改动现有 marker、ledger 或设备目录。主线程是唯一设备操作者。下面命令在此版本只能计划、校验或制作主机草案；`observe/refresh/reconcile/capture/execute/run` 均拒绝实际 I/O。
+
+## 三个用途及边界
+
+- `directory`：无卡 Android A / root / 固定 userdata 别名与 rdev，原 B 与完整 misc 必须已恢复；供后续目录工具使用。
+- `recovery`：无卡、新 boot、新 tx、真实 16 项双读、900 秒原始现场时效及两层原件恢复独审。只允许本机 p37 原 `boot_b` 64 MiB 和 p3 的 `[2048,2080)` 32 字节。不需要 scanner，不创建/删除/归档设备锁，也不上传/覆盖 helper。复用已经上传且每写前重验 SHA 的固定 native IO。
+- `rearm-with-sim`：仅再次试启 B 的 BC32 单写。用户确认 SIM1 移动、SIM2 联通；每个 root 请求严格要求 `gsm.sim.state=READY,READY`，NOT_READY/ABSENT/其他值停止。使用既有目录/helper 所属 tx，另用全新 request ID / request SHA / op ID，ledger 必须 COMPLETE 或为空、所有共享 barrier 均 absent。绝不借 recovery context 绕过 normal gate。完整 B 在候选诊断窗 `[56,60) MiB` 外须匹配新候选；写前后完整 B 必须逐字节不变；完整 misc 读回只能目标 32 字节不同，13 个保护区与主 GPT 前缀前后核对。无 B 本体写、重启、自动重试或自动恢复。
+
+原件：`evidence/stage2-execution-20261013/android-install-01/{boot_b.before.bin,misc.before.bin}`；B SHA `0000000000000000000000000000000000000000000000000000000000000000`，完整 misc SHA `0000000000000000000000000000000000000000000000000000000000000000`。它们不是当前 Linux B / 已变 BC32。
+
+BC32-only 固定候选是 `materials/openwrt-no-auto-fsck-20261015/candidate.json`（`056b5204…697b5`）与 64 MiB boot `aeac7894…706ce`；不是旧 `153af211…`。头 56 MiB / 尾 4 MiB 的精确摘要在 `rearm.py`。候选独审与用户执行范围仍必须另外绑定，包的 SHA 本身不是授权。
+
+## 真实证据合同
+
+`evidence_contract.py` 是纯主机验证器，不初始化 transport、不导入同名 runtime；依赖使用 `_e5_next_*` 唯一 namespace。调用方必须一起固定 `common.py`、`observe.py`、`evidence_contract.py` 的 SHA（本清单覆盖全部文件）。
+
+```python
+validate_cold(binding, now)
+validate_original(binding, now)
+validate_directory_ready(binding, boot_id, now)
+```
+
+`binding` 精确为 `{"path": "/absolute/host/file.json", "sha256": "64hex"}`。目录 envelope 精确字段：
+
+```json
+{
+  "schema": "e5-next-directory-evidence-v1",
+  "serial": "DEVICE_SERIAL_REDACTED",
+  "boot_id": "实际 UUID",
+  "cold_request": {"path": "…", "sha256": "…"},
+  "cold_complete": {"path": "…/COMPLETE.json", "sha256": "…"},
+  "cold_review": {"path": "…", "sha256": "…"},
+  "cold_refresh": null,
+  "readonly_result": null,
+  "original_review": null
+}
+```
+
+先做 cold-only envelope，后两项最初为 null。原件复核完成后绑定 `READONLY_RESULT.json` 与独立原件复审。`cold_refresh` 为 null，或同 boot 刷新 pair 的 path/SHA。它不是布尔“通过”。目录返回 `e5-next-directory-ready-v1 / ORIGINALS_VERIFIED`、同 boot、最早有效期、原 B/misc SHA、真实证据 digest，始终 `device_execution_allowed=false / approved_to_flash=false`。稳定比对可排除 `checked_at`，其余字段不得省略。
+
+机器重验原始 21 次健康（至少 600 秒、首次 uptime ≤120 秒）、初末 crash/pstore/PID1、精确脚本与 argv、stdout/stderr/退出码/8 秒请求期限、初末诊断真实时序及 PID1 namespace/starttime。还会重验完整 16 raw 与两遍 transport 读回：生产 profile 共 177,242,112 字节、130 个只读请求（30 geometry + 100 chunks）。每份原始字节、offset/length、节点身份和请求脚本都比对。姓名与 SHA 只用于责任/证据绑定，不提供身份认证；冷开机动作、UI、日志异常仍由实际独立复审确认。
+
+## 长阶段的同 boot 刷新
+
+最初完整 cold 是历史基线，不会改标签或假造第二次 cold。长备份/暂存后，可在**同 boot、normal 无 barrier**下单独采两次短健康和初末 crash/pstore/PID1。必须引用最初真实 cold 及其及时独审，再对最新原文/UI 独审；得到新的最多 900 秒读取租约。UNKNOWN 不准 refresh，仍需新 boot + 完整 cold。
+
+刷新不会延长任何旧分区现场的 900 秒。刷新后需重新做 16 项完整双读，才能形成新的恢复/目录/BC32 现场。普通文件 staging 可分阶段使用独立预算；最终 rename / 块写只消费未过期的证据，不要求所有备份与 staging 在最初 15 分钟内做完。
+
+## 可用 CLI 顺序
+
+以下均在工作区根目录执行。`<…>` 必须来自真实后续材料，不是工具产生的通过票据。I/O 必须等新执行确认、独立 gate-only 启用及整个依赖 pin 重绑复审后，由主线程调用；本目录自身不能启用。
+
+1. `python3 -B tools/e5_next_recovery_prepare_20261015/recovery.py plan`：仅展示范围。
+2. `recovery.py state-request --tool-manifest-sha <本清单SHA> --previous-boot <已知前boot> --purpose directory|recovery --output <新host目录>`：保存动态 marker/ledger snapshot 与 cold 请求。不变更屏障。装卡用途另提供 `--purpose rearm-with-sim --sim-confirmation <真实用户确认记录> --sim-confirmation-sha <SHA>`。
+3. `observe.py observe --tool-manifest-sha <SHA> --request <COLD_REQUEST.json> --sha256 <SHA>`：将来受审启用后，真实 21 次观察；本准备版立即拒绝。
+4. 独立复审 raw，再 `recovery.py cold-envelope --tool-manifest-sha <SHA> --input <COMPLETE.json> --sha256 <SHA> --review <真实cold review> --review-sha256 <SHA> --output <新目录>`。
+5. 无卡只读：`recovery.py reconcile --tool-manifest-sha <SHA> --input <COLD_ENVELOPE.json> --sha256 <SHA> --txid <新16hex> --helper-owner-tx <既有IOhelper所属tx> --output <新目录>`。装卡再试启改用 `rearm.py capture`、`--helper-owner-tx <已有owner>`；不会上传或执行 helper。
+6. 目录用途：独审 16 raw 后 `recovery.py directory-envelope --tool-manifest-sha <SHA> --input <cold envelope> --sha256 <SHA> --readonly-result <READONLY_RESULT.json> --readonly-sha256 <SHA> --review <原件复审> --review-sha256 <SHA> --output <新目录>`。root bridge 调 `validate_directory_ready`，不能复用旧 resume schema。
+7. 原件恢复：`recovery.py draft --tool-manifest-sha <SHA> --input <READONLY_RESULT.json> --sha256 <SHA> --seconds <30..600且足够剩余租约> --output <新目录>` → 第一份真实独审 → `bind-request` → 第二份真实独审 → `bind-bundle` → `validate`。这三个命令的 `--input/--sha256` 分别是 request proposal / bundle proposal / bound bundle；均需 `--readonly-result/--readonly-sha256`，bind 命令另需 `--review/--review-sha256`。最终 `execute` 同时绑定 bundle 与 readonly result，只恢复固定原件，不继续安装。
+8. BC32-only：`rearm.py draft --tool-manifest-sha <SHA> --input <READONLY_RESULT.json> --sha256 <SHA> --request-id <新32hex> --seconds <预算> --output <新目录>`；实际独审后 `rearm.py validate|run --input <REQUEST_PROPOSAL.json> --sha256 <SHA> --review <复审> --review-sha256 <SHA> --tool-manifest-sha <SHA>`。`run` 另需新 `--output`，本版拒绝运行。
+
+同 boot 刷新：`recovery.py refresh-request --input <原始cold envelope> --sha256 <SHA> --output <新目录> --tool-manifest-sha <SHA>`；将来启用 `observe.py refresh --request <REFRESH_REQUEST.json> ...`；独审后 `recovery.py refresh-envelope --prior <原始envelope> --prior-sha256 <SHA> --input <refresh COMPLETE> --sha256 <SHA> --review <最新真实复审> --review-sha256 <SHA> --output <新目录> --tool-manifest-sha <SHA>`。随后重新执行第 5 步，旧 raw 不能续期。
+
+## 运行实现与未承诺的部分
+
+恢复复用新 `tools/e5_nextphase_core_prepare_20261015` 的固定有界 backend、ledger 和 recovery-only grant。新 core 对正常 COMPLETE、无 marker 的已完成试用失败也可从最后 START 的旧 boot 推导必须新 boot；不会捏造 UNKNOWN。prepare core 的禁用门也须在将来受审独立副本启用并重新绑定源码 SHA。`common.NATIVE_LOCAL` 仅保留旧已上传 IO 字节的本机校验路径，不执行它。
+
+每次实际写有持久 IN_FLIGHT、共享屏障、短期限、同 ACTIVE 完整读回；B 原件逐块恢复后全量复核，再写原 BC32。失败永久 UNKNOWN、不重放、不自动清理、不自动重启。成功 grant 仅按已审 core 归档主机记录；设备旧 lock / helper 仍留存，需要阶段 2 单独已授权处理。主机进程终止不证明阻塞内核 syscall 已退出。恢复后 Android 新启动健康/联网需另外验收。
+
+若 Android 无法启动，本包不提供 FDL 救援或物理 A 写入；必须停止并重新审定。普通目录回退、userdata/super、物理 NV、A、其它 B 引导链、misc 窗外均不在本包写范围。归档/日志检查不等于已经验证 E5 硬件。
+
+## 测试
+
+`python3 -B -m unittest -v test_next`。导入前 audit hook 禁 subprocess/socket，使用临时主机文件和 fake backend。42 项覆盖原始 cold/refresh 与双读 transcript、错误来源/过期/换 boot/未知状态、恢复提案和模板拒绝、BC32-only 正常/丢 ACK/窗外变化/保护变化/取消。分区 fixtures 保留 16 项形状但缩小字节，engine 的分区读回范围另用 fake；不是硬件或完整 177 MiB 实机测试。新 core 的正常 COMPLETE grant 由其独立 23 项测试覆盖。

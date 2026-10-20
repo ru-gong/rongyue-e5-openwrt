@@ -1,0 +1,6 @@
+id=e5_local_system_switch
+name=E5 system switch — sanitized research reference
+version=1.0.2-reference
+versionCode=10002
+author=ru-gong; Enceka upstream boot-control design
+description=Source reference only. No executable helper or device bindings included.

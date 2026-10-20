@@ -1,0 +1,284 @@
+"""Host/fake only. No process, network, ADB or USB can run in this test process."""
+import sys
+def sentinel(event,args):
+    if event.startswith(("subprocess.","socket.","os.exec","os.posix_spawn","os.spawn")) or event=="os.system":
+        raise AssertionError("external execution forbidden: "+event)
+sys.addaudithook(sentinel)
+import copy
+import json
+import re
+import signal
+import struct
+import tempfile
+import threading
+import unittest
+from types import SimpleNamespace
+from pathlib import Path
+from unittest.mock import patch
+import zlib
+import bounded_boot_control as b
+
+BOOT="00000000-0000-4000-8000-000000000001"
+
+class Fake:
+    def __init__(self,parts):
+        self.boot_id=BOOT;self.parts={k:bytearray(v) for k,v in parts.items()};self.reads=[];self.writes=[]
+        self.preflights=0;self.ready=[];self.fault=None;self.poisons=[]
+    def execution_scope(self,request,request_sha):pass
+    def finish_recovery(self,result_path,result_sha):pass
+    def poison(self,reason):self.poisons.append(reason)
+    def preflight(self,budget):
+        budget.check();self.preflights+=1
+        if self.preflights==2 and self.fault=="protection":self.parts["boot_a"][0]^=1
+        if self.preflights==2 and self.fault=="misc_before_arm":self.parts["misc"][0]^=1
+    def verify_install_ready(self,binding,budget):self.ready.append(binding);budget.check()
+    def read_chunk(self,part,off,n,budget):
+        budget.check();self.reads.append((part,off,n));result=bytes(self.parts[part][off:off+n])
+        if self.fault=="bad_readback" and self.writes and part=="boot_b":result=bytes([result[0]^1])+result[1:]
+        return result
+    def write_chunk(self,part,off,data,op,budget):
+        budget.check();self.writes.append((part,off,len(data)));self.parts[part][off:off+len(data)]=data
+        if self.fault=="lost_ack":raise TimeoutError("ACK lost after write")
+        if self.fault=="cancel":budget.cancel.set()
+        if self.fault=="deadline":budget.end=budget.clock()-1
+        if self.fault=="sigterm":signal.raise_signal(signal.SIGTERM)
+        if part=="misc" and self.fault=="partial_misc":
+            self.parts[part][off+16]^=1;raise TimeoutError("partial misc uncertain")
+        if part=="misc" and self.fault=="outside_misc":self.parts[part][0]^=1
+        return {"op_id":op,"part":part,"offset":off,"bytes":len(data),"fsync_completed":True}
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.original=b"O"*b.BOOT_BYTES;cls.current=b"C"*b.BOOT_BYTES;cls.linux=b"L"*b.BOOT_BYTES
+        bc=bytearray(32);bc[:4]=b"_a\0\0";bc[4:8]=b"BCAB";bc[8]=1;bc[9]=2;bc[12]=0xff;bc[14]=0x0f
+        struct.pack_into("<I",bc,28,zlib.crc32(bc[:28]));cls.bc=bytes(bc)
+        m=bytearray(b.MISC_BYTES);m[b.BC_OFFSET:b.BC_OFFSET+32]=bc;cls.misc=bytes(m)
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name).resolve();(self.root/"evidence").mkdir()
+        self.p={"serial":b.SERIAL,"partitions":{},"protected_hashes":{},"gpt_prefix_sha256":b.sha(b"G"*32768),
+            "original_boot_b_sha256":b.sha(self.original),"original_misc_sha256":b.sha(self.misc)}
+        self.parts={"boot_b":self.current,"misc":self.misc,"gpt":b"G"*32768}
+        for i,k in enumerate(sorted(b.PROTECTED)):
+            data=bytes([i])*4096;self.parts[k]=data
+            self.p["partitions"][k]={"bytes":len(data)};self.p["protected_hashes"][k]=b.sha(data)
+        self.patchers=[patch.object(b,"ROOT",self.root),patch.object(b,"profile",lambda:copy.deepcopy(self.p)),
+            patch.object(b,"LINUX_BOOT_SHA",b.sha(self.linux)),patch.object(b,"ORIGINAL_MISC_REL","misc.bin"),patch.object(b,"DEVICE_IO_DISABLED",False),
+            patch.object(b,"_backend_type",lambda obj:b.require(type(obj) is Fake,"test requires Fake"))]
+        for p in self.patchers:p.start()
+        self.device=Fake(self.parts)
+        (self.root/"original.bin").write_bytes(self.original);(self.root/"linux.bin").write_bytes(self.linux);(self.root/"misc.bin").write_bytes(self.misc)
+    def tearDown(self):
+        for p in reversed(self.patchers):p.stop()
+        self.tmp.cleanup()
+    def request(self,mode="restore-original",tx="0123456789abcdef",recovery=None):
+        image=self.original if mode=="restore-original" else self.linux
+        return {"schema":"e5-bounded-boot-request-v3","serial":b.SERIAL,"boot_id":BOOT,"txid":tx,
+            "mode":mode,"total_seconds":900,"expected_before":{"boot_b":b.sha(bytes(self.device.parts["boot_b"])),"misc":b.sha(bytes(self.device.parts["misc"]))},
+            "image":{"path":str(self.root/("original.bin" if mode=="restore-original" else "linux.bin")),"bytes":b.BOOT_BYTES,"sha256":b.sha(image)},
+            "original_misc":{"path":str(self.root/"misc.bin"),"bytes":b.MISC_BYTES,"sha256":b.sha(self.misc)},
+            "recovery":recovery,"install_ready":None if mode=="restore-original" else {"path":"fake-only","sha256":"f"*64}}
+    def run_req(self,r=None,out="run"):
+        r=r or self.request();path=self.root/(out+".request.json");path.write_bytes(b.canonical(r))
+        self.device.txid=r['txid']
+        return b.execute(self.device,path,b.sha(path.read_bytes()),self.root/"evidence"/out)
+    def events(self):
+        with b.Ledger() as ledger:return copy.deepcopy(ledger.rows)
+    def fail_with(self,kind):
+        self.device.fault=kind
+        with self.assertRaises((b.Refusal,TimeoutError,InterruptedError)):self.run_req()
+        self.assertEqual(self.events()[-1]["event"],"UNKNOWN")
+        self.assertEqual(len(self.device.poisons),1)
+    def test_default_disabled_before_device_or_ledger(self):
+        with patch.object(b,"DEVICE_IO_DISABLED",True):
+            with self.assertRaisesRegex(b.Refusal,"DISABLED"):self.run_req()
+        self.assertEqual(self.device.reads,[]);self.assertFalse((self.root/"evidence"/(".bounded-boot-v3-"+b.SERIAL)).exists())
+    def test_original_full_transaction_boundaries(self):
+        result=self.run_req();self.assertTrue(result["complete"]);self.assertFalse(result["reboot_performed"])
+        self.assertEqual(self.device.writes,[("boot_b",i,b.CHUNK) for i in range(0,b.BOOT_BYTES,b.CHUNK)]+[("misc",2048,32)])
+        self.assertEqual(bytes(self.device.parts["boot_b"]),self.original);self.assertEqual(bytes(self.device.parts["misc"]),self.misc)
+        ev=self.events();self.assertEqual(ev[-1]["event"],"COMPLETE")
+        flights=[e for e in ev if e["event"]=="IN_FLIGHT"];verified=[e for e in ev if e["event"]=="VERIFIED"]
+        self.assertEqual(len(flights),17);self.assertEqual([x["op_id"] for x in flights],[x["op_id"] for x in verified])
+        self.assertTrue(all(f["seq"]<v["seq"] for f,v in zip(flights,verified)))
+        self.assertTrue(all(n<=b.CHUNK for _,_,n in self.device.reads))
+    def test_install_dynamic_bc_and_readiness_twice(self):
+        self.run_req(self.request("install-linux"));self.assertEqual(len(self.device.ready),2)
+        self.assertEqual(bytes(self.device.parts["misc"])[2048:2080],b.trial_bc(self.bc))
+        self.assertEqual(b.outside_bc(bytes(self.device.parts["misc"])),b.outside_bc(self.misc))
+    def test_lost_ack_no_following_write_and_cross_instance_poison(self):
+        self.fail_with("lost_ack");self.assertEqual(len(self.device.writes),1)
+        self.device.fault=None
+        with self.assertRaisesRegex(b.Refusal,"persistent UNKNOWN"):self.run_req(self.request(tx="1111111111111111"),"second")
+        self.assertEqual(len(self.device.writes),1)
+    def test_bad_readback_stops_before_misc(self):
+        self.fail_with("bad_readback");self.assertEqual(len(self.device.writes),1)
+    def test_cancel_latched_no_next_block(self):
+        self.fail_with("cancel");self.assertEqual(len(self.device.writes),1)
+    def test_total_deadline_after_write_unknown(self):
+        self.fail_with("deadline");self.assertEqual(len(self.device.writes),1)
+    def test_sigterm_handler_blocks_following_write(self):
+        self.fail_with("sigterm");self.assertEqual(len(self.device.writes),1)
+    def test_partial_misc_unknown_not_atomic(self):
+        self.fail_with("partial_misc");self.assertEqual(len(self.device.writes),17)
+        self.assertEqual(b.outside_bc(bytes(self.device.parts["misc"])),b.outside_bc(self.misc))
+    def test_misc_outside_corruption_detected(self):self.fail_with("outside_misc")
+    def test_protection_corruption_before_misc_stops(self):
+        self.fail_with("protection");self.assertEqual(len(self.device.writes),16)
+    def test_misc_changed_before_arm_stops(self):
+        self.fail_with("misc_before_arm");self.assertEqual(len(self.device.writes),16)
+    def test_wrong_preimage_zero_writes(self):
+        r=self.request();r["expected_before"]["misc"]="0"*64
+        with self.assertRaisesRegex(b.Refusal,"preimage"):self.run_req(r)
+        self.assertEqual(self.device.writes,[])
+    def test_mutated_local_image_rejected_before_device(self):
+        r=self.request();(self.root/"original.bin").write_bytes(b"X"*b.BOOT_BYTES)
+        with self.assertRaisesRegex(b.Refusal,"hash"):self.run_req(r)
+        self.assertEqual(self.device.reads,[])
+    def test_inflight_disk_failure_dispatches_nothing(self):
+        original=b.Ledger.event
+        def fail(ledger,event,**fields):
+            if event=="IN_FLIGHT":raise OSError("fsync failed")
+            return original(ledger,event,**fields)
+        with patch.object(b.Ledger,"event",fail):
+            with self.assertRaises(OSError):self.run_req()
+        self.assertEqual(self.device.writes,[]);self.assertEqual(self.events()[-1]["event"],"UNKNOWN")
+    def test_torn_ledger_refuses_new_transaction(self):
+        with b.Ledger() as ledger:ledger.event("START",txid="old")
+        with (self.root/"evidence"/(".bounded-boot-v3-"+b.SERIAL)/"ledger.jsonl").open("ab") as f:f.write(b'{')
+        with self.assertRaisesRegex(b.Refusal,"torn"):self.run_req()
+        self.assertEqual(self.device.reads,[])
+    def test_ledger_lock_spans_different_output_folders(self):
+        with b.Ledger():
+            with self.assertRaises(BlockingIOError):self.run_req(out="other")
+        self.assertEqual(self.device.reads,[])
+    def test_readonly_reconciliation_never_clears_poison(self):
+        self.fail_with("lost_ack");self.device.fault=None;head=self.events()[-1]["chain_sha256"]
+        got=b.reconcile_readonly(self.device,self.root/"evidence"/"reconcile",900)
+        self.assertEqual(got["ledger_head"],head);self.assertTrue(got["complete"]);self.assertEqual(len(self.device.writes),1)
+        self.assertEqual(self.events()[-1]["chain_sha256"],head)
+        with self.assertRaisesRegex(b.Refusal,"persistent UNKNOWN"):self.run_req(self.request(tx="2222222222222222"),"no-review")
+    def test_new_explicit_reviewed_recovery_after_unknown(self):
+        self.fail_with("lost_ack");self.device.fault=None
+        recdir=self.root/"evidence"/"reconcile";rec=b.reconcile_readonly(self.device,recdir,900)
+        recpath=recdir/"reconciliation.json";recsha=b.sha(recpath.read_bytes());reviewpath=self.root/"review.json"
+        binding={"reconciliation_path":str(recpath),"reconciliation_sha256":recsha,"review_path":str(reviewpath),"review_sha256":"0"*64}
+        req=self.request(tx="3333333333333333",recovery=binding)
+        proposal=copy.deepcopy(req);proposal["recovery"].pop("review_path");proposal["recovery"].pop("review_sha256")
+        review={"schema":"e5-explicit-boot-recovery-review-v3","serial":b.SERIAL,"proposal_sha256":b.sha(b.canonical(proposal)),
+            "reconciliation_sha256":recsha,"ledger_head":rec["ledger_head"],"decision":"NEW_ORIGINAL_RECOVERY_ONLY_NO_REPLAY"}
+        reviewpath.write_bytes(b.canonical(review));binding["review_sha256"]=b.sha(reviewpath.read_bytes())
+        result=self.run_req(req,"explicit-recovery");self.assertTrue(result["complete"])
+        self.assertEqual(len(self.device.writes),18);self.assertEqual(bytes(self.device.parts["boot_b"]),self.original)
+    def test_restore_can_repair_invalid_bc_without_outside_write(self):
+        self.device.parts["misc"][2048]^=1
+        self.run_req();self.assertEqual(bytes(self.device.parts["misc"]),self.misc)
+    def test_install_invalid_bc_zero_writes(self):
+        self.device.parts["misc"][2048]^=1
+        with self.assertRaisesRegex(b.Refusal,"CRC"):self.run_req(self.request("install-linux"))
+        self.assertEqual(self.device.writes,[])
+    def test_native_write_whitelist_rejects_A_before_transport(self):
+        backend=object.__new__(b.NativeBackend)
+        with self.assertRaisesRegex(b.Refusal,"only B"):backend.write_chunk("boot_a",0,b"x"*b.CHUNK,"a"*32,b.Budget(60))
+    def test_native_misc_non32_range_rejected(self):
+        backend=object.__new__(b.NativeBackend)
+        with self.assertRaisesRegex(b.Refusal,"range"):backend.write_chunk("misc",2048,b"x"*31,"a"*32,b.Budget(60))
+    def test_native_reader_binary_envelope(self):
+        backend=object.__new__(b.NativeBackend);backend.p={"partitions":{"misc":{"node":"/dev/block/mmcblk0p3","dev":"179:3","bytes":b.MISC_BYTES,"start_lba":135168}}};backend.boot_id=BOOT
+        data=bytes(range(256))*16
+        def request(label,script,budget,**kw):
+            marker=re.search(r'E5READ3 ([a-f0-9]+) misc 0 4096',script).group(1)
+            raw=f'E5READ3 {marker} misc 0 4096 77 3\n'.encode()+data+f'\nE5END3 {marker} 77 3\n'.encode()
+            return kw['validator'](raw)
+        backend._request=request
+        self.assertEqual(backend.read_chunk("misc",0,4096,b.Budget(60)),data)
+        with self.assertRaisesRegex(b.Refusal,"inode/dev changed"):
+            backend.read_chunk("misc",0,4096,b.Budget(60),expected_identity=(78,3))
+    def test_native_missing_binary_end_refused(self):
+        backend=object.__new__(b.NativeBackend);backend.p={"partitions":{"misc":{"node":"/dev/block/mmcblk0p3","dev":"179:3","bytes":b.MISC_BYTES,"start_lba":135168}}};backend.boot_id=BOOT
+        def request(label,script,budget,**kw):
+            marker=re.search(r'E5READ3 ([a-f0-9]+) misc 0 4096',script).group(1)
+            return kw['validator'](f'E5READ3 {marker} misc 0 4096 77 3\n'.encode()+b'x'*4096)
+        backend._request=request
+        with self.assertRaisesRegex(b.Refusal,'missing END'):backend.read_chunk('misc',0,4096,b.Budget(60))
+    def native_ack_fixture(self,change=None,readback_change=False):
+        backend=object.__new__(b.NativeBackend);backend.p={"partitions":{"boot_b":{"node":"/dev/block/mmcblk0p37","dev":"259:30","bytes":b.BOOT_BYTES,"start_lba":1566720}}}
+        backend.transport=SimpleNamespace(reconciliation_only=False);backend.boot_id=BOOT;backend.txid='a'*16;backend.native='/data/local/tmp/e5-clean-io.'+backend.txid;backend.native_sha='f'*64
+        data=b'Q'*b.CHUNK;calls=[]
+        def request(label,script,budget,**kw):
+            calls.append((label,kw.get('mutating',False)))
+            if label=='write-identity':return b'77 3\n100.00 50.00\n'
+            argv=script.splitlines()[-1].split();deadline=int(argv[5]);op=kw['op_id']
+            common=dict(op_id=op,boot_id=BOOT,txid=backend.txid,deadline_ms=deadline,action='write-block')
+            start=dict(event='START',pid=12,starttime_ticks=30,**common)
+            done=dict(event='DONE',ok=True,offset=0,bytes=b.CHUNK,total=b.BOOT_BYTES,inode=77,dev=3,size=b.BOOT_BYTES,
+                major=259,minor=30,fsync_completed=True,possibly_modified=True,**common)
+            if change:done.update(change)
+            ack=kw['validator'](b.canonical(start)+b'\n'+b.canonical(done)+b'\n')
+            self.assertTrue(callable(kw['followup']));return kw['followup'](ack,lambda *a,**k:None)
+        backend._request=request
+        def read(part,off,n,budget,**kw):
+            self.assertIn('part_request',kw);calls.append(('independent-readback',False))
+            self.assertEqual(kw['expected_identity'],(77,3))
+            return (b'R' if readback_change else b'Q')*n
+        backend.read_chunk=read
+        return backend,data,calls
+    def test_native_ack_requires_followup_under_transport_barrier(self):
+        dev,data,calls=self.native_ack_fixture();got=dev.write_chunk('boot_b',0,data,'b'*32,b.Budget(60))
+        self.assertEqual(got['bytes'],b.CHUNK);self.assertEqual(calls[-1][0],'independent-readback')
+    def test_native_ack_wrong_rdev_rejected(self):
+        dev,data,calls=self.native_ack_fixture({'minor':29})
+        with self.assertRaisesRegex(b.Refusal,'DONE'):dev.write_chunk('boot_b',0,data,'b'*32,b.Budget(60))
+        self.assertEqual(len(calls),2)
+    def test_native_ack_wrong_boot_rejected(self):
+        dev,data,calls=self.native_ack_fixture({'boot_id':'00000000-0000-4000-8000-000000000001'})
+        with self.assertRaisesRegex(b.Refusal,'identity'):dev.write_chunk('boot_b',0,data,'b'*32,b.Budget(60))
+    def test_native_followup_mismatch_refuses_success(self):
+        dev,data,calls=self.native_ack_fixture(readback_change=True)
+        with self.assertRaisesRegex(b.Refusal,'independent readback'):dev.write_chunk('boot_b',0,data,'b'*32,b.Budget(60))
+    def test_reconciliation_absent_ledger_saves_all_raw_without_events(self):
+        got=b.reconcile_readonly(self.device,self.root/"evidence"/"rec-empty",900)
+        self.assertEqual(got["ledger_head"],"0"*64);self.assertEqual(self.events(),[])
+        self.assertEqual(set(got["artifacts"]),set(b.PROTECTED)|{"gpt","boot_b","misc"})
+        for k,e in got["artifacts"].items():
+            raw=Path(e["path"]).read_bytes();self.assertEqual(b.sha(raw),e["sha256"]);self.assertEqual(len(raw),e["bytes"])
+    def test_receipt_wrong_candidate_rejected_before_directory_inspection(self):
+        dev=object.__new__(b.NativeBackend);dev.boot_id=BOOT;dev.txid="a"*16
+        candidate=self.root/"candidate.json";candidate.write_bytes(b"fixed candidate")
+        receipt={"schema":"e5-clean-activation-v3","serial":b.SERIAL,"boot_id":BOOT,"txid":dev.txid,
+            "status":"ACTIVATED","default_boot":"android","original_B_misc_verified":True,
+            "request_sha256":"a"*64,"candidate_sha256":"b"*64,"tree_sha256":"c"*64}
+        path=self.root/"receipt.json";path.write_bytes(b.canonical(receipt))
+        with patch.object(b,"CANDIDATE_REL","candidate.json"),patch.object(b,"CANDIDATE_SHA",b.sha(candidate.read_bytes())):
+            with self.assertRaisesRegex(b.Refusal,"receipt hash fields"):
+                dev.verify_install_ready({"path":str(path),"sha256":b.sha(path.read_bytes())},b.Budget(60))
+    def test_recovery_context_must_match_exact_request_before_reads(self):
+        dev=object.__new__(b.NativeBackend);dev.transport=SimpleNamespace(reconciliation_only=False,
+            recovery_context={"request_sha256":"a"*64,"txid":"b"*16,"boot_id":BOOT},state=self.root/"state")
+        dev.transport.state.mkdir();(dev.transport.state/"RECOVERY_ONLY.json").write_text("{}")
+        req=self.request(recovery={})
+        with self.assertRaisesRegex(b.Refusal,"context differs"):dev.execution_scope(req,"c"*64)
+    def test_other_transaction_helper_cannot_install_linux(self):
+        dev=object.__new__(b.NativeBackend);dev.txid="a"*16;dev.native="/data/local/tmp/e5-clean-io."+"b"*16
+        dev.transport=SimpleNamespace(reconciliation_only=False,recovery_context=None,state=self.root/"state")
+        dev.transport.state.mkdir()
+        with self.assertRaisesRegex(b.Refusal,"cannot install Linux"):
+            dev.execution_scope(self.request("install-linux"),"a"*64)
+    def test_no_sim_guard_in_every_native_base(self):
+        dev=object.__new__(b.NativeBackend);dev.boot_id=BOOT
+        self.assertIn('test "$(getprop gsm.sim.state)" = ABSENT,ABSENT',dev._base())
+    def test_equal_priority_bootable_B_not_armable(self):
+        bc=bytearray(self.bc);bc[14]=0x2f;struct.pack_into("<I",bc,28,zlib.crc32(bc[:28]))
+        with self.assertRaisesRegex(b.Refusal,"pending B"):b.trial_bc(bytes(bc))
+    def test_reconciliation_transport_cannot_write(self):
+        dev=object.__new__(b.NativeBackend);dev.transport=SimpleNamespace(reconciliation_only=True)
+        with self.assertRaisesRegex(b.Refusal,"cannot write"):dev.write_chunk("boot_b",0,b"x"*b.CHUNK,"a"*32,b.Budget(60))
+    def test_readonly_transport_cannot_execute_even_original_restore(self):
+        dev=object.__new__(b.NativeBackend);dev.transport=SimpleNamespace(reconciliation_only=True)
+        with self.assertRaisesRegex(b.Refusal,"cannot execute"):dev.execution_scope(self.request(),"a"*64)
+    def test_real_backend_gate_precedes_transport_and_adb_validation(self):
+        dev=object.__new__(b.NativeBackend)
+        with patch.object(b,'DEVICE_IO_DISABLED',True):
+            with self.assertRaisesRegex(b.Refusal,'DISABLED'):dev._request('never','printf x',b.Budget(60))
+
+if __name__=="__main__":unittest.main(verbosity=2)

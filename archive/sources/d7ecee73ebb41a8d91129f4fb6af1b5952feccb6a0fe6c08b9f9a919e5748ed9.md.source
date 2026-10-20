@@ -1,0 +1,23 @@
+# 纯主机目录归档
+
+`host_archive.py` 只使用本机 Python 标准库文件 API；不导入采集器、旧 live、ADB/SSH 适配器，也没有 subprocess、socket、设备、VM、mount、提取或恢复入口。它不修改冻结的 `capture.py` 或输入证据。
+
+输入必须是同一固定设备/boot ID 的 `directory` 或 `all` 完整采集目录：有 `COMPLETE.json` 且没有 `STOP.json`。采集源码、profile、plan 固定 SHA；每条 request 的序号、时限、退出码、stderr、脚本和原始 stdout 哈希均需一致。校准双流、misc 双读、GPT、前后 geometry、前后 NUL 清单都重新解释验证。逐块检查请求 offset/length、头尾 stat/boot/path、原始字节与重组文件逐字节一致及独立第二读 SHA；不只信任 COMPLETE 的布尔字段。
+
+来源核验有独立边界：工具核对当前冻结采集源码的 SHA，以及每条保存的 `.sh.txt` 与 request 中脚本 SHA 的内部一致性；它没有根据冻结源码重新生成预期脚本并逐字节比较，也不由哈希证明脚本实际执行来源。实际完整目录归档用于恢复材料之前，主线程或独立审查者仍须把真实请求脚本与冻结采集器逐项对应。合成测试的脚本只是夹具，不构成这项来源证明。
+
+命令是纯主机操作：
+
+```
+python3 -B host_archive.py --capture /完整采集的绝对目录 --output /新建归档绝对目录 --txid 0123456789abcdef
+```
+
+输出目录必须不存在且位于源采集目录之外。归档文件 `directory-backup.tar` 独占创建、权限 0600；生成时再次核对输入身份并流式计算文件 SHA，fsync 后独立重新读取 tar，精确验证所有成员路径、内容、type、uid/gid、mode，不丢空文件和空目录。不允许链接、路径逃逸、未知成员、遗漏成员、重组数据变化、超时/失败请求或现有输出覆盖。旧的完整备份可以归档；本工具不以采集时间评估证据是否满足未来设备操作的新鲜度要求。
+
+输出 `inventory.json` 和 `directory-backup.tar.verified.json` 使用既有目录 session 的 schema，`ARCHIVE_COMPLETE.json` 给出这两份绑定及原始证据 SHA。`txid` 是操作者指定的 16 位小写十六进制计划标识；它不认证操作者，也不把旧证据变新。该适配可以供未来 session 的完整原件校验使用，但未来同 boot 的实时 inspect、冷启动审查、保护分区检查和批准门仍需满足，不能直接据此开始切换。
+
+tar 按原记录保留所有普通文件字节、目录结构、uid/gid、mode 和整秒 mtime；原始清单继续保存详细 mtime/ctime、inode、设备号等。外层 xattr、SELinux、ACL、atime 以及纳秒 mtime 的完整恢复没有被证明或承诺。ext4 文件内部元数据随其原始字节保留。归档不是整个运行中文件系统在某一时刻的原子快照，也不认证设备确实产生了任意人为伪造的输入；它校验已有可信采集链的本地完整性和一致性。
+
+失败会保留 partial tar 和 `FAILED_NOT_USABLE.json`，不生成 `ARCHIVE_COMPLETE.json`，不得视为合格原件；不删除、不覆盖、不重试。若生成时进程被强制终止，缺少最终完成文件同样代表未完成。
+
+当前只有 12 项合成目录/块证据测试通过，涵盖空目录、元数据、二进制内容、错偏移、哈希冲突、源数据变更、链接、路径逃逸、缺记录、失败采集和 tar 损坏。2026-10-14 的 `directory-01` 在清单前超时，没有完整目录数据；本轮没有为它生成真实归档。分段检查的新采集协议若另行实现，需要另审适配，本工具不会偷偷接受不同生产协议。

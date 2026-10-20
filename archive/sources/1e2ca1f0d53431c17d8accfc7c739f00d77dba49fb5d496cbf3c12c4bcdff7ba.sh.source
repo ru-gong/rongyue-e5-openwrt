@@ -1,0 +1,43 @@
+set -eu
+set -o pipefail
+set -C
+test "$(id -u)" = 0
+test "$(getprop ro.serialno)" = DEVICE_SERIAL_REDACTED
+test "$(getprop ro.boot.slot_suffix)" = _a
+test "$(getprop sys.boot_completed)" = 1
+test "$(getprop gsm.sim.state)" = ABSENT,ABSENT
+test "$(getprop ro.product.model)" = E5
+test "$(getprop ro.board.platform)" = ums9621
+test "$(getprop ro.build.display.id)" = TS305_V03_20241128_2301
+test "$(cat /proc/sys/kernel/random/boot_id)" = 00000000-0000-4000-8000-000000000001
+test ! -L /data; test ! -L /data/local; test ! -L /data/local/tmp
+test "$(readlink -f /data)" = /data
+test "$(awk '$2=="/data" {n++} END {print n+0}' /proc/mounts)" = 1
+data_source=$(awk '$2=="/data" {print $1}' /proc/mounts)
+case "$data_source" in /dev/block/by-name/userdata|/dev/block/mmcblk0p70) ;; *) exit 83;; esac
+test "$(readlink -f "$data_source")" = /dev/block/mmcblk0p70
+test "$(readlink -f /dev/block/by-name/userdata)" = /dev/block/mmcblk0p70
+test "$(readlink -f /dev/block/mmcblk0p70)" = /dev/block/mmcblk0p70
+test -b /dev/block/mmcblk0p70
+test "$(stat -c '%t:%T' /dev/block/mmcblk0p70)" = 103:3f
+test "$(cat /sys/class/block/mmcblk0p70/dev)" = 259:63
+test "$(awk '$2=="/data" {print $3}' /proc/mounts)" = f2fs
+awk '$2=="/data" && $4 ~ /(^|,)rw(,|$)/ && $4 !~ /(^|,)ro(,|$)/ {ok++} END {exit !(ok==1)}' /proc/mounts
+test -d /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock/owner; test "$(cat /data/local/tmp/e5-clean-directory.lock/owner)" = 314ff262fa18c842
+test ! -L /data/local/tmp/e5-clean-scanner.314ff262fa18c842; test -f /data/local/tmp/e5-clean-scanner.314ff262fa18c842; test "$(readlink -f /data/local/tmp/e5-clean-scanner.314ff262fa18c842)" = /data/local/tmp/e5-clean-scanner.314ff262fa18c842
+test "$(stat -c %s /data/local/tmp/e5-clean-scanner.314ff262fa18c842)" = 713024
+printf "CPROG\tbcab3c134025457ba7565cb4ecc7219b\tscanner\t713024\t"; stat -c '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T' /data/local/tmp/e5-clean-scanner.314ff262fa18c842
+/data/adb/magisk/busybox dd if=/data/local/tmp/e5-clean-scanner.314ff262fa18c842 bs=4096 count=713024 iflag=count_bytes status=none
+printf "\nCSHA\tbcab3c134025457ba7565cb4ecc7219b\tscanner\t"; /data/adb/magisk/busybox sha256sum /data/local/tmp/e5-clean-scanner.314ff262fa18c842
+printf "CMETA\tbcab3c134025457ba7565cb4ecc7219b\tscanner\t"; stat -c '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T' /data/local/tmp/e5-clean-scanner.314ff262fa18c842
+test ! -L /data/local/tmp/e5-clean-io.314ff262fa18c842; test -f /data/local/tmp/e5-clean-io.314ff262fa18c842; test "$(readlink -f /data/local/tmp/e5-clean-io.314ff262fa18c842)" = /data/local/tmp/e5-clean-io.314ff262fa18c842
+test "$(stat -c %s /data/local/tmp/e5-clean-io.314ff262fa18c842)" = 708592
+printf "CPROG\tbcab3c134025457ba7565cb4ecc7219b\tio\t708592\t"; stat -c '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T' /data/local/tmp/e5-clean-io.314ff262fa18c842
+/data/adb/magisk/busybox dd if=/data/local/tmp/e5-clean-io.314ff262fa18c842 bs=4096 count=708592 iflag=count_bytes status=none
+printf "\nCSHA\tbcab3c134025457ba7565cb4ecc7219b\tio\t"; /data/adb/magisk/busybox sha256sum /data/local/tmp/e5-clean-io.314ff262fa18c842
+printf "CMETA\tbcab3c134025457ba7565cb4ecc7219b\tio\t"; stat -c '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T' /data/local/tmp/e5-clean-io.314ff262fa18c842
+scan_deadline=$(/data/adb/magisk/busybox awk '{printf "%.0f",$1*1000+5000}' /proc/uptime)
+printf "CDEADLINE\tbcab3c134025457ba7565cb4ecc7219b\t%s\n" "$scan_deadline"
+/data/local/tmp/e5-clean-scanner.314ff262fa18c842 scan 314ff262fa18c842 00000000-0000-4000-8000-000000000001 00000000000000000000000000000000 "$scan_deadline"
+printf "CNOW\tbcab3c134025457ba7565cb4ecc7219b\t"; /data/adb/magisk/busybox awk '{print $1}' /proc/uptime
+printf "CEND\tbcab3c134025457ba7565cb4ecc7219b\t%s\n" "$(cat /proc/sys/kernel/random/boot_id)"

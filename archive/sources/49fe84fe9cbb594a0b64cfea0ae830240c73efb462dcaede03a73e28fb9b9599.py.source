@@ -1,0 +1,245 @@
+#!/usr/bin/env python3
+"""E5 first-Linux evidence, stdout JSONL only. No transport, file writes or repair.
+
+Run only by the root operator after independent review. Imports are side-effect
+free for host tests. Linux reads use fixed nodes, readonly ioctls and commands.
+"""
+import array
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import struct
+import subprocess
+import sys
+import zlib
+
+DEVICE_IO_DISABLED = False
+CONTRACT = {'schema': 'e5-next-linux-readonly-contract-v1', 'serial_expected_not_live_observed': 'DEVICE_SERIAL_REDACTED', 'source_commit': '569f13d4ce15585f70817c2a1e03bb574a84720b', 'gpt_prefix_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'protected_hashes': {'trustos_a': '0000000000000000000000000000000000000000000000000000000000000000', 'trustos_b': '0000000000000000000000000000000000000000000000000000000000000000', 'uboot_a': '0000000000000000000000000000000000000000000000000000000000000000', 'uboot_b': '0000000000000000000000000000000000000000000000000000000000000000', 'vbmeta_a': '0000000000000000000000000000000000000000000000000000000000000000', 'vbmeta_b': '0000000000000000000000000000000000000000000000000000000000000000', 'init_boot_a': '0000000000000000000000000000000000000000000000000000000000000000', 'init_boot_b': '0000000000000000000000000000000000000000000000000000000000000000', 'sml_a': '0000000000000000000000000000000000000000000000000000000000000000', 'sml_b': '0000000000000000000000000000000000000000000000000000000000000000', 'teecfg_a': '0000000000000000000000000000000000000000000000000000000000000000', 'teecfg_b': '0000000000000000000000000000000000000000000000000000000000000000', 'boot_a': '0000000000000000000000000000000000000000000000000000000000000000'}, 'partitions': {'misc': {'partition_number': 3, 'start_sector': 135168, 'bytes': 1048576}, 'trustos_a': {'partition_number': 4, 'start_sector': 137216, 'bytes': 6291456}, 'trustos_b': {'partition_number': 5, 'start_sector': 149504, 'bytes': 6291456}, 'sml_a': {'partition_number': 6, 'start_sector': 161792, 'bytes': 1048576}, 'sml_b': {'partition_number': 7, 'start_sector': 163840, 'bytes': 1048576}, 'uboot_a': {'partition_number': 8, 'start_sector': 165888, 'bytes': 3145728}, 'uboot_b': {'partition_number': 9, 'start_sector': 172032, 'bytes': 3145728}, 'l_agdsp_a': {'partition_number': 26, 'start_sector': 1296384, 'bytes': 6291456}, 'teecfg_a': {'partition_number': 32, 'start_sector': 1390592, 'bytes': 1048576}, 'teecfg_b': {'partition_number': 33, 'start_sector': 1392640, 'bytes': 1048576}, 'boot_a': {'partition_number': 36, 'start_sector': 1435648, 'bytes': 67108864}, 'boot_b': {'partition_number': 37, 'start_sector': 1566720, 'bytes': 67108864}, 'init_boot_a': {'partition_number': 40, 'start_sector': 2107392, 'bytes': 8388608}, 'init_boot_b': {'partition_number': 41, 'start_sector': 2123776, 'bytes': 8388608}, 'vbmeta_a': {'partition_number': 49, 'start_sector': 14829568, 'bytes': 1048576}, 'vbmeta_b': {'partition_number': 50, 'start_sector': 14831616, 'bytes': 1048576}, 'userdata': {'partition_number': 70, 'start_sector': 15241216, 'bytes': 23467130880}}, 'nv_partitions': [{'partition': 'nr_fixnv1_a', 'partition_number': 13, 'physical_node': '/dev/block/mmcblk0p13', 'linux_physical_node': '/dev/mmcblk0p13', 'sysfs': '/sys/class/block/mmcblk0p13', 'gpt_start_sector': 243712, 'size_sectors': 102400, 'bytes': 52428800}, {'partition': 'nr_fixnv1_b', 'partition_number': 14, 'physical_node': '/dev/block/mmcblk0p14', 'linux_physical_node': '/dev/mmcblk0p14', 'sysfs': '/sys/class/block/mmcblk0p14', 'gpt_start_sector': 346112, 'size_sectors': 102400, 'bytes': 52428800}, {'partition': 'nr_fixnv2_a', 'partition_number': 15, 'physical_node': '/dev/block/mmcblk0p15', 'linux_physical_node': '/dev/mmcblk0p15', 'sysfs': '/sys/class/block/mmcblk0p15', 'gpt_start_sector': 448512, 'size_sectors': 102400, 'bytes': 52428800}, {'partition': 'nr_fixnv2_b', 'partition_number': 16, 'physical_node': '/dev/block/mmcblk0p16', 'linux_physical_node': '/dev/mmcblk0p16', 'sysfs': '/sys/class/block/mmcblk0p16', 'gpt_start_sector': 550912, 'size_sectors': 102400, 'bytes': 52428800}, {'partition': 'nr_runtimenv1', 'partition_number': 17, 'physical_node': '/dev/block/mmcblk0p17', 'linux_physical_node': '/dev/mmcblk0p17', 'sysfs': '/sys/class/block/mmcblk0p17', 'gpt_start_sector': 653312, 'size_sectors': 112640, 'bytes': 57671680}, {'partition': 'nr_runtimenv2', 'partition_number': 18, 'physical_node': '/dev/block/mmcblk0p18', 'linux_physical_node': '/dev/mmcblk0p18', 'sysfs': '/sys/class/block/mmcblk0p18', 'gpt_start_sector': 765952, 'size_sectors': 112640, 'bytes': 57671680}, {'partition': 'nr_deltanv_a', 'partition_number': 22, 'physical_node': '/dev/block/mmcblk0p22', 'linux_physical_node': '/dev/mmcblk0p22', 'sysfs': '/sys/class/block/mmcblk0p22', 'gpt_start_sector': 1087488, 'size_sectors': 2048, 'bytes': 1048576}, {'partition': 'nr_deltanv_b', 'partition_number': 23, 'physical_node': '/dev/block/mmcblk0p23', 'linux_physical_node': '/dev/mmcblk0p23', 'sysfs': '/sys/class/block/mmcblk0p23', 'gpt_start_sector': 1089536, 'size_sectors': 2048, 'bytes': 1048576}, {'partition': 'calinv', 'partition_number': 69, 'physical_node': '/dev/block/mmcblk0p69', 'linux_physical_node': '/dev/mmcblk0p69', 'sysfs': '/sys/class/block/mmcblk0p69', 'gpt_start_sector': 15210496, 'size_sectors': 30720, 'bytes': 15728640}], 'boot_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'boot_prefix_56m_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'boot_suffix_from60m_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'misc_original_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'misc_prefix_2048_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'misc_suffix_from2080_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'runtime_scripts': {'/opt/e5/e5-next-boot': '0000000000000000000000000000000000000000000000000000000000000000', '/opt/e5/t551m-nv-prepare': '0000000000000000000000000000000000000000000000000000000000000000', '/opt/e5/t551m-nv-verify': '0000000000000000000000000000000000000000000000000000000000000000'}, 'candidate': {'path': '/REDACTED_HOST_PATH', 'sha256': '0000000000000000000000000000000000000000000000000000000000000000'}, 'device_profile': {'path': '/REDACTED_HOST_PATH', 'sha256': '0000000000000000000000000000000000000000000000000000000000000000'}, 'source_disclosure': {'commit': '569f13d4ce15585f70817c2a1e03bb574a84720b', 'official_author_binary': False, 'variant': 'fixed 569 author source local build + existing diagnostic cap + no-auto-fsck init-only patch', 'W1_applied': False, 'D1_applied': False, 'OpenClash_added': False, 'source_hashes': {'boot/init': '0000000000000000000000000000000000000000000000000000000000000000', 'device/openwrt_device_common/shared/staging.py': '0000000000000000000000000000000000000000000000000000000000000000', 'device/openwrt_device_common/shared/nv-prepare.py': '0000000000000000000000000000000000000000000000000000000000000000', 'device/openwrt_device_common/shared/nv-verify.py': '0000000000000000000000000000000000000000000000000000000000000000'}, 'no_auto_fsck_patch': {'path': '/REDACTED_HOST_PATH', 'sha256': '0000000000000000000000000000000000000000000000000000000000000000'}}, 'rootfs_pristine_raw_sha256': '0000000000000000000000000000000000000000000000000000000000000000', 'automatic_fsck_allowed': False}
+MAX_TEXT = 2 << 20
+ALLOWED_COMMANDS = {
+    ("/bin/busybox", "--list"), ("/opt/e5/bin/busybox", "--list"),
+    ("/bin/busybox", "dmesg"), ("/sbin/logread",),
+    ("/bin/bash", "/opt/e5/e5-next-boot", "status"),
+    ("/usr/bin/python3", "-B", "/opt/e5/t551m-nv-verify"),
+}
+
+
+class EvidenceFailure(RuntimeError):
+    def __init__(self,why,data=None):
+        super().__init__(why);self.data=data
+
+
+def require(ok, why, data=None):
+    if not ok: raise EvidenceFailure(why,data)
+
+
+def sha(data): return hashlib.sha256(data).hexdigest()
+
+
+def text(path): return Path(path).read_text().strip()
+
+
+def blob_sha(path, start, size):
+    h=hashlib.sha256();remaining=size
+    with Path(path).open("rb",buffering=0) as f:
+        f.seek(start)
+        while remaining:
+            b=f.read(min(1<<20,remaining));require(bool(b),"short block read")
+            h.update(b);remaining-=len(b)
+    return h.hexdigest()
+
+
+def run_command(argv, timeout=120):
+    require(tuple(argv) in ALLOWED_COMMANDS,"command outside readonly allowlist")
+    env={**os.environ,"PYTHONDONTWRITEBYTECODE":"1","PATH":"/usr/sbin:/usr/bin:/sbin:/bin"}
+    p=subprocess.run(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+                     timeout=timeout,env=env,check=False)
+    return {"argv":argv,"exit_code":p.returncode,
+            "stdout":p.stdout[:MAX_TEXT].decode(errors="replace"),
+            "stderr":p.stderr[:MAX_TEXT].decode(errors="replace"),
+            "stdout_truncated":len(p.stdout)>MAX_TEXT,"stderr_truncated":len(p.stderr)>MAX_TEXT}
+
+
+def mapping(name,row):
+    n=row["partition_number"];leaf="mmcblk0p"+str(n)
+    node=Path("/dev")/leaf;s=Path("/sys/class/block")/leaf
+    props=dict(line.split("=",1) for line in text(s/"uevent").splitlines() if "=" in line)
+    require(props.get("PARTNAME")==name and props.get("DEVNAME")==leaf,"PARTNAME/DEVNAME mismatch: "+name)
+    require(text(s/"partition")==str(n),"partition number mismatch")
+    require(int(text(s/"start"))==row["start_sector"] and int(text(s/"size"))*512==row["bytes"],"GPT geometry mismatch: "+name)
+    st=node.stat();require(stat.S_ISBLK(st.st_mode),"physical node not block")
+    dev=f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}"
+    require(text(s/"dev")==dev,"physical rdev differs from current Linux sysfs")
+    # Linux BLKGETSIZE64 and BLKROGET are read-only queries; never BLKROSET.
+    with node.open("rb",buffering=0) as f:
+        size=array.array("Q",[0]);ro=array.array("i",[0])
+        fcntl.ioctl(f.fileno(),0x80081272,size,True);fcntl.ioctl(f.fileno(),0x125e,ro,True)
+    require(size[0]==row["bytes"],"block size ioctl mismatch")
+    return {"node":str(node),"PARTNAME":name,"partition_number":n,"start_sector":row["start_sector"],
+            "bytes":row["bytes"],"linux_dev":dev,"sysfs_ro":text(s/"ro"),"block_ro":ro[0]}
+
+
+def analyze_misc(raw):
+    require(len(raw)==1<<20,"misc length mismatch")
+    bc=raw[2048:2080]
+    observed={"bytes":len(raw),"sha256":sha(raw),"bc_hex":bc.hex(),
+              "prefix_sha256":sha(raw[:2048]),"suffix_sha256":sha(raw[2080:])}
+    require(observed["prefix_sha256"]==CONTRACT["misc_prefix_2048_sha256"] and
+            observed["suffix_sha256"]==CONTRACT["misc_suffix_from2080_sha256"],"misc changed outside approved BC32",observed)
+    require(bc[4:8]==b"BCAB" and bc[8]==1 and bc[9]&7==2 and
+            struct.unpack_from("<I",bc,28)[0]==zlib.crc32(bc[:28]),"invalid boot-control structure/CRC",observed)
+    require(bc[:4] in (b"_a\0\0",b"_b\0\0"),"invalid boot-control suffix",observed)
+    return {**observed,"bc_crc_valid":True,"outside32_matches_original":True}
+
+
+def boot_observation(node):
+    parts={"prefix_0_to_56m":blob_sha(node,0,56<<20),"diagnostic_56_to_60m":blob_sha(node,56<<20,4<<20),
+           "suffix_60_to_64m":blob_sha(node,60<<20,4<<20)}
+    require(parts["prefix_0_to_56m"]==CONTRACT["boot_prefix_56m_sha256"] and
+            parts["suffix_60_to_64m"]==CONTRACT["boot_suffix_from60m_sha256"],"boot B changed outside diagnostic window",parts)
+    return {"hashes":parts,"outside_diagnostic_matches_final_boot":True,
+            "diagnostic_may_change_during_collection":True,"no_whole_boot_immutability_claim":True}
+
+
+def nv_mapping(name,row):
+    physical=mapping(name,row)
+    require(physical["sysfs_ro"]=="1" and physical["block_ro"]==1,"factory NV writable: "+name,physical)
+    logical=Path("/dev/block/by-name")/name;target=logical.resolve(strict=True)
+    st=target.stat();require(stat.S_ISBLK(st.st_mode) and target.parent==Path("/dev") and target.name.startswith("loop"),"NV alias not loop: "+name)
+    loop=Path("/sys/class/block")/target.name
+    require(text(loop/"dev")==f"{os.major(st.st_rdev)}:{os.minor(st.st_rdev)}","loop rdev mismatch")
+    backing=text(loop/"loop/backing_file")
+    require(backing=="/opt/e5/nv/"+name,"NV loop has wrong private backing: "+name)
+    return {**physical,"logical_alias":str(logical),"logical_target":str(target),"loop_backing":backing}
+
+
+def analyze_nv_origin(values,source):
+    names={item["partition"] for item in CONTRACT["nv_partitions"]}
+    for label,entry in (("origin",values),("boot-source",source)):
+        require(isinstance(entry,dict) and set(entry)==names and all(isinstance(v,str) and len(v)==64 and all(c in "0123456789abcdef" for c in v) for v in entry.values()),"NV "+label+" manifest fields")
+    return {"origin_sha256":values,"origin_matches_this_boot_source":values==source,
+            "first_fresh_install_requires_origin_match":True,"source_changed_retaining_is_not_fresh_origin":values!=source}
+
+
+def main():
+    if DEVICE_IO_DISABLED:
+        print(json.dumps({"id":"disabled","ok":False,"error":"DEVICE_IO_DISABLED: preparation collector; no device collection performed"}))
+        return 70
+    if sys.platform!="linux" or os.uname().machine!="aarch64" or os.geteuid()!=0:
+        print(json.dumps({"id":"fatal-platform","ok":False,"error":"requires actual E5 Linux aarch64 root; no collection performed"}))
+        return 2
+    results=[];valid={};script_ok={};nv_first={}
+    def record(name,fn):
+        started=datetime.datetime.now().astimezone().isoformat()
+        try: result={"id":name,"ok":True,"data":fn()}
+        except Exception as error:
+            result={"id":name,"ok":False,"error_type":type(error).__name__,"error":str(error)}
+            if getattr(error,"data",None) is not None:result["data"]=error.data
+        result["started"]=started;result["finished"]=datetime.datetime.now().astimezone().isoformat()
+        results.append(result);print(json.dumps(result,ensure_ascii=False),flush=True)
+        return result
+    def command_ok(argv):
+        result=run_command(argv)
+        # Include nonzero stdout/stderr in a failure record instead of throwing away details.
+        require(result["exit_code"]==0,"readonly command returned nonzero",result)
+        return result
+    record("identity-observation",lambda:{"uname":list(os.uname()),"uid":os.geteuid(),"contract":CONTRACT,
+                                         "cmdline":text("/proc/cmdline"),"mounts":text("/proc/mounts"),
+                                         "boot_id":text("/proc/sys/kernel/random/boot_id"),
+                                         "serial_is_expected_binding_not_live_android_property":True})
+    def releases():
+        values={p:text(p) for p in ("/etc/openwrt_release","/etc/os-release","/etc/e5/image-version","/etc/e5/device-profile","/etc/e5/image-form")}
+        require(values["/etc/e5/image-version"]=="569f13d-dirty" and values["/etc/e5/device-profile"]=="e5","unexpected installed image identity")
+        return values
+    record("release-image",releases)
+    record("busybox-base-applets",lambda:command_ok(["/bin/busybox","--list"]))
+    record("busybox-full-applets",lambda:command_ok(["/opt/e5/bin/busybox","--list"]))
+    def gpt():
+        node=Path("/dev/mmcblk0");require(stat.S_ISBLK(node.stat().st_mode),"mmcblk0 not block")
+        actual=blob_sha(node,0,32768);require(actual==CONTRACT["gpt_prefix_sha256"],"GPT first32KiB changed")
+        return {"bytes":32768,"sha256":actual}
+    gpt_ok=record("gpt-prefix",gpt)["ok"]
+    for name,row in CONTRACT["partitions"].items():
+        def read_mapping(name=name,row=row):
+            require(gpt_ok,"GPT prerequisite failed");m=mapping(name,row)
+            if name!="userdata":require((Path("/dev/block/by-name")/name).resolve(strict=True)==Path(m["node"]),"protected/boot/misc alias mismatch")
+            valid[name]=m;return m
+        record("map:"+name,read_mapping)
+    for name,expected in CONTRACT["protected_hashes"].items():
+        def protected(name=name,expected=expected):
+            require(name in valid,"mapping prerequisite failed");m=valid[name]
+            actual=blob_sha(m["node"],0,m["bytes"])
+            observed={"physical_node":m["node"],"bytes":m["bytes"],"sha256":actual,"expected_sha256":expected}
+            require(actual==expected,"protected partition changed: "+name,observed)
+            return {**observed,"matches_frozen":True}
+        record("protected:"+name,protected)
+    def misc():
+        require("misc" in valid,"misc mapping failed")
+        with Path(valid["misc"]["node"]).open("rb",buffering=0) as f:raw=f.read(1<<20)
+        return analyze_misc(raw)
+    record("misc-outside32-and-CRC",misc)
+    def boot():
+        require("boot_b" in valid,"boot B mapping failed");return boot_observation(valid["boot_b"]["node"])
+    record("bootB-outside-diagnostic",boot)
+    for path,expected in CONTRACT["runtime_scripts"].items():
+        def script(path=path,expected=expected):
+            data=Path(path).read_bytes();require(sha(data)==expected,"runtime script differs: "+path)
+            script_ok[path]=True;return {"path":path,"sha256":sha(data)}
+        record("runtime-script:"+path,script)
+    def status():
+        require(script_ok.get("/opt/e5/e5-next-boot") and "misc" in valid,"status prerequisites failed")
+        require(Path(text("/run/e5linux/misc-dev")).resolve(strict=True)==Path(valid["misc"]["node"]),"runtime misc pointer differs")
+        return command_ok(["/bin/bash","/opt/e5/e5-next-boot","status"])
+    record("next-boot-status",status)
+    def nv_verify():
+        require(script_ok.get("/opt/e5/t551m-nv-verify") and script_ok.get("/opt/e5/t551m-nv-prepare"),"NV verify source hash prerequisite failed")
+        return command_ok(["/usr/bin/python3","-B","/opt/e5/t551m-nv-verify"])
+    record("NV-upstream-verify",nv_verify)
+    source_record=record("NV-this-boot-source",lambda:json.loads(text("/run/t551m-nv-source-sha256.json")))
+    source=source_record.get("data",{})
+    def origin():
+        values=json.loads(text("/opt/e5/nv/factory-sha256.json"))
+        return analyze_nv_origin(values,source)
+    record("NV-working-copy-origin",origin)
+    for item in CONTRACT["nv_partitions"]:
+        name=item["partition"]
+        row={"partition_number":item["partition_number"],"start_sector":item["gpt_start_sector"],"bytes":item["bytes"]}
+        def nv_one(name=name,row=row):
+            require(gpt_ok,"GPT prerequisite failed");m=nv_mapping(name,row)
+            actual=blob_sha(m["node"],0,m["bytes"])
+            nv_first[name]={"mapping":m,"sha256":actual,"this_boot_source_sha256":source.get(name)}
+            require(source.get(name)==actual,"NV differs from this boot prepare baseline: "+name,nv_first[name])
+            return nv_first[name]
+        record("NV-first:"+name,nv_one)
+    for item in CONTRACT["nv_partitions"]:
+        name=item["partition"]
+        row={"partition_number":item["partition_number"],"start_sector":item["gpt_start_sector"],"bytes":item["bytes"]}
+        def nv_two(name=name,row=row):
+            require(name in nv_first,"NV first read failed");m=nv_mapping(name,row)
+            actual=blob_sha(m["node"],0,m["bytes"])
+            require(actual==nv_first[name]["sha256"],"physical NV changed between reads",{"mapping":m,"sha256":actual,"first_sha256":nv_first[name]["sha256"]})
+            return {"mapping":m,"sha256":actual,"stable_two_reads":True}
+        record("NV-second:"+name,nv_two)
+    record("logread",lambda:command_ok(["/sbin/logread"]))
+    record("dmesg",lambda:command_ok(["/bin/busybox","dmesg"]))
+    def pstore():
+        values=[]
+        for path in sorted(Path("/sys/fs/pstore").glob("*")):
+            if not path.is_file():continue
+            with path.open("rb") as f:data=f.read(MAX_TEXT+1)
+            values.append({"name":path.name,"text":data[:MAX_TEXT].decode(errors="replace"),"truncated":len(data)>MAX_TEXT})
+        return values
+    record("pstore-readonly",pstore)
+    failed=[r["id"] for r in results if not r["ok"]]
+    print(json.dumps({"id":"summary","ok":not failed,"failed":failed,"record_count":len(results),
+                      "writes_or_reboot_requested_by_collector":False,
+                      "fresh_Android_NV_baseline_comparison":"HOST_REQUIRED_NOT_PERFORMED_HERE",
+                      "network_dual_SIM_SMS_or_long_term_F2FS_acceptance":False}),flush=True)
+    return 1 if failed else 0
+
+
+if __name__=="__main__":raise SystemExit(main())

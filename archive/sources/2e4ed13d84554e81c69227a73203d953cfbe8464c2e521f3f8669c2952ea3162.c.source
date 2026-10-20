@@ -1,0 +1,242 @@
+/* Fixed empty-directory no-replace probe. Production stays disabled.
+ * CLI: probe TXID BOOT_UUID OPID32 DEADLINE_MS DATADEV DATAINO LOCKDEV LOCKINO
+ * Only three fixed names below /data/local/tmp/e5-clean-directory.lock.
+ * Any error stops without cleanup; only the normal successful path removes
+ * its own still-empty directories after identity checks. No block/file writes,
+ * subprocess, network, reboot, retry, or fallback rename implementation.
+ */
+#define _GNU_SOURCE 1
+#define _DARWIN_C_SOURCE 1
+#include <sys/types.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <sys/vfs.h>
+#endif
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static const int DEVICE_EXECUTION_ENABLED = 0;
+static const char *tx="",*boot="",*op="",*phase="arguments",*fixture;
+static uintmax_t deadline,now_ms,self_start,data_dev,data_ino,lock_dev,lock_ino;
+static volatile sig_atomic_t cancelled;
+static int attempted,eexist_ok,inodes_ok,rename_ok,clean_ok,f2fs_ok;
+static int rootfd=-1,datafd=-1,localfd=-1,tmpfd=-1,lockfd=-1;
+static struct stat data_st,local_st,tmp_st,lock_st,owner_st,source_st,dest_st;
+static char source[80],destination[80],renamed[80];
+
+static void on_signal(int s){cancelled=s;}
+static int check(void){
+    struct timespec t;
+#if defined(__linux__) && !defined(E5_NOREPLACE_HOST_TEST)
+    if(clock_gettime(CLOCK_BOOTTIME,&t))return -1;
+#else
+    if(clock_gettime(CLOCK_MONOTONIC,&t))return -1;
+#endif
+    now_ms=(uintmax_t)t.tv_sec*1000+(uintmax_t)t.tv_nsec/1000000;
+    if(cancelled){errno=ECANCELED;return -1;}
+    if(!deadline||now_ms>=deadline){errno=ETIMEDOUT;return -1;}return 0;
+}
+static int emit(const char *event,int complete,const char *why){
+    int e=errno;
+    int n=printf("{\"schema\":\"e5-noreplace-probe-v1\",\"event\":\"%s\",\"complete\":%s,\"phase\":\"%s\",\"reason\":\"%s\",\"errno\":%d,\"txid\":\"%s\",\"boot_id\":\"%s\",\"opid\":\"%s\",\"self_pid\":%ld,\"self_starttime\":%ju,\"deadline_ms\":%ju,\"checked_boottime_ms\":%ju,\"data_dev\":%ju,\"data_ino\":%ju,\"lock_dev\":%ju,\"lock_ino\":%ju,\"source_inode\":%ju,\"destination_inode\":%ju,\"cancel_signal\":%d,\"mutation_attempted\":%s,\"existing_dest_eexist\":%s,\"existing_inodes_unchanged\":%s,\"missing_dest_rename\":%s,\"cleanup_completed\":%s,\"f2fs_confirmed\":%s,\"power_loss_safety_proven\":false,\"outcome\":\"%s\"}\n",
+      event,complete?"true":"false",phase,why,e,tx,boot,op,(long)getpid(),self_start,deadline,now_ms,data_dev,data_ino,lock_dev,lock_ino,(uintmax_t)source_st.st_ino,(uintmax_t)dest_st.st_ino,(int)cancelled,attempted?"true":"false",eexist_ok?"true":"false",inodes_ok?"true":"false",rename_ok?"true":"false",clean_ok?"true":"false",f2fs_ok?"true":"false",complete?"COMPLETED":attempted?"UNKNOWN_AFTER_MUTATION_ATTEMPT":"NO_MUTATION_ATTEMPT");
+    if(n<0||fflush(stdout)){cancelled=SIGPIPE;errno=EPIPE;return -1;}errno=e;return 0;
+}
+static int fail(const char *why){emit("RESULT",0,why);return 70;}
+static int step(const char *p){phase=p;if(check())return -1;return emit("PHASE",0,"");}
+static int decimal(const char *s,uintmax_t *out){
+    if(!s||!*s||(*s=='0'&&s[1]))return -1;
+    for(const char *p=s;*p;p++)if(*p<'0'||*p>'9')return -1;
+    char *end;errno=0;*out=strtoumax(s,&end,10);return errno||*end?-1:0;
+}
+static int hex(const char *s,size_t n){if(strlen(s)!=n)return 0;for(size_t i=0;i<n;i++)if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='a'&&s[i]<='f')))return 0;return 1;}
+static int uuid(const char *s){if(strlen(s)!=36)return 0;for(size_t i=0;i<36;i++){if(i==8||i==13||i==18||i==23){if(s[i]!='-')return 0;}else if(!((s[i]>='0'&&s[i]<='9')||(s[i]>='a'&&s[i]<='f')))return 0;}return 1;}
+static int same(const struct stat *a,const struct stat *b){return a->st_dev==b->st_dev&&a->st_ino==b->st_ino&&a->st_mode==b->st_mode&&a->st_uid==b->st_uid&&a->st_gid==b->st_gid;}
+static int dir_at(int parent,const char *name,struct stat *st){
+    if(check())return -1;
+    int fd=openat(parent,name,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(fd<0)return -1;
+    struct stat named;
+    if(fstat(fd,st)||fstatat(parent,name,&named,AT_SYMLINK_NOFOLLOW)||!same(st,&named)||!S_ISDIR(st->st_mode)){int e=errno?errno:ESTALE;close(fd);errno=e;return -1;}return fd;
+}
+static int stable_at(int parent,const char *name,int fd,const struct stat *expected){
+    struct stat a,b;if(check()||fstat(fd,&a)||fstatat(parent,name,&b,AT_SYMLINK_NOFOLLOW))return -1;
+    if(!same(&a,expected)||!same(&b,expected)||!S_ISDIR(a.st_mode)){errno=ESTALE;return -1;}return 0;
+}
+static int absent(const char *name){struct stat s;if(fstatat(lockfd,name,&s,AT_SYMLINK_NOFOLLOW)==0){errno=EEXIST;return -1;}return errno==ENOENT?0:-1;}
+static int small(const char *path,char *b,size_t cap){
+    if(check())return -1;
+    int fd=open(path,O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);if(fd<0)return -1;
+    ssize_t n=read(fd,b,cap-1);int e=errno;if(close(fd)&&n>=0){n=-1;e=errno;}if(n<0){errno=e;return -1;}if((size_t)n>=cap-1){errno=E2BIG;return -1;}b[n]=0;return check();
+}
+static int boot_check(void){
+    char path[PATH_MAX],b[128];
+#ifdef E5_NOREPLACE_HOST_TEST
+    if(snprintf(path,sizeof path,"%s/../boot_id",fixture)>=(int)sizeof path){errno=E2BIG;return -1;}
+#else
+    (void)fixture;snprintf(path,sizeof path,"/proc/sys/kernel/random/boot_id");
+#endif
+    if(small(path,b,sizeof b))return -1;
+    size_t n=strlen(b);if(n&&b[n-1]=='\n')b[--n]=0;if(strcmp(b,boot)){errno=ESTALE;return -1;}return 0;
+}
+static int self_identity(void){
+#ifdef E5_NOREPLACE_HOST_TEST
+    self_start=1;return 0;
+#else
+    char b[8192];if(small("/proc/self/stat",b,sizeof b))return -1;char *p=strrchr(b,')');if(!p||p[1]!=' '){errno=EPROTO;return -1;}char *save=NULL;unsigned f=3;for(char *s=strtok_r(p+2," \n",&save);s;s=strtok_r(NULL," \n",&save),f++)if(f==22){if(decimal(s,&self_start)||!self_start){errno=EPROTO;return -1;}return 0;}errno=EPROTO;return -1;
+#endif
+}
+static int owner_check(int first){
+    struct stat st,named;char b[18],expected[18];
+    if(check())return -1;
+    int fd=openat(lockfd,"owner",O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC);if(fd<0)return -1;
+    if(fstat(fd,&st)||fstatat(lockfd,"owner",&named,AT_SYMLINK_NOFOLLOW)||!same(&st,&named)||!S_ISREG(st.st_mode)||st.st_nlink!=1||st.st_size!=17||st.st_uid!=geteuid()||(st.st_mode&0777)!=0600||st.st_dev!=lock_st.st_dev){int e=errno?errno:EPERM;close(fd);errno=e;return -1;}
+    ssize_t n=read(fd,b,sizeof b);int e=errno;if(close(fd)&&n>=0){n=-1;e=errno;}if(n<0){errno=e;return -1;}
+    snprintf(expected,sizeof expected,"%s\n",tx);if(n!=17||memcmp(b,expected,17)||(!first&&!same(&st,&owner_st))){errno=ESTALE;return -1;}if(first)owner_st=st;return check();
+}
+static int bindings(void){
+    if(boot_check()||check())return -1;
+#ifndef E5_NOREPLACE_HOST_TEST
+    if(stable_at(rootfd,"data",datafd,&data_st))return -1;
+#else
+    struct stat st;if(lstat(fixture,&st)||!same(&st,&data_st)){errno=ESTALE;return -1;}
+#endif
+    return stable_at(datafd,"local",localfd,&local_st)||stable_at(localfd,"tmp",tmpfd,&tmp_st)||stable_at(tmpfd,"e5-clean-directory.lock",lockfd,&lock_st)||owner_check(0)?-1:0;
+}
+static int empty(int fd){
+    if(check())return -1;
+    int dupfd=openat(fd,".",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(dupfd<0)return -1;
+    DIR *d=fdopendir(dupfd);if(!d){int e=errno;close(dupfd);errno=e;return -1;}int rc=0,e=0;
+    for(;;){if(check()){rc=-1;e=errno;break;}errno=0;struct dirent *de=readdir(d);if(!de){if(errno){rc=-1;e=errno;}break;}if(strcmp(de->d_name,".")&&strcmp(de->d_name,"..")){rc=-1;e=ENOTEMPTY;break;}}
+    if(closedir(d)&&!rc){rc=-1;e=errno;}errno=e;return rc;
+}
+static int hook(const char *point){
+#ifdef E5_NOREPLACE_HOST_TEST
+    const char *p=getenv("E5_NOREPLACE_TEST_FAULT");if(!p)return 0;
+    char match[100];snprintf(match,sizeof match,"cancel-%s",point);if(!strcmp(p,match))raise(SIGTERM);
+    snprintf(match,sizeof match,"deadline-%s",point);if(!strcmp(p,match))deadline=now_ms;
+    snprintf(match,sizeof match,"fail-%s",point);if(!strcmp(p,match)){errno=EIO;return -1;}
+    snprintf(match,sizeof match,"pause-%s",point);if(!strcmp(p,match)){while(!check()){struct timespec t={0,1000000};nanosleep(&t,NULL);}return -1;}
+#else
+    (void)point;
+#endif
+    return check();
+}
+static int syncfd(int fd,const char *point){if(hook(point)||check())return -1;if(fsync(fd))return -1;return check();}
+/* No cancellation after admission may be reported as undoing a committed syscall. */
+static int mutate(int kind,const char *a,const char *b,const char *point){
+    if(bindings()||hook(point))return -1;
+    sigset_t set,old,pending;sigemptyset(&set);sigaddset(&set,SIGTERM);sigaddset(&set,SIGINT);sigaddset(&set,SIGHUP);sigaddset(&set,SIGPIPE);
+    if(sigprocmask(SIG_BLOCK,&set,&old))return -1;
+    int rc=-1,e=0;
+    if(sigpending(&pending))e=errno;
+    else if(sigismember(&pending,SIGTERM)||sigismember(&pending,SIGINT)||sigismember(&pending,SIGHUP)||sigismember(&pending,SIGPIPE)){cancelled=SIGTERM;e=ECANCELED;}
+    else if(check())e=errno;
+    else{
+        attempted=1;
+        if(kind==1)rc=mkdirat(lockfd,a,0700);
+        else if(kind==2){
+            struct stat current;const struct stat *expected=NULL;
+            if(!strcmp(a,destination))expected=&dest_st;else if(!strcmp(a,renamed))expected=&source_st;
+            if(!expected){errno=EINVAL;}
+            else if(fstatat(lockfd,a,&current,AT_SYMLINK_NOFOLLOW)){}
+            else if(!same(&current,expected)||!S_ISDIR(current.st_mode)){errno=ESTALE;}
+            else rc=unlinkat(lockfd,a,AT_REMOVEDIR);
+        }
+        else{
+#ifdef __linux__
+#ifdef SYS_renameat2
+            rc=(int)syscall(SYS_renameat2,lockfd,a,lockfd,b,1U);
+#else
+            errno=ENOSYS;
+#endif
+#elif defined(__APPLE__) && defined(E5_NOREPLACE_HOST_TEST)
+            rc=renameatx_np(lockfd,a,lockfd,b,RENAME_EXCL);
+#else
+            (void)b;errno=ENOSYS;
+#endif
+        }
+        e=errno;
+    }
+    if(sigprocmask(SIG_SETMASK,&old,NULL)){rc=-1;e=errno;}
+    if(check()){rc=-1;e=errno;}errno=e;return rc;
+}
+static int remove_own(const char *name,int fd,const struct stat *st,const char *point){
+    if(bindings()||stable_at(lockfd,name,fd,st)||empty(fd)||hook(point))return -1;
+    /* rmdir itself refuses non-empty directories. No recursive deletion. */
+    if(mutate(2,name,NULL,point)||absent(name)||syncfd(lockfd,"cleanup-fsync"))return -1;
+    return 0;
+}
+#ifdef E5_NOREPLACE_HOST_TEST
+static int root_ok(const char *s){
+    const char *a="/tmp/e5-noreplace-test-",*b="/private/tmp/e5-noreplace-test-",*p=NULL;
+    if(!strncmp(s,a,strlen(a)))p=s+strlen(a);else if(!strncmp(s,b,strlen(b)))p=s+strlen(b);
+    if(!p||!*p)return 0;
+    while(*p&&*p!='/'){if(!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_'||*p=='-'))return 0;p++;}return !strcmp(p,"/data");
+}
+#endif
+int main(int argc,char **argv){
+    struct sigaction sa;memset(&sa,0,sizeof sa);sa.sa_handler=on_signal;
+    if(sigemptyset(&sa.sa_mask)||sigaction(SIGTERM,&sa,NULL)||sigaction(SIGINT,&sa,NULL)||sigaction(SIGHUP,&sa,NULL)||sigaction(SIGPIPE,&sa,NULL))return fail("signal-handler-installation-failed");
+#ifdef E5_NOREPLACE_HOST_TEST
+    (void)DEVICE_EXECUTION_ENABLED;
+    if(argc<3||strcmp(argv[1],"--test-root")){errno=EINVAL;return fail("test-root-required");}
+    char real[PATH_MAX];if(!realpath(argv[2],real)||strcmp(real,argv[2])||!root_ok(real)){errno=EPERM;return fail("test-root-refused");}fixture=argv[2];argc-=2;argv+=2;
+#else
+    if(!DEVICE_EXECUTION_ENABLED){errno=EPERM;return fail("production-device-execution-disabled");}
+    if(geteuid()!=0){errno=EPERM;return fail("root-required");}
+#endif
+    if(argc!=10||strcmp(argv[1],"probe")||!hex(argv[2],16)||!uuid(argv[3])||!hex(argv[4],32)){errno=EINVAL;return fail("fixed-arguments-required");}
+    tx=argv[2];boot=argv[3];op=argv[4];
+    if(decimal(argv[5],&deadline)||decimal(argv[6],&data_dev)||decimal(argv[7],&data_ino)||decimal(argv[8],&lock_dev)||decimal(argv[9],&lock_ino)||!data_ino||!lock_ino){errno=EINVAL;return fail("identity-or-deadline-invalid");}
+    if(check()||deadline-now_ms>6000){errno=ETIMEDOUT;return fail("short-deadline-required");}
+    if(boot_check()||self_identity())return fail("boot-or-process-identity");
+    if(emit("BEGIN",0,"")||step("open-bindings"))return fail("cancel-or-output");
+#ifdef E5_NOREPLACE_HOST_TEST
+    datafd=open(fixture,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(datafd<0||fstat(datafd,&data_st))return fail("data-open");
+#else
+    rootfd=open("/",O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);if(rootfd<0||(datafd=dir_at(rootfd,"data",&data_st))<0)return fail("data-open");
+#endif
+    if(data_dev!=(uintmax_t)data_st.st_dev||data_ino!=(uintmax_t)data_st.st_ino){errno=ESTALE;return fail("data-identity-mismatch");}
+    if((localfd=dir_at(datafd,"local",&local_st))<0||(tmpfd=dir_at(localfd,"tmp",&tmp_st))<0||(lockfd=dir_at(tmpfd,"e5-clean-directory.lock",&lock_st))<0)return fail("fixed-path-open");
+    if(lock_dev!=(uintmax_t)lock_st.st_dev||lock_ino!=(uintmax_t)lock_st.st_ino||data_st.st_dev!=lock_st.st_dev||local_st.st_dev!=data_st.st_dev||tmp_st.st_dev!=data_st.st_dev||lock_st.st_uid!=geteuid()||(lock_st.st_mode&0777)!=0700){errno=ESTALE;return fail("lock-identity-or-same-filesystem");}
+#if defined(__linux__) && !defined(E5_NOREPLACE_HOST_TEST)
+    struct statfs fs;if(fstatfs(datafd,&fs)||((unsigned long)fs.f_type!=0xf2f52010UL)){errno=ENOTSUP;return fail("data-not-f2fs");}f2fs_ok=1;
+#elif !defined(E5_NOREPLACE_HOST_TEST)
+    errno=ENOTSUP;return fail("production-linux-required");
+#endif
+    if(owner_check(1)||bindings())return fail("owner-or-binding-mismatch");
+    snprintf(source,sizeof source,"probe-source.%s",tx);snprintf(destination,sizeof destination,"probe-destination.%s",tx);snprintf(renamed,sizeof renamed,"probe-renamed.%s",tx);
+    if(absent(source)||absent(destination)||absent(renamed))return fail("probe-path-already-present");
+    if(step("create-source")||mutate(1,source,NULL,"before-create-source"))return fail("create-source");
+    int sf=dir_at(lockfd,source,&source_st);if(sf<0||empty(sf)||syncfd(sf,"source-fsync")||syncfd(lockfd,"create-source-fsync"))return fail("source-created-unverified");
+    if(step("create-destination")||mutate(1,destination,NULL,"before-create-destination"))return fail("create-destination");
+    int df=dir_at(lockfd,destination,&dest_st);if(df<0||empty(df)||syncfd(df,"destination-fsync")||syncfd(lockfd,"create-destination-fsync"))return fail("destination-created-unverified");
+    if(step("existing-destination-test")||stable_at(lockfd,source,sf,&source_st)||stable_at(lockfd,destination,df,&dest_st))return fail("pre-existing-test-identity");
+    int rc=mutate(3,source,destination,"before-existing-rename");int saved=errno;
+    if(rc!=-1||saved!=EEXIST){errno=saved;return fail("existing-destination-did-not-refuse");}eexist_ok=1;
+    if(check()||bindings()||stable_at(lockfd,source,sf,&source_st)||stable_at(lockfd,destination,df,&dest_st)||empty(sf)||empty(df))return fail("existing-destination-changed");
+    inodes_ok=1;
+    if(step("missing-destination-test")||absent(renamed)||mutate(3,source,renamed,"before-missing-rename"))return fail("missing-destination-rename");
+    rename_ok=1;
+    if(hook("after-rename")||absent(source)||stable_at(lockfd,renamed,sf,&source_st)||stable_at(lockfd,destination,df,&dest_st)||empty(sf)||empty(df)||syncfd(sf,"rename-source-fsync")||syncfd(lockfd,"rename-parent-fsync"))return fail("rename-readback-or-fsync");
+    if(step("cleanup-destination")||remove_own(destination,df,&dest_st,"before-remove-destination"))return fail("cleanup-destination-stopped");
+    if(hook("after-first-cleanup")||step("cleanup-renamed")||remove_own(renamed,sf,&source_st,"before-remove-renamed"))return fail("cleanup-renamed-stopped");
+    if(absent(source)||absent(destination)||absent(renamed)||bindings()||check())return fail("final-readback");
+    if(close(sf)||close(df)||close(lockfd)||close(tmpfd)||close(localfd)||close(datafd))return fail("close-error");
+    if(rootfd>=0&&close(rootfd))return fail("root-close-error");
+    if(boot_check()||check())return fail("final-boot-or-deadline");
+    clean_ok=1;phase="complete";errno=0;
+    if(emit("RESULT",1,""))return 70;
+    return 0;
+}

@@ -1,0 +1,111 @@
+import copy,hashlib,importlib.util,json,os,tempfile,unittest
+from pathlib import Path
+from unittest.mock import patch
+import stop_case as s
+H=Path(__file__).resolve().parent;R=H.parents[1]
+def pin(p):b=p.read_bytes();return {'path':str(p),'bytes':len(b),'sha256':s.sha(b)}
+def save(p,v):p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(v if isinstance(v,bytes) else s.enc(v))
+class Fixture:
+ def __init__(self):
+  self.t=tempfile.TemporaryDirectory(prefix='e5-stage-host-test-');self.root=Path(self.t.name).resolve();self.state=self.root/'state';self.state.mkdir();(self.state/'completed').mkdir();(self.state/'LOCK').touch()
+  c={'schema':'e5-acknowledged-host-stage-stop-v1','serial':'TEST123','txid':'855ae61b90f0f332','boot_id':'00000000-0000-4000-8000-000000000001','state':'state','requests':2,'files':[],'completed':{},'operations':[]}
+  for i,(label,payload) in enumerate([('bounded-create-stage',b''),('write-stage-chunk',b'openwrt\n')]):
+   p=self.root/'transport'/str(i);op=f'{i:032x}';b={'serial':c['serial'],'txid':c['txid'],'boot_id':c['boot_id'],'op_id':op,'label':label,'mutating':True,'payload_bytes':len(payload),'payload_sha256':s.sha(payload),'automatic_retry':False,'recovery_context':None,'reconciliation_only':False,'deadline_seconds':8}
+   raw=b'OK\n';r={'returncode':0,'failure':None,'host_child_reaped':True,'stdin_bytes_sent':len(payload),'stderr_bytes':0,'stdout_bytes':len(raw),'stdout_sha256':s.sha(raw),'elapsed_seconds':.1}
+   save(p/'IN_FLIGHT.json',b);save(p/'transport-result.json',r);save(p/'stdout.bin',raw);save(p/'stderr.bin',b'');done=dict(b,status='COMPLETE',validated=True);save(p/'COMPLETE.json',done);save(self.state/'completed'/(op+'.json'),done)
+   c['operations'].append({'folder':str(p),'op_id':op})
+  u={'reason':'bounded stage: Refusal: host input drift','txid':c['txid'],'boot_id':c['boot_id'],'automatic_retry':False};save(self.state/'UNCERTAIN.json',u);save(self.root/'snapshot.json',u);c['uncertain']={**pin(self.state/'UNCERTAIN.json'),'path_snapshot':str(self.root/'snapshot.json')}
+  c['completed']={p.name:pin(p) for p in (self.state/'completed').iterdir()};self.c=c;self.e=s.Case(self.root,c,s.sha(s.enc(c)),fixture=True)
+ def api(self):
+  p=R/'tools/e5_closed_fd_stop_live_20261019/closure.py';spec=importlib.util.spec_from_file_location('_case_native_fs',p);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+class Tests(unittest.TestCase):
+ def setUp(self):self.f=Fixture();self.addCleanup(self.f.t.cleanup);self.e=self.f.e
+ def test_exact_two_acknowledged_mutations(self):self.assertTrue(self.e.verify()['all_device_requests_completed'])
+ def test_disabled_before_serial_lock(self):
+  with self.assertRaisesRegex(s.Refusal,'disabled'):self.e.settle(self.f.api(),enabled=False)
+  self.assertTrue((self.f.state/'UNCERTAIN.json').exists());self.assertFalse(self.e.archive.exists())
+ def test_settle_preserves_original_marker(self):
+  raw=(self.f.state/'UNCERTAIN.json').read_bytes();self.e.settle(self.f.api(),enabled=True);self.assertEqual((self.e.archive/'UNCERTAIN.json').read_bytes(),raw);self.assertFalse((self.f.state/'UNCERTAIN.json').exists());self.assertTrue((self.e.archive/'HOST_SETTLEMENT_COMPLETE.json').exists())
+ def test_duplicate_or_interrupted_settlement_refused(self):
+  self.e.archive.parent.mkdir();self.e.archive.mkdir()
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_active_refused(self):
+  save(self.f.state/'ACTIVE.json',{})
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_new_recovery_refused(self):
+  save(self.f.state/'RECOVERY_CLOSED_FD_TRANSITION.json',{})
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_recovery_only_refused(self):
+  save(self.f.state/'RECOVERY_ONLY.json',{})
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_marker_change_refused(self):
+  save(self.f.state/'UNCERTAIN.json',{'foreign':True})
+  with self.assertRaises(RuntimeError):self.e.verify()
+ def test_timeout_never_settled(self):
+  p=Path(self.f.c['operations'][0]['folder']);r=s.obj(p/'transport-result.json');r['failure']='timeout';save(p/'transport-result.json',r)
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_nonzero_never_settled(self):
+  p=Path(self.f.c['operations'][0]['folder']);r=s.obj(p/'transport-result.json');r['returncode']=70;save(p/'transport-result.json',r)
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_new_shared_completion_refused(self):
+  save(self.f.state/'completed/foreign.json',{})
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_missing_completion_refused(self):
+  p=Path(self.f.c['operations'][0]['folder']);(p/'COMPLETE.json').unlink()
+  with self.assertRaises(FileNotFoundError):self.e.verify()
+ def test_shared_completion_mismatch_refused(self):
+  save(next((self.f.state/'completed').iterdir()),{})
+  with self.assertRaises(RuntimeError):self.e.verify()
+ def test_unvalidated_refused(self):
+  p=Path(self.f.c['operations'][0]['folder']);v=s.obj(p/'COMPLETE.json');v['validated']=False;save(p/'COMPLETE.json',v)
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_uncertain_operation_never_settled(self):
+  save(Path(self.f.c['operations'][0]['folder'])/'UNCERTAIN.json',{})
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_payload_range_not_expandable(self):
+  p=Path(self.f.c['operations'][1]['folder']);v=s.obj(p/'IN_FLIGHT.json');v['payload_bytes']=9;save(p/'IN_FLIGHT.json',v)
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_raw_changed_refused(self):
+  save(Path(self.f.c['operations'][0]['folder'])/'stdout.bin',b'BAD')
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_stderr_refused(self):
+  save(Path(self.f.c['operations'][0]['folder'])/'stderr.bin',b'error')
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_missing_immutable_file_refused(self):
+  p=self.f.root/'bound';p.write_bytes(b'fixed');self.f.c['files']=[pin(p)];p.unlink()
+  with self.assertRaises(FileNotFoundError):self.e.verify()
+ def test_frozen_file_drift_refused(self):
+  p=self.f.root/'bound';p.write_bytes(b'fixed');self.f.c['files']=[pin(p)];p.write_bytes(b'drift')
+  with self.assertRaises(RuntimeError):self.e.verify()
+ def test_changed_marker_before_rename_stays_blocked(self):
+  api=self.f.api();original=api.durable
+  def change(p,raw):
+   original(p,raw)
+   if p.name=='HOST_SETTLEMENT_BEGIN.json':save(self.f.state/'UNCERTAIN.json',{'foreign':True})
+  api.durable=change
+  with self.assertRaises(RuntimeError):self.e.settle(api,enabled=True)
+  self.assertEqual(s.obj(self.f.state/'UNCERTAIN.json'),{'foreign':True});self.assertFalse((self.e.archive/'HOST_SETTLEMENT_COMPLETE.json').exists())
+ def test_fsync_failure_before_rename_retains_blocker(self):
+  api=self.f.api();api.sync=lambda p:(_ for _ in ()).throw(OSError('fsync failed'))
+  with self.assertRaises(OSError):self.e.settle(api,enabled=True)
+  self.assertTrue((self.f.state/'UNCERTAIN.json').exists())
+ def test_failure_after_rename_restores_original_blocker(self):
+  api=self.f.api();real=api.durable;raw=(self.f.state/'UNCERTAIN.json').read_bytes()
+  def fail(p,data):
+   if p.name=='HOST_SETTLEMENT_COMPLETE.json':raise OSError('receipt write failed')
+   return real(p,data)
+  api.durable=fail
+  with self.assertRaises(OSError):self.e.settle(api,enabled=True)
+  self.assertEqual((self.f.state/'UNCERTAIN.json').read_bytes(),raw)
+  self.assertEqual((self.e.archive/'UNCERTAIN.json').read_bytes(),raw)
+  with self.assertRaises(s.Refusal):self.e.verify()
+ def test_no_automatic_resume_after_partial(self):
+  api=self.f.api();real=api.noreplace
+  def stop(a,b):
+   if a.name=='UNCERTAIN.json':raise OSError('interrupted')
+   return real(a,b)
+  api.noreplace=stop
+  with self.assertRaises(OSError):self.e.settle(api,enabled=True)
+  with self.assertRaises(s.Refusal):self.e.settle(self.f.api(),enabled=True)
+  self.assertTrue((self.f.state/'UNCERTAIN.json').exists())
+if __name__=='__main__':unittest.main(verbosity=2)

@@ -1,0 +1,39 @@
+"""Host-only NV proof binding for a mixed-family read-protocol continuation.
+All SIM device gates remain disabled, all eight validation algorithms unchanged.
+"""
+import ast,hashlib,json,os
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent
+OLD=ROOT/'tools/e5_sim_rearm_265962d3c1cdbde8_prepare_v2_20261020'
+BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+FAMILY=ROOT/'tools/e5_activation_bundle_6e70430299911d68/RESULT.json';FAMILY_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+DEST=ROOT/'tools/e5_sim_rearm_6e70430299911d68_prepare_20261020'
+sha=lambda b:hashlib.sha256(b).hexdigest()
+def need(ok,s):
+ if not ok:raise RuntimeError(s)
+def encoded(v):return (json.dumps(v,ensure_ascii=False,sort_keys=True,indent=2)+'\n').encode()
+def binding(p):return {'path':str(p),'sha256':sha(p.read_bytes())}
+def assign(raw,name,value):
+ s=raw.decode();tree=ast.parse(s);ns=[x for x in tree.body if isinstance(x,ast.Assign) and any(isinstance(y,ast.Name) and y.id==name for y in x.targets)];need(len(ns)==1,'one assignment');n=ns[0];lines=s.splitlines(True);lines[n.lineno-1:n.end_lineno]=[name+'='+value+'\n'];return ''.join(lines).encode()
+def build():
+ need(sha((OLD/'MANIFEST.json').read_bytes())==BASE_SHA,'base manifest');m=json.loads((OLD/'MANIFEST.json').read_bytes());files={}
+ for n,pin in m['files'].items():
+  p=OLD/n;raw=p.read_bytes();need(not p.is_symlink() and len(raw)==pin['bytes'] and sha(raw)==pin['sha256'],'base source '+n);files[n]=raw
+ need(sha(FAMILY.read_bytes())==FAMILY_SHA,'new family');fam=json.loads(FAMILY.read_bytes())
+ for item in fam['files'].values():
+  p=Path(item['path']);need(not p.is_symlink() and p.stat().st_size==item['bytes'] and sha(p.read_bytes())==item['sha256'],'family source')
+ d=json.loads(files['DEPENDENCIES.json']);core=Path(fam['directories']['core']);mf=json.loads((core/'SOURCE_MANIFEST.json').read_bytes());pins={k:mf['modules'][k] for k in d['core_pins']}
+ need(d['no_sim_family']['path']==fam['directories']['recovery'],'preserve actual old history sources')
+ d.update(activation_source=binding(FAMILY),core_path=str(core),core_manifest=binding(core/'SOURCE_MANIFEST.json'),core_pins=pins,first_install_sources={k:mf['modules'][n] if n!='workflow' else sha((core/'workflow.py').read_bytes()) for k,n in [('adapter_sha256','android_directory_adapter'),('workflow_sha256','workflow'),('nv_baseline_sha256','nv_baseline')]})
+ files['DEPENDENCIES.json']=encoded(d);raw=files['common.py'];raw=assign(raw,'LIVE',"ROOT/"+repr(str(core.relative_to(ROOT))));raw=assign(raw,'PINS',repr(pins));raw=assign(raw,'DEPENDENCIES_SHA',repr(sha(files['DEPENDENCIES.json'])));files['common.py']=raw
+ old_tree,new_tree=ast.parse((OLD/'common.py').read_bytes()),ast.parse(raw)
+ def functions(t):return {n.name:ast.dump(n,include_attributes=False) for n in t.body if isinstance(n,(ast.FunctionDef,ast.ClassDef))}
+ need(functions(old_tree)==functions(new_tree),'common functions unchanged')
+ for name in m['unchanged_runtime_algorithms']:need(files[name]==(OLD/name).read_bytes(),'eight algorithms unchanged')
+ files['SOURCE_BINDINGS.json']=encoded({'schema':'e5-sim-core-protocol-bindings-v1','base_manifest':binding(OLD/'MANIFEST.json'),'inputs':{'result':binding(FAMILY)},'family':fam['activation_id'],'core_only_read_protocol_continuation':True,'no_sim_history_family':fam['directories']['recovery'],'eight_algorithms_byte_identical':True,'all_common_functions_ast_identical':True,'device_io':False,'state_accessed':False,'field_evidence_created':False})
+ m['files']={n:{'bytes':len(v),'sha256':sha(v)} for n,v in files.items()};m['runtime_pins']=pins;m['source_family']=fam['activation_id'];files['MANIFEST.json']=encoded(m)
+ need(not DEST.exists(),'fresh output');DEST.mkdir(mode=0o700)
+ for n,v in files.items():
+  with (DEST/n).open('xb') as f:f.write(v);f.flush();os.fsync(f.fileno())
+ return {'output':str(DEST),'manifest':binding(DEST/'MANIFEST.json'),'device_operations':False,'eight_algorithms_unchanged':True}
+if __name__=='__main__':print(json.dumps(build()))

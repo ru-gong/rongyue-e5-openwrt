@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""Receive one read-only offline userdata gzip stream. Writes new Mac files only.
+
+No ADB, shell, uploader, retry, repair or device-write interface. The source
+must first be independently identified, unmounted and kernel read-only.
+"""
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import time
+import zlib
+
+RAW_BYTES = 23467130880
+HOST, PORT = '192.0.2.1', 39070
+
+
+def validate_chunks(chunks, output, *, expected_bytes, expected_sha256, compressed_cap):
+    decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    raw_hash, gz_hash = hashlib.sha256(), hashlib.sha256()
+    raw_bytes = gz_bytes = 0
+    for chunk in chunks:
+        if not chunk: continue
+        if decoder.eof: raise ValueError('bytes after gzip stream')
+        gz_bytes += len(chunk)
+        if gz_bytes > compressed_cap: raise ValueError('compressed cap')
+        output.write(chunk); gz_hash.update(chunk)
+        pending = chunk
+        while pending:
+            block = decoder.decompress(pending, 8 << 20)
+            raw_bytes += len(block)
+            if raw_bytes > expected_bytes: raise ValueError('raw size exceeds fixed partition')
+            raw_hash.update(block)
+            if decoder.unused_data: raise ValueError('trailing or concatenated stream')
+            pending = decoder.unconsumed_tail
+    if not decoder.eof: raise ValueError('truncated gzip stream')
+    if raw_bytes != expected_bytes: raise ValueError('wrong raw partition byte count')
+    if raw_hash.hexdigest() != expected_sha256: raise ValueError('independent source SHA mismatch')
+    return {'raw_bytes': raw_bytes, 'raw_sha256': raw_hash.hexdigest(),
+            'gzip_bytes': gz_bytes, 'gzip_sha256': gz_hash.hexdigest(),
+            'gzip_crc_verified': True, 'exactly_one_gzip_stream': True}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('--remote-raw-sha256', required=True)
+    ap.add_argument('--offline-source-review', type=Path, required=True,
+                    help='Reviewed JSON with actual rescue boot, CID, GPT, unmounted/RO and independent source SHA')
+    ap.add_argument('--output', type=Path, required=True)
+    args = ap.parse_args()
+    digest = args.remote_raw_sha256
+    if not re.fullmatch('[0-9a-f]{64}', digest): raise ValueError('SHA256 required')
+    source = args.offline_source_review.absolute()
+    if source.is_symlink() or any(p.is_symlink() for p in source.parents): raise ValueError('unsafe source review')
+    raw_review = source.read_bytes(); review = json.loads(raw_review)
+    required = {'serial': 'DEVICE_SERIAL_REDACTED', 'partition': '/dev/mmcblk0p70',
+                'start_lba': 15241216, 'bytes': RAW_BYTES, 'unmounted': True,
+                'holders_empty': True, 'kernel_readonly': True,
+                'independent_raw_sha256': digest, 'whole_snapshot_source_is_faulted_not_clean': True}
+    if any(review.get(k) != v for k, v in required.items()): raise ValueError('source not offline fixed userdata')
+    if not review.get('boot_id') or not review.get('cid') or not review.get('raw_evidence'):
+        raise ValueError('missing actual identity and source evidence')
+    root = Path(__file__).resolve().parents[2]
+    out = args.output.absolute()
+    if not out.is_relative_to(root / 'evidence'): raise ValueError('output outside evidence')
+    if out.exists() or out.is_symlink() or any(p.is_symlink() for p in out.parents): raise ValueError('new directory required')
+    out.mkdir(mode=0o700)
+    request = {'schema': 'e5-offline-fault-snapshot-receive-v1', 'source_review': str(source),
+               'source_review_sha256': hashlib.sha256(raw_review).hexdigest(),
+               'started_at': dt.datetime.now(dt.timezone.utc).isoformat(),
+               'remote_endpoint': [HOST, PORT], 'partition_writes': 0, 'automatic_retry': False}
+    (out / 'REQUEST.json').write_text(json.dumps(request, indent=2) + '\n')
+    begin = time.monotonic()
+    try:
+        with socket.create_connection((HOST, PORT), timeout=15) as sock:
+            sock.settimeout(30)
+            def chunks():
+                while True:
+                    if time.monotonic() - begin > 3600: raise TimeoutError('one-hour receive limit')
+                    block = sock.recv(65536)
+                    if not block: return
+                    yield block
+            with (out / 'userdata.fault.img.gz.partial').open('xb') as f:
+                result = validate_chunks(chunks(), f, expected_bytes=RAW_BYTES,
+                                         expected_sha256=digest, compressed_cap=RAW_BYTES + (64 << 20))
+                f.flush(); os.fsync(f.fileno())
+        # A fresh destination directory and exclusive link prevent replacing anything.
+        os.link(out / 'userdata.fault.img.gz.partial', out / 'userdata.fault.img.gz')
+        os.unlink(out / 'userdata.fault.img.gz.partial')
+        result.update({'status': 'COMPLETE_FAULT_SNAPSHOT_NOT_HEALTHY_BACKUP',
+                       'partition_writes': 0, 'elapsed_seconds': time.monotonic() - begin,
+                       'source_review_sha256': request['source_review_sha256']})
+        (out / 'COMPLETE.json').write_text(json.dumps(result, indent=2) + '\n')
+        print(json.dumps(result))
+    except BaseException as error:
+        (out / 'STOP.json').write_text(json.dumps({'error': type(error).__name__ + ': ' + str(error),
+                                                 'partial_retained': True, 'automatic_retry': False}, indent=2) + '\n')
+        raise
+
+
+if __name__ == '__main__': main()

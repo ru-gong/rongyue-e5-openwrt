@@ -1,0 +1,31 @@
+"""Pure local material/import verification; deny all real state and external I/O."""
+import sys
+from pathlib import Path
+ROOT=Path('/REDACTED_HOST_PATH')
+SOURCE=ROOT/'tools/e5_sim_rearm_441f60bc8933be12_prepare_20261016'
+TARGET=ROOT/'tools/e5_sim_rearm_441f60bc8933be12_live_20261016'
+FORBIDDEN=(ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED',ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED',ROOT/'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock')
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn','os.fork','pty.spawn'):raise AssertionError('external operation forbidden')
+ if event=='open' and args and isinstance(args[0],(str,bytes)):
+  p=Path(args[0].decode() if isinstance(args[0],bytes) else args[0]).absolute()
+  if any(p==q or p.is_relative_to(q) for q in FORBIDDEN):raise AssertionError('actual state/ledger forbidden')
+  if len(args)>2 and isinstance(args[2],int) and args[2]&0x643:raise AssertionError('file write forbidden')
+sys.addaudithook(audit)
+import ast,hashlib,importlib.util,json
+def sha(b):return hashlib.sha256(b).hexdigest()
+copy=json.loads((Path(__file__).parent/'HOST_COPY.json').read_bytes())
+for name,rec in copy['files'].items():
+ raw=(TARGET/name).read_bytes();assert len(raw)==rec['bytes'] and sha(raw)==rec['sha256']
+for name in copy['unchanged_files']:assert (SOURCE/name).read_bytes()==(TARGET/name).read_bytes()
+for name,change in copy['changes'].items():
+ raw=(SOURCE/name).read_bytes();want=raw.replace(change['old'].encode()+b'\n',change['new'].encode()+b'\n')
+ assert want==(TARGET/name).read_bytes()
+spec=importlib.util.spec_from_file_location('_e5_sim_common',TARGET/'common.py');c=importlib.util.module_from_spec(spec);sys.modules[spec.name]=c;spec.loader.exec_module(c)
+c.verify_manifest(copy['target_manifest_sha256']);deps=c.dependencies();runtime=c.load_runtime();profile=c.material_check(runtime['bounded_boot_control'])
+o=c.sibling('observe');r=c.sibling('rearm');nv=c.sibling('sim_nv');e=c.sibling('evidence_contract');recovery=c.sibling('recovery');c.sibling('nv_origin')
+assert o.DEVICE_IO_ENABLED is True and r.REARM_IO_DISABLED is False and nv.NV_IO_DISABLED is False and recovery.RECOVERY_IO_DISABLED is True
+assert (TARGET/'recovery.py').read_bytes()==(SOURCE/'recovery.py').read_bytes()
+for name,gate in [('rearm.py',b'REARM_IO_DISABLED=True'),('sim_nv.py',b'NV_IO_DISABLED=True')]:
+ variants=e.source_variants(TARGET/name,gate);assert sha((SOURCE/name).read_bytes()) in variants and sha((TARGET/name).read_bytes()) in variants
+print(json.dumps({'schema':'e5-sim-enabled-host-smoke-v1','manifest_sha256':copy['target_manifest_sha256'],'exact_three_gate_copy':True,'unchanged_file_count':len(copy['unchanged_files']),'manifest_and_dependency_materials_verified':True,'source_variants_verified':True,'runtime_modules_loaded_only':True,'generic_recovery_disabled':True,'transport_or_backend_constructed':False,'device_process_network_operations':False,'actual_state_access':False,'field_evidence_created':False},sort_keys=True,indent=2))

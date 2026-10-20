@@ -1,0 +1,31 @@
+"""Negative classification tests using exact immutable failed-seal records."""
+import copy,json,unittest
+import case as c
+
+class ClassifierTests(unittest.TestCase):
+ def setUp(self):
+  base=c.RUN/'activate-execution/transport/000704-directory-helper-00000000000000000000000000000000'
+  part=base/'part-0004'
+  if not part.exists():part=sorted(base.glob('part-*'))[-1]
+  def obj(p):return json.loads(p.read_bytes())
+  self.args=[obj(base/'IN_FLIGHT.json'),obj(base/'transport-result.json'),[json.loads(x) for x in (base/'stdout.bin').read_bytes().splitlines()],obj(part/'IN_FLIGHT.json'),obj(part/'transport-result.json'),[json.loads(x) for x in (part/'stdout.bin').read_bytes().splitlines()],(part/'stderr.bin').read_bytes()]
+ def test_actual_sync_ack_read_decline_classifies_without_readiness(self):
+  self.assertTrue(c.classified(*self.args))
+  self.assertFalse(self.args[5][-1]['complete'])
+ def test_content_or_rename_or_incomplete_sync_rejected(self):
+  for key,value in [('mutation_attempted',True),('renamed',True),('files_fsynced',7),('fsync_completed',False),('ok',False)]:
+   with self.subTest(key=key):
+    args=copy.deepcopy(self.args);args[2][-1][key]=value
+    with self.assertRaises(RuntimeError):c.classified(*args)
+ def test_timeout_lost_ack_or_other_negative_rejected(self):
+  for index,key,value in [(1,'returncode',None),(1,'failure','timeout'),(4,'failure','timeout'),(4,'returncode',0),(4,'host_child_reaped',False)]:
+   with self.subTest(index=index,key=key):
+    args=copy.deepcopy(self.args);args[index][key]=value
+    with self.assertRaises(RuntimeError):c.classified(*args)
+ def test_wrong_native_reason_or_positive_not_classified(self):
+  for key,value in [('complete',True),('detail','permission-denied'),('reason','busy'),('cancel_signal',15),('unknown',[])]:
+   with self.subTest(key=key):
+    args=copy.deepcopy(self.args);args[5][-1][key]=value
+    with self.assertRaises(RuntimeError):c.classified(*args)
+
+if __name__=='__main__':unittest.main(verbosity=2)

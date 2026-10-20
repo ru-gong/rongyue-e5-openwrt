@@ -1,0 +1,106 @@
+"""Exact acknowledged readonly scan refusal, plus every completed append.
+
+No phone I/O. A failed convergence proof is retained, never called successful.
+Only a new full scan and full prefix read can admit a new continuation.
+"""
+import copy,hashlib,importlib.util,json,os,shlex,sys,types
+from pathlib import Path
+from unittest.mock import patch
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent
+PRIOR=ROOT/'tools/e5_stage_append_prepare_20261020'
+RUN=ROOT/'evidence/author-stage-continuation-20261020'
+CORE=ROOT/'tools/e5_nextphase_core_live_265962d3c1cdbde8'
+STATE=ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+LEDGER=ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+TX='314ff262fa18c842';BOOT='00000000-0000-4000-8000-000000000001';SERIAL='DEVICE_SERIAL_REDACTED'
+def need(ok,why):
+ if not ok:raise RuntimeError(why)
+def sha(b):return hashlib.sha256(b).hexdigest()
+def obj(p):return json.loads(Path(p).read_bytes())
+def pin(p):p=Path(p);return {'bytes':p.stat().st_size,'sha256':sha(p.read_bytes())}
+def bind(p):return {'path':str(p),'sha256':pin(p)['sha256']}
+def load(name,p,raw=None):
+ m=types.ModuleType(name);m.__file__=str(p);sys.modules[name]=m;exec(compile(p.read_bytes() if raw is None else raw,str(p),'exec'),m.__dict__);return m
+
+def classify(b,t,rows,stderr):
+ need(b['label']=='stage-combined-preflight' and b['mutating'] is False and b['payload_bytes']==0 and b['payload_sha256']==sha(b'') and b['automatic_retry'] is False,'readonly scan only')
+ need(t['failure'] is None and t['returncode']==70 and t['host_child_reaped'] is True and t['stdin_bytes_sent']==0 and t['stderr_bytes']==0 and not stderr and 0<=t['elapsed_seconds']<=8,'positive failed exit; no timeout/cancel/ACK loss')
+ need(rows and rows[-1]['event']=='RESULT' and rows[-1]['complete'] is False and rows[-1]['reason']=='fd-table-scan-unknown' and rows[-1]['detail']=='fd-table-not-converged' and rows[-1]['errno']==116 and rows[-1]['cancel_signal']==0 and rows[-1]['unknown']==['scan-not-complete'],'exact transient convergence refusal only')
+ for r in rows:need(r['schema']=='e5-native-occupancy-v1' and r['txid']==TX and r['boot_id']==BOOT and r['opid']==b['op_id'],'failed native identity')
+ r=rows[-1];need(r['fd_closed_rejected']==0 and r['fd_diff_records_omitted']==0 and r['fd_closed_records_omitted']==0 and r['fd_differences'] and all(d['old_kind']==0 and d['new_kind']==3 and d['old_dev']==13 and d['old_ino']==8920 for d in r['fd_differences']),'fixed observed closed unprotected objects, no hidden diagnostics')
+ return True
+
+def failed_readonly(folder,a,combined,d):
+ b=obj(folder/'IN_FLIGHT.json');t=obj(folder/'transport-result.json');unc=obj(folder/'UNCERTAIN.json');raw=(folder/'stdout.bin').read_bytes();err=(folder/'stderr.bin').read_bytes()
+ need(not (folder/'COMPLETE.json').exists() and not list(folder.glob('part-*')),'failed readonly not completed or nested')
+ need(unc==obj(STATE/'UNCERTAIN.json') and all(unc.get(k)==v for k,v in b.items() if k!='status'),'exact failed marker')
+ need((b['serial'],b['txid'],b['boot_id'])==(SERIAL,TX,BOOT) and b['evidence_directory']==str(folder) and b['reconciliation_only'] is False and b['recovery_context'] is None and b['deadline_seconds']==8 and b['argv_sha256']==sha(json.dumps(b['argv'],sort_keys=True,separators=(',',':')).encode()),'failed binding')
+ need(t['stdout_sha256']==sha(raw) and t['stdout_bytes']==len(raw) and len(raw)<=b['output_limit'],'failed raw binding/cap')
+ material=obj(CORE/'SOURCE_MANIFEST.json')
+ d.remote_scanner='/data/local/tmp/e5-clean-scanner.'+TX;d.remote_io='/data/local/tmp/e5-clean-io.'+TX;d.remote_helper='/data/local/tmp/e5-clean-helper.'+TX
+ d.scanner=a.Artifact(Path(material['artifacts']['scanner']['path']),material['artifacts']['scanner']['bytes'],material['artifacts']['scanner']['sha256'])
+ d.io_helper=a.Artifact(Path(material['artifacts']['io_helper']['path']),material['artifacts']['io_helper']['bytes'],material['artifacts']['io_helper']['sha256'])
+ d._part=None;d._enabled=lambda:None;d._request=lambda label,script,**kw:(label,script,kw)
+ c=combined.CombinedAppend.__new__(combined.CombinedAppend);c.a=d;c.api=a;c.identity=(66367,19785)
+ with patch.object(combined.uuid,'uuid4',return_value=types.SimpleNamespace(hex=b['op_id'])):label,script,kw=c.preflight()
+ command=a.BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(d._guard()+script)
+ expected=[str(Path(material['artifacts']['adb']['path'])),'-s',SERIAL,'shell','-T',a.SU+' -c '+shlex.quote(command)]
+ need(b['argv']==expected and b['output_limit']==kw['limit'] and label==b['label'],'exact pure readonly generated argv')
+ rest=raw
+ for key,path,item in [('scanner',d.remote_scanner,d.scanner),('io',d.remote_io,d.io_helper)]:
+  head,sep,rest=rest.partition(b'\n');prefix=f'CPROG\t{b["op_id"]}\t{key}\t{item.size}\t'.encode();need(sep and head.startswith(prefix),'failed program frame');before=a.parse_stat(head[len(prefix):]);data=rest[:item.size];rest=rest[item.size:]
+  need(len(data)==item.size and sha(data)==item.sha256,'failed program streamed SHA')
+  line,sep,rest=rest.partition(b'\n');need(sep and line==b'','failed program separator')
+  line,sep,rest=rest.partition(b'\n');need(sep and line==f'CSHA\t{b["op_id"]}\t{key}\t{item.sha256}  {path}'.encode(),'failed program second SHA')
+  line,sep,rest=rest.partition(b'\n');prefix=f'CMETA\t{b["op_id"]}\t{key}\t'.encode();need(sep and line.startswith(prefix) and a.parse_stat(line[len(prefix):])==before,'failed program metadata')
+ line,sep,rest=rest.partition(b'\n');prefix=f'CDEADLINE\t{b["op_id"]}\t'.encode();need(sep and line.startswith(prefix) and line[len(prefix):].isdigit(),'failed scan deadline');deadline=int(line[len(prefix):]);need(rest.endswith(b'\n'),'failed native terminal record')
+ rows=[json.loads(x) for x in rest.splitlines()];need(all(x['deadline_ms']==deadline for x in rows),'failed deadline binding');classify(b,t,rows,err)
+ return b,rows[-1]
+
+def replay():
+ old=obj(PRIOR/'CASE.json');need(pin(PRIOR/'CASE.json')['sha256']=='0000000000000000000000000000000000000000000000000000000000000000','prior prefix binding')
+ family=obj(Path(obj(RUN/'FAMILY.json')['result']['path']))
+ for x in family['files'].values():need(pin(x['path'])=={k:x[k] for k in ('bytes','sha256')},'runtime drift')
+ need(not (RUN/'resume-stage-execution/COMPLETE.json').exists(),'stage must remain stopped')
+ d=a=None;sys.path.insert(0,str(CORE));a=load('_churn_adapter',CORE/'android_directory_adapter.py');d=a.AndroidDirectoryAdapter.__new__(a.AndroidDirectoryAdapter);d.txid=TX;d.boot_id=BOOT;d.lock='/data/local/tmp/e5-clean-directory.lock'
+ combined=load('_churn_combined',PRIOR/'combined_enabled.py');need(sha((PRIOR/'combined_enabled.py').read_bytes())==obj(PRIOR/'BINDINGS.json')['modules']['combined']['sha256'],'combined source')
+ base=RUN/'resume-stage-execution';folders=sorted(p for p in (base/'transport').iterdir() if p.is_dir());need(len(folders)==842 and folders[-1].name.startswith('000842-'),'fixed failed request sequence')
+ failed,reason=failed_readonly(folders[-1],a,combined,d)
+ need(obj(STATE/'ACTIVE.json')==failed,'only the exact acknowledged failed readonly operation may remain ACTIVE')
+ # Exact pinned parser, with only the already validated final readonly refusal
+ # excluded from its completed-record iterator. No fake completion is made.
+ p=CORE/'phase_evidence.py';raw=p.read_bytes();need(sha(raw)==family['files']['core/phase_evidence.py']['sha256'],'proof parser source')
+ oldline=b"for operation in sorted(p for p in folder.iterdir() if p.is_dir() and re.fullmatch(r'\\d{6}-.+', p.name)):"
+ need(raw.count(oldline)==1,'fixed parser iterator');proof=load('_churn_complete_proof',p,raw.replace(oldline,b'for operation in COMPLETED_ONLY:'));proof.COMPLETED_ONLY=folders[:-1]
+ rows=proof.transport_proof(base/'transport',SERIAL,TX,BOOT);need(len(rows)==841,'all other requests complete')
+ for row in rows:need((row['folder']/'COMPLETE.json').read_bytes()==(STATE/'completed'/(row['begin']['op_id']+'.json')).read_bytes(),'shared completed receipt')
+ expected=copy.deepcopy(old['prefix']);total=old['acknowledged_payload_bytes'];inputs=obj(CORE/'SOURCE_MANIFEST.json')['stage_inputs'];writes=0
+ c=combined.CombinedAppend.__new__(combined.CombinedAppend);c.a=d;c.api=a;c.identity=tuple(old['stage_identity'])
+ for row in rows:
+  b=row['begin']
+  if not b['mutating']:continue
+  writes+=1;need(b['label']=='write-stage-chunk','only stage append')
+  command=shlex.split(b['argv'][-1]);need(command[:2]==[a.SU,'-c'] and len(command)==3,'write su form');prefix=d._guard()+d._locked();need(command[2].startswith(prefix),'write guarded');tail=command[2][len(prefix):];tokens=shlex.split(tail)
+  need(len(tokens)==13 and tokens[:4]==[d.remote_io,'write-file',TX,BOOT] and tokens[4]==b['op_id'] and tail.endswith('\n') and '\n' not in tail[:-1],'one fixed native append')
+  deadline,dev,stageino,inode,offset,n,size=map(int,tokens[5:12]);name=tokens[12];need(name in inputs and (dev,stageino)==tuple(old['stage_identity']) and n==min(4<<20,size-offset) and size==inputs[name]['bytes'] and offset%(4<<20)==0,'append range')
+  previous=expected.get(name);need(previous and offset==previous['bytes'] and inode==previous['inode'],'known existing contiguous inode')
+  with Path(inputs[name]['path']).open('rb') as f:f.seek(offset);data=f.read(n)
+  need(len(data)==n and b['payload_bytes']==n and b['payload_sha256']==sha(data),'local payload binding')
+  native=[json.loads(x) for x in row['raw'].splitlines()];need(len(native)==2,'native sequence');ack=native[-1]
+  need(native[0]['event']=='START' and all(x['op_id']==b['op_id'] and x['txid']==TX and x['boot_id']==BOOT and x['deadline_ms']==deadline for x in native),'native identity')
+  need(ack['event']=='DONE' and ack['ok'] is True and ack['fsync_completed'] is True and ack['action']=='write-file' and ack['dev']==dev and ack['inode']==inode and ack['offset']==offset and ack['bytes']==n and ack['total']==size and ack['size']==offset+n,'native fsync ACK')
+  parts=sorted(row['folder'].glob('part-*/IN_FLIGHT.json'));need(len(parts)==1 and obj(parts[0])['label']=='stage-combined-double-readback','one combined two-read proof')
+  pb=obj(parts[0]);need(pb['argv']==[b['argv'][0],'-s',SERIAL,'shell','-T',a.SU+' -c '+shlex.quote(a.BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(d._guard()+c.readback_script(name,offset,n,b['op_id'])))],'exact double read script')
+  rb=(parts[0].parent/'stdout.bin').read_bytes();c.parse_readback(rb,b['op_id'],data,ack)
+  head=rb.partition(b'\n')[0];meta=a.parse_stat(head[len(f'CDATA\t{b["op_id"]}\t'.encode()):]);expected[name]={'bytes':offset+n,'inode':inode,'dev':dev,'meta':meta,'total':size,'source':inputs[name]};total+=n
+ need(writes==369 and total==1755876907 and expected['openwrt.ext4']['bytes']==1627389952,'fixed checked prefix')
+ need(pin(LEDGER)==old['ledger'],'no block write ledger change')
+ files=dict(old['files'])
+ for p in base.rglob('*'):
+  if p.is_file():files[str(p.relative_to(ROOT))]=pin(p)
+ for p in (PRIOR/'CASE.json',PRIOR/'BINDINGS.json',PRIOR/'resume_enabled.py',PRIOR/'combined_enabled.py',RUN/'resume-stage.log'):files[str(p.relative_to(ROOT))]=pin(p)
+ return {**{k:old[k] for k in ('serial','txid','boot_id','stage_identity','source_family','ledger')},'schema':'e5-ack-prefix-readonly-convergence-stop-v1','prefix':expected,'acknowledged_payload_bytes':total,'files':files,'uncertainty':pin(STATE/'UNCERTAIN.json'),'active':pin(STATE/'ACTIVE.json'),'archive_rel':'host-stage-checkpoints/'+TX+'/fd-convergence-000842','block_writes_dispatched':False,'failed_readonly_exit_acknowledged':True,'all_mutations_completed':True,'completed_request_count':841,'failed_readonly_count':1,'native_failure_preserved':reason,'original_stop':str(base/'STOP.json'),'fresh_prefix_read_required':True,'native_writer_changed':False,'scanner_changed':False}
+if __name__=='__main__':
+ v=replay()
+ with (HERE/'CASE.json').open('x') as f:json.dump(v,f,sort_keys=True,indent=2);f.write('\n')
+ print(json.dumps({'case':bind(HERE/'CASE.json'),'prefix_bytes':v['acknowledged_payload_bytes']}))

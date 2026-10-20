@@ -1,0 +1,99 @@
+"""Synthetic host fixtures, no processes/network. All imports follow the I/O sentinel."""
+import test_regression as t
+import json,re,tempfile,datetime as dt,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+c,e,o,arm=t.c,t.e,t.o,t.arm
+nv=c.sibling('sim_nv');origin=c.sibling('nv_origin')
+BOOT=t.NEW;TX=t.TX
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve()
+ def save(self,p,x):p=Path(p);p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(x if isinstance(x,bytes) else c.canonical(x)+b'\n');return c.binding(p)
+ def fixture(self,changed=False):
+  self.rows=[dict(r,bytes=4096) for r in nv.rows()]
+  for p in (patch.object(nv,'rows',return_value=self.rows),patch.object(nv,'NV_IO_DISABLED',False)):p.start();self.addCleanup(p.stop)
+  tr=self.root/'transport';tr.mkdir();self.data={r['name']:bytes([i+1])*4096 for i,r in enumerate(self.rows)};self.count=0;owner=self
+  class Fake:
+   boot_id=BOOT;txid=TX
+   def _request(self,label,body,budget,limit,validator,op_id):
+    owner.count+=1;op=op_id
+    if label.startswith('sim-network-'):raw=f'SIMNET {op} {BOOT} READY,LOADED\nregistered, cellular connected\n\nSIMNETEND {op} {BOOT} LOADED,LOADED\n'.encode()
+    else:
+     m=re.search(r'SIMNV [^ ]+ [^ ]+ (/dev/block/mmcblk0p[0-9]+) ([0-9]+) ([0-9]+)',body);node,off,n=m.group(1),int(m.group(2)),int(m.group(3));r=next(r for r in owner.rows if r['node']==node);data=owner.data[r['name']][off:off+n]
+     if label=='sim-nv-hash':data=((c.sha(data) if not changed else '0'*64)+'  -\n').encode()
+     head=f'SIMNV {op} {BOOT} {node} {off} {n} 100 200'.encode();raw=head+b'\nSIM READY,LOADED\n'+data+b'\n'+head+b'\nSIM LOADED,LOADED\n'
+    parsed=validator(raw);p=tr/f'{owner.count:06d}-{label}-{op}';p.mkdir();argv=e.argv(e.base(BOOT,'rearm-with-sim',TX)+body)
+    q={'schema':'e5-bounded-transport-v1','status':'COMPLETE','validated':True,'serial':c.SERIAL,'boot_id':BOOT,'txid':TX,'mutating':False,'reconciliation_only':True,'recovery_context':None,'payload_bytes':0,'payload_sha256':c.sha(b''),'deadline_seconds':8,'automatic_retry':False,'op_id':op,'label':label,'argv':argv,'argv_sha256':c.sha(c.canonical(argv)),'stdout_sha256':c.sha(raw),'output_limit':limit}
+    for name,x in [('COMPLETE.json',q),('IN_FLIGHT.json',{**q,'status':'IN_FLIGHT'}),('stdout.bin',raw),('stderr.bin',b''),('transport-result.json',{'failure':None,'returncode':0,'elapsed_seconds':.01,'host_child_reaped':True,'stdin_bytes_sent':0,'stdout_bytes':len(raw),'stdout_sha256':c.sha(raw),'stderr_bytes':0})]:owner.save(p/name,x)
+    return parsed
+  native=Fake();b=nv.capture(native,SimpleNamespace(check=lambda:None),self.root/'nv');return b,tr,native
+ def test_four_raw_ready_combinations(self):
+  for v in ('READY,READY','READY,LOADED','LOADED,READY','LOADED,LOADED'):self.assertTrue(o.sim_ready(v));self.assertIn(v,o.sim_guard())
+ def test_bad_SIM_states(self):
+  for v in ('','READY','READY,READY,READY','READY,ABSENT','UNKNOWN,LOADED','NOT_READY,READY','PIN_REQUIRED,READY','PUK_REQUIRED,READY',' READY,READY','LOADED,LOADED\n',True):self.assertFalse(o.sim_ready(v))
+ def test_nosim_scope_unchanged(self):
+  self.assertIn('= ABSENT,ABSENT',e.base(BOOT,'directory'));self.assertNotIn('ABSENT',e.base(BOOT,'rearm-with-sim',TX))
+ def test_raw_transition_replay(self):
+  b,p,_=self.fixture();v=nv.validate_capture(b,c.now(),BOOT,TX,p);self.assertEqual(v['hashes'],{k:c.sha(x) for k,x in self.data.items()});self.assertEqual(self.count,20);self.assertEqual(c.obj(b)['items'][0]['sim_states_raw'][0],['READY,LOADED','LOADED,LOADED'])
+ def test_real_change_stops_no_complete(self):
+  with self.assertRaisesRegex(RuntimeError,'changed during two'):self.fixture(True)
+  self.assertFalse((self.root/'nv/COMPLETE.json').exists());self.assertEqual(self.count,2)
+ def test_missing_second_read(self):
+  b,p,_=self.fixture();q=next(x for x in p.iterdir() if '-sim-nv-hash-' in x.name);q.rename(q.with_name('unclassified'))
+  with self.assertRaisesRegex(RuntimeError,'count'):nv.validate_capture(b,c.now(),BOOT,TX,p)
+ def test_wrong_script_even_self_consistent_receipt(self):
+  b,p,_=self.fixture();q=next(x for x in p.iterdir() if '-sim-nv-read-' in x.name);x=c.obj(c.binding(q/'COMPLETE.json'));x['argv'][-1]+='; true';x['argv_sha256']=c.sha(c.canonical(x['argv']));self.save(q/'COMPLETE.json',x);self.save(q/'IN_FLIGHT.json',{**x,'status':'IN_FLIGHT'})
+  with self.assertRaisesRegex(RuntimeError,'source transcript'):nv.validate_capture(b,c.now(),BOOT,TX,p)
+ def test_tampered_data_even_updated_receipt(self):
+  b,p,_=self.fixture();q=next(x for x in sorted(p.iterdir()) if '-sim-nv-read-' in x.name);raw=(q/'stdout.bin').read_bytes().replace(bytes([1])*4096,bytes([9])*4096);self.save(q/'stdout.bin',raw)
+  for n in ('COMPLETE.json','IN_FLIGHT.json','transport-result.json'):
+   x=c.obj(c.binding(q/n));x['stdout_sha256']=c.sha(raw);self.save(q/n,x)
+  with self.assertRaisesRegex(RuntimeError,'double read'):nv.validate_capture(b,c.now(),BOOT,TX,p)
+ def test_source_age_identity_gates(self):
+  b,p,_=self.fixture()
+  for boot,tx,at in ((BOOT,TX,c.now()+dt.timedelta(seconds=901)),(t.OLD,TX,c.now()),(BOOT,'a'*16,c.now())):
+   with self.assertRaises(RuntimeError):nv.validate_capture(b,at,boot,tx,p)
+  v=c.obj(b);v['source_sha256']='0'*64;b=self.save(Path(b['path']),v)
+  with self.assertRaisesRegex(RuntimeError,'producer'):nv.validate_capture(b,c.now(),BOOT,TX,p)
+ def test_prewrite_full_nine_and_changes(self):
+  b,p,n=self.fixture();expected={k:c.sha(v) for k,v in self.data.items()};nv.check_live(n,SimpleNamespace(check=lambda:None),expected);self.assertEqual(self.count,29)
+  expected[self.rows[0]['name']]='0'*64
+  with self.assertRaisesRegex(RuntimeError,'stop before BC32'):nv.check_live(n,SimpleNamespace(check=lambda:None),expected)
+ def test_geometry_scope(self):
+  r=nv.rows()[0]
+  for off,n in ((-4096,4096),(0,0),(1,4096),(r['bytes'],4096),(0,8<<20)):
+   with self.assertRaises(RuntimeError):nv.script(r,off,n,'a'*32,BOOT)
+  with self.assertRaises(RuntimeError):nv.guard(dict(r,node='/dev/block/mmcblk0p36'))
+ def test_identity_and_sim_after(self):
+  r=nv.rows()[0];op='a'*32;h=f'SIMNV {op} {BOOT} {r["node"]} 0 4096 1 2'.encode();raw=h+b'\nSIM READY,READY\n'+b'X'*4096+b'\n'+h+b'\nSIM LOADED,LOADED\n';nv.parse(raw,r,0,4096,op,BOOT)
+  for x in (raw.replace(b' 1 2\nSIM LOADED',b' 1 3\nSIM LOADED'),raw.replace(b'LOADED,LOADED',b'ABSENT,LOADED'),raw+b'X'):
+   with self.assertRaises(RuntimeError):nv.parse(x,r,0,4096,op,BOOT)
+ def test_diff_retained_not_fresh(self):
+  old={r['name']:'a'*64 for r in nv.rows()};self.assertTrue(origin.difference(old,old)['fresh_origin_expected']);d=origin.difference(old,{**old,'nr_runtimenv1':'b'*64});self.assertFalse(d['fresh_origin_expected']);self.assertEqual(set(d['changed']),{'nr_runtimenv1'});self.assertFalse(d['working_copy_refresh_allowed'])
+ def test_delta_cal_and_incomplete_rejected(self):
+  old={r['name']:'a'*64 for r in nv.rows()}
+  for new in ({},dict(old,unknown='b'*64),dict(old,calinv='wrong'),*[dict(old,**{n:'b'*64}) for n in ('calinv','nr_deltanv_a','nr_deltanv_b')]):
+   with self.assertRaises(RuntimeError):origin.difference(old,new)
+ def test_unknown_network_output_rejected(self):
+  for raw in (b'PASS',f'SIMNET {"a"*32} {BOOT} READY,READY\nPermission Denial\n\nSIMNETEND {"a"*32} {BOOT} LOADED,LOADED\n'.encode()):
+   with self.assertRaises(RuntimeError):nv.parse_network(raw,'registry',BOOT,'a'*32)
+ def test_gate_denied_before_any_runtime(self):
+  self.assertFalse(o.DEVICE_IO_ENABLED);self.assertTrue(arm.REARM_IO_DISABLED and nv.NV_IO_DISABLED)
+  for call in (lambda:arm.capture({},TX,'/no'),lambda:arm.run({}, {},'/no'),lambda:nv.capture(None,None,None)):
+   with self.assertRaisesRegex(RuntimeError,'IO_DISABLED'):call()
+  with patch.object(c,'DEPENDENCIES_SHA','UNBOUND_RESEAL_REQUIRED'):
+   with self.assertRaisesRegex(RuntimeError,'UNBOUND'):c.dependencies()
+ def test_exact_confirmation_not_pretend_SIM_state(self):
+  v={'schema':'e5-sim-placement-confirmation-v2','serial':c.SERIAL,'slot1':'China Mobile','slot2':'China Unicom','user_confirmed':True};b=self.save(self.root/'confirm',v);o.validate_policy({'purpose':'rearm-with-sim','sim_confirmation':b});v['sim_state']='READY,READY';b=self.save(self.root/'badconfirm',v)
+  with self.assertRaises(RuntimeError):o.validate_policy({'purpose':'rearm-with-sim','sim_confirmation':b})
+ def test_literal_guard_no_source_execution(self):
+  p=c.LIVE/'android_directory_adapter.py';self.assertIn('= ABSENT,ABSENT',origin.render_guard(p,c.sha(c.read(p)),BOOT))
+  p=self.root/'evil';p.write_text('class AndroidDirectoryAdapter:\n def _guard(self): return __import__("os").system("true")\n')
+  with self.assertRaisesRegex(RuntimeError,'dynamic'):origin.render_guard(p,c.sha(c.read(p)),BOOT)
+ def test_no_restore_scope_even_gate_changed(self):
+  r=c.sibling('recovery')
+  with patch.object(r,'RECOVERY_IO_DISABLED',False):
+   with self.assertRaisesRegex(RuntimeError,'not provided'):r.execute({}, {},'/unused')
+if __name__=='__main__':unittest.main()

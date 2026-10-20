@@ -1,0 +1,344 @@
+"""Fixed next scanner deployment. Default disabled; no CLI/device autoentry.
+
+Only old-lock preserving archive, exclusive new lock/helpers and scanner read.
+Uses pinned root core transport and validator; never clears shared barriers.
+"""
+from datetime import datetime,timezone
+from pathlib import Path
+import contextlib
+import fcntl
+import hashlib
+import json
+import math
+import os
+import re
+import shlex
+import stat
+import sys
+import time
+import uuid
+
+DEVICE_IO_DISABLED=True
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+CORE=ROOT/'tools/e5_nextphase_core_live_6c405cb2e5c4447e'
+SERIAL='DEVICE_SERIAL_REDACTED'
+OLD_TX='fad8a60f84aa4268'
+OLD_BOOT='00000000-0000-4000-8000-000000000001'
+LOCK='/data/local/tmp/e5-clean-directory.lock'
+BB='/data/adb/magisk/busybox'
+STATE=ROOT/('evidence/e5-clean-v3-device-state-'+SERIAL)
+GLOBAL_LOCK=ROOT/'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock'
+ORIGINAL_B_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+ORIGINAL_MISC_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+STAT='%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T'
+ADB=Path('/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb')
+ADB_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+STEMS={'scanner':'scanner','io_helper':'io','helper':'helper'}
+
+class Refusal(RuntimeError):pass
+def require(ok,why):
+    if not ok:raise Refusal(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def canonical(value):return json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+def now():return datetime.now(timezone.utc)
+def valid_sha(value):return isinstance(value,str) and re.fullmatch('[0-9a-f]{64}',value) is not None
+def safe_read(path,digest=None,size=None,limit=None):
+    p=Path(path);require(p.is_absolute() and not p.is_symlink() and all(not x.is_symlink() for x in p.parents),'unsafe host path')
+    st=p.stat();require(stat.S_ISREG(st.st_mode) and st.st_nlink==1,'host input type/link')
+    require((size is None or st.st_size==size) and (limit is None or st.st_size<=limit),'host input size')
+    data=p.read_bytes();require((digest is None or sha(data)==digest) and (size is None or len(data)==size),'host input hash/length')
+    after=p.stat();require(all(getattr(after,k)==getattr(st,k) for k in ('st_dev','st_ino','st_mode','st_nlink','st_size','st_mtime_ns','st_ctime_ns')),'host input changed while reading');return data
+def obj(binding):
+    require(isinstance(binding,dict) and set(binding)=={'path','sha256'} and valid_sha(binding['sha256']),'exact file binding')
+    return json.loads(safe_read(binding['path'],binding['sha256'],limit=4<<20))
+def bind(path):return {'path':str(path),'sha256':sha(safe_read(path))}
+def fsync_dir(path):
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def durable(path,data):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+    fsync_dir(path.parent)
+def gate_digest(gate):
+    # checked_at is the validator's new observation time, not evidence identity.
+    return sha(canonical({k:v for k,v in gate.items() if k!='checked_at'}))
+def stamp(value):
+    require(isinstance(value,str),'timestamp type');t=datetime.fromisoformat(value)
+    require(t.tzinfo is not None and t.utcoffset().total_seconds()==0,'aware UTC timestamp required');return t
+def parse_stat(raw):
+    fields=raw.decode('ascii').split('|');require(len(fields)==14,'stat fields');bits=int(fields[0],16)
+    return {'mode_bits':bits,'dev':int(fields[1]),'inode':int(fields[2]),'bytes':int(fields[3]),'mode':fields[4],
+            'uid':int(fields[5]),'gid':int(fields[6]),'nlink':int(fields[7]),'mtime':fields[8],'ctime':fields[9],
+            'mtime_text':fields[10],'ctime_text':fields[11],'rdev_major':int(fields[12],16),'rdev_minor':int(fields[13],16),
+            'type':'d' if stat.S_ISDIR(bits) else 'f' if stat.S_ISREG(bits) else 'other'}
+def identity(row):return {k:row[k] for k in ('mode_bits','dev','inode','mode','uid','gid')}
+def check_shared_state():
+    require(STATE.is_dir() and not STATE.is_symlink() and all(not p.is_symlink() for p in STATE.parents),'shared state path')
+    require(obj(bind(STATE/'STATE_BINDING.json'))=={'schema':'e5-transport-state-v1','serial':SERIAL},'serial state binding')
+    _closure_api().normal_gate(STATE,Path('/REDACTED_HOST_PATH'))
+@contextlib.contextmanager
+def host_lock():
+    fd=os.open(GLOBAL_LOCK,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        s=os.fstat(fd);require(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==os.getuid() and s.st_mode&0o777==0o600,'host lock metadata')
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);yield
+    finally:os.close(fd)
+
+def restoration_proof(binding,boot_id):
+    result=obj(binding);folder=Path(binding['path']).parent
+    require(result.get('schema')=='e5-bounded-boot-result-v3' and result.get('complete') is True and
+            result.get('boot_b_sha256')==ORIGINAL_B_SHA and result.get('misc_sha256')==ORIGINAL_MISC_SHA and
+            result.get('boot_a_written') is False and result.get('reboot_performed') is False,'original recovery result')
+    req_raw=safe_read(folder/'request.json',result['request_sha256'],limit=4<<20);req=json.loads(req_raw)
+    require(req.get('mode')=='restore-original' and req.get('txid')==result['txid'] and req.get('boot_id')!=boot_id,'post-restoration new boot required')
+    safe_read(folder/'boot_b.readback.bin',ORIGINAL_B_SHA,64<<20)
+    safe_read(folder/'misc.readback.bin',ORIGINAL_MISC_SHA,1<<20)
+    return result
+
+def validate_request(request_binding,manifest_binding,review_binding,cold_validator,*,at=None):
+    """Host-only. The real supplied validator is source-bound; booleans are not a cold gate."""
+    at=at or now();request=obj(request_binding);manifest=obj(manifest_binding);review=obj(review_binding)
+    require(set(request)=={'schema','serial','txid','boot_id','created_at','expires_at','total_seconds','manifest','postcold','restoration'},'request fields')
+    require(request['schema']=='e5-next-scanner-deployment-v1' and request['serial']==SERIAL and request['manifest']==manifest_binding,'request identity/manifest')
+    require(re.fullmatch('[0-9a-f]{16}',request['txid']) and request['txid']!=OLD_TX and str(uuid.UUID(request['boot_id']))==request['boot_id'] and request['boot_id']!=OLD_BOOT,'new tx/boot')
+    created,expires=stamp(request['created_at']),stamp(request['expires_at'])
+    require(created<=at<expires and 0<(expires-created).total_seconds()<=900,'request stale/future/lease')
+    require(type(request['total_seconds']) is int and 30<=request['total_seconds']<=600 and request['total_seconds']+5<(expires-at).total_seconds(),'budget exceeds remaining lease')
+    require(manifest['schema']=='e5-next-scanner-artifact-manifest-v1' and manifest['production_binaries_executed'] is False,'artifact manifest')
+    require(sha(safe_read(Path(__file__).resolve()))==manifest['host_source_sha256'],'host source changed')
+    require(set(manifest['core'])=={'android_directory_adapter.py','bounded_transport.py'},'core source list')
+    for name,b in manifest['core'].items():
+        require(b['path']==str(CORE/name),'fixed core path');safe_read(b['path'],b['sha256'])
+    contract=manifest['cold_contract'];require(contract['path']==str(ROOT/'tools/e5_next_recovery_live_6c405cb2e5c4447e/evidence_contract.py'),'fixed cold validator path')
+    safe_read(contract['path'],contract['sha256'])
+    require(set(manifest['cold_dependencies'])=={'common.py','observe.py'},'cold dependency set')
+    for name,b in manifest['cold_dependencies'].items():
+        require(b['path']==str(Path(contract['path']).with_name(name)),'cold dependency path');safe_read(b['path'],b['sha256'])
+    module=sys.modules.get(cold_validator.__module__)
+    require(module is not None and Path(module.__file__).resolve()==Path(contract['path']) and
+            getattr(module,'validate_directory_ready',None) is cold_validator,'real source-bound cold validator required')
+    require(Path(module.c.__file__).resolve()==Path(contract['path']).with_name('common.py') and
+            Path(module.observer.__file__).resolve()==Path(contract['path']).with_name('observe.py'),'cold runtime dependency origins')
+    gate=cold_validator(request['postcold'],request['boot_id'],at)
+    require(gate.get('schema')=='e5-next-directory-ready-v1' and gate.get('status')=='ORIGINALS_VERIFIED' and
+            gate.get('boot_id')==request['boot_id'] and gate.get('serial')==SERIAL,'cold result contract')
+    require(expires<=stamp(gate['expires_at']),'request outlives cold evidence')
+    state_snapshot=obj(gate['state_snapshot'])
+    require(request['txid'] not in state_snapshot['used_txids'],'new tx was already used')
+    restoration=restoration_proof(request['restoration'],request['boot_id'])
+    require(isinstance(review.get('reviewer'),str) and review['reviewer'].strip(),'independent reviewer identity required')
+    require(review=={'reviewer':review['reviewer'],'schema':'e5-next-scanner-deployment-review-v1','decision':'FIXED_OLD_LOCK_ARCHIVE_NEW_HELPERS_SCANNER_ONLY',
+                     'request':request_binding,'manifest':manifest_binding,'cold_gate_sha256':gate_digest(gate),
+                     'restoration':request['restoration'],'scope_no_partition_or_rootfs_write':True},'independent stage2 review mismatch')
+    require(set(manifest['artifacts'])=={'archiver','scanner','io_helper','helper'},'exact four native artifacts')
+    for key,b in manifest['artifacts'].items():
+        require(set(b)=={'path','bytes','sha256'} and type(b['bytes']) is int and 0<b['bytes']<=4<<20,'artifact fields/size')
+        p=Path(b['path']);require(p.is_relative_to(HERE) or (key in ('io_helper','helper') and p.parent==ROOT/'tools/e5_clean_author_live_v3_20261014'),'fixed artifact provenance path')
+        safe_read(p,b['sha256'],b['bytes'])
+    require(manifest['artifacts']['io_helper']['sha256']=='0000000000000000000000000000000000000000000000000000000000000000' and
+            manifest['artifacts']['helper']['sha256']=='0000000000000000000000000000000000000000000000000000000000000000','unchanged IO/directory helper pins')
+    check_shared_state()
+    return request,manifest,gate,restoration
+
+class Stage2Deploy:
+    def __init__(self,adapter,request_binding,manifest_binding,review_binding,cold_validator,evidence_dir):
+        self.a=adapter;self.request_binding=request_binding;self.manifest_binding=manifest_binding;self.review_binding=review_binding
+        self.cold_validator=cold_validator;self.out=Path(evidence_dir);self.used=False;self.t=None;self.operations=[]
+    def _contract(self):
+        self.r,self.m,self.cold,self.restoration=validate_request(self.request_binding,self.manifest_binding,self.review_binding,self.cold_validator)
+        module=sys.modules.get(type(self.a).__module__)
+        require(module is not None and Path(module.__file__).resolve()==CORE/'android_directory_adapter.py' and type(self.a) is module.AndroidDirectoryAdapter,'fixed real adapter class')
+        require(type(self.a.adb) is module.Artifact and self.a.adb.path==ADB and self.a.adb.sha256==ADB_SHA,'fixed ADB artifact')
+        safe_read(ADB,ADB_SHA,self.a.adb.size)
+        require(Path(module.transport_api.__file__).resolve()==CORE/'bounded_transport.py','fixed loaded transport origin')
+        require(self.a.txid==self.r['txid'] and self.a.boot_id==self.r['boot_id'] and self.a.lock==LOCK and self.a._part is None,'adapter request identity')
+        require(self.a.cancel_event is not None and not self.a.cancel_event.is_set(),'explicit unset cancellation')
+        remaining=min(self.r['total_seconds'],(stamp(self.r['expires_at'])-now()).total_seconds()-5)
+        require(type(self.a.transaction_deadline) in (int,float) and math.isfinite(self.a.transaction_deadline) and 0<self.a.transaction_deadline-time.monotonic()<=remaining+1,'adapter shared finite deadline')
+        for key,stem in STEMS.items():
+            item=getattr(self.a,key);b=self.m['artifacts'][key]
+            require(type(item) is module.Artifact and item.path==Path(b['path']) and item.size==b['bytes'] and item.sha256==b['sha256'],'adapter exact artifact')
+            remote=self.a.remote_io if key=='io_helper' else getattr(self.a,'remote_'+key)
+            require(remote=='/data/local/tmp/e5-clean-'+stem+'.'+self.r['txid'],'fixed remote helper path')
+        self.t=self.a._ensure_transport()
+        require(self.t.state==STATE and self.t.serial==SERIAL and self.t.txid==self.r['txid'] and self.t.boot_id==self.r['boot_id'] and
+                self.t.recovery_context is None and self.t.reconciliation_only is False and not self.t.poisoned,'normal serial-wide transport required')
+        self.archive=LOCK+'.archive.'+OLD_TX+'.'+self.r['txid']
+        self.remote_archiver='/data/local/tmp/e5-clean-lock-archive.'+self.r['txid']
+        return module
+    def _time(self):
+        require(now()<stamp(self.r['expires_at']),'stage2 lease expired')
+        require(not self.a.cancel_event.is_set() and time.monotonic()<self.a.transaction_deadline,'stage2 cancelled/expired')
+    def _request(self,label,script,**kw):
+        self._time();return self.a._request(label,script,**kw)
+    @staticmethod
+    def _empty(raw):require(raw==b'','unexpected bootstrap output');return None
+    @staticmethod
+    def _wrap(body):return BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote('set -eu\nset -o pipefail\nset -C\n'+body)
+    def _snapshot(self,location,*,new_locked=False,programs_absent=False):
+        require(location in ('old','archive'),'fixed location')
+        p=LOCK if location=='old' else self.archive;op=uuid.uuid4().hex
+        paths={'data':'/data','local':'/data/local','tmp':'/data/local/tmp','old_lock':p,'old_owner':p+'/owner'}
+        if new_locked:paths.update(new_lock=LOCK,new_owner=LOCK+'/owner')
+        body=f"printf 'STATE\\t{op}\\t{self.a.boot_id}\\n'\n"
+        for key,path in paths.items():
+            kind='f' if key.endswith('owner') else 'd'
+            body+=f'test ! -L {path}; test -{kind} {path}; test "$(readlink -f {path})" = {path}\nprintf "{key}\\t"; stat -c \'{STAT}\' {path}\n'
+        body+=f'test "$({BB} find {p} -mindepth 1 -maxdepth 1 -print)" = {p}/owner\nprintf "OLD_OWNER\\t"; cat {p}/owner\n'
+        if location=='old':body+=f'test ! -e {self.archive}; test ! -L {self.archive}\n'
+        elif not new_locked:body+=f'test ! -e {LOCK}; test ! -L {LOCK}\n'
+        if new_locked:body+=self.a._locked()+f'printf "NEW_OWNER\\t"; cat {LOCK}/owner\n'
+        if programs_absent:
+            for path in [self.remote_archiver,*[('/data/local/tmp/e5-clean-'+stem+'.'+self.a.txid) for stem in STEMS.values()]]:
+                body+=f'test ! -e {path}; test ! -L {path}\n'
+        body+=f"printf 'END\\t{op}\\t%s\\n' \"$(cat /proc/sys/kernel/random/boot_id)\"\n"
+        def parse(raw):
+            lines=raw.splitlines();require(len(lines)==len(paths)+3+int(new_locked) and lines[0]==f'STATE\t{op}\t{self.a.boot_id}'.encode() and lines[-1]==f'END\t{op}\t{self.a.boot_id}'.encode(),'snapshot framing')
+            rows={}
+            for line,key in zip(lines[1:],paths):
+                name,sep,value=line.partition(b'\t');require(sep and name.decode()==key,'snapshot order');rows[key]=parse_stat(value)
+            for key,row in rows.items():
+                require(row['type']==('f' if key.endswith('owner') else 'd') and row['dev']==rows['data']['dev'] and row['inode']>0,'snapshot type/fs/identity')
+            for key,uid,gid,mode in [('data',1000,1000,'771'),('local',0,0,'751'),('tmp',0,2000,'771'),('old_lock',0,0,'700'),('old_owner',0,0,'600')]+([('new_lock',0,0,'700'),('new_owner',0,0,'600')] if new_locked else []):
+                require((rows[key]['uid'],rows[key]['gid'],rows[key]['mode'])==(uid,gid,mode),'snapshot metadata: '+key)
+            for key in ['old_owner']+(['new_owner'] if new_locked else []):require(rows[key]['bytes']==17 and rows[key]['nlink']==1,'owner length/link')
+            require(lines[1+len(paths)]==('OLD_OWNER\t'+OLD_TX).encode(),'old owner differs')
+            if new_locked:require(lines[-2]==('NEW_OWNER\t'+self.a.txid).encode(),'new owner differs')
+            rows['old_owner_hex']=(OLD_TX+'\n').encode().hex();return rows
+        return self._request('stage2-state-'+location,body,limit=16384,validator=parse,op_id=op)
+    @staticmethod
+    def _same(before,after,*,owner=True):
+        for key in ('data','local','tmp','old_lock'):require(identity(before[key])==identity(after[key]),'ancestor/old lock drift: '+key)
+        if owner:require(before['old_owner']==after['old_owner'],'old owner metadata drift')
+        for key in ('new_lock','new_owner'):
+            if key in before:require(before[key]==after[key] if key=='new_owner' else identity(before[key])==identity(after[key]),'new lock drift')
+    def _bindings_guard(self,before,location,*,new_locked=False):
+        paths={'data':'/data','local':'/data/local','tmp':'/data/local/tmp','old_lock':LOCK if location=='old' else self.archive}
+        if new_locked:paths['new_lock']=LOCK
+        body=''
+        for key,path in paths.items():
+            r=before[key];expected='|'.join([format(r['mode_bits'],'x'),str(r['dev']),str(r['inode']),r['mode'],str(r['uid']),str(r['gid'])])
+            body+=f'test ! -L {path}; test -d {path}; test "$(readlink -f {path})" = {path}; test "$(stat -c \'%f|%d|%i|%a|%u|%g\' {path})" = '+shlex.quote(expected)+'\n'
+        owner=paths['old_lock']+'/owner'
+        body+=f'test ! -L {owner}; test -f {owner}; test "$(stat -c \'%d %i %s %h %a %u %g\' {owner})" = '+shlex.quote(' '.join(str(before['old_owner'][k]) for k in ('dev','inode','bytes','nlink','mode','uid','gid')))+f'\ntest "$(cat {owner})" = {OLD_TX}\n'
+        if new_locked:body+=self.a._locked()
+        return body
+    def _program_read(self,path,binding,expected_dev):
+        require(path in {self.remote_archiver,*[('/data/local/tmp/e5-clean-'+stem+'.'+self.a.txid) for stem in STEMS.values()]},'fixed program path')
+        n=binding['bytes'];op=uuid.uuid4().hex
+        prefix=f'PROGRAM\t{op}\t{path}\t{n}\t'.encode();suffix=f'\nEND\t{op}\t'.encode()
+        body=f'test ! -L {path}; test -f {path}; test "$(readlink -f {path})" = {path}\nprintf "PROGRAM\\t{op}\\t{path}\\t{n}\\t"; stat -c \'{STAT}\' {path}\n'
+        body+=f'{BB} dd if={path} bs=4096 count={n} iflag=count_bytes status=none\nprintf "\\nEND\\t{op}\\t"; stat -c \'{STAT}\' {path}\n'
+        def parse(raw):
+            line,sep,tail=raw.partition(b'\n');require(sep and line.startswith(prefix),'program header');before=parse_stat(line[len(prefix):])
+            payload=tail[:n];rest=tail[n:];require(rest.startswith(suffix) and rest.endswith(b'\n'),'program exact length/footer');after=parse_stat(rest[len(suffix):-1]);require(before==after,'program metadata changed')
+            require(before['type']=='f' and before['nlink']==1 and before['uid']==0 and before['gid']==0 and before['mode']=='700' and before['bytes']==n and before['dev']==expected_dev,'program metadata')
+            require(len(payload)==n and sha(payload)==binding['sha256'],'program readback hash');return before
+        meta=self._request('stage2-program-readback',body,limit=n+8192,validator=parse)
+        body=f'test ! -L {path}; test -f {path}; stat -c \'{STAT}\' {path}\n{BB} sha256sum {path}\nstat -c \'{STAT}\' {path}\n'
+        def parse_hash(raw):
+            lines=raw.splitlines();require(len(lines)==3 and parse_stat(lines[0])==meta and parse_stat(lines[2])==meta and lines[1]==(binding['sha256']+'  '+path).encode(),'program independent SHA/identity');return meta
+        return self._request('stage2-program-independent-sha',body,limit=4096,validator=parse_hash)
+    def _upload(self,key,path,before,location,*,new_locked=False):
+        item=self.m['artifacts'][key];payload=safe_read(item['path'],item['sha256'],item['bytes'])
+        self._time();deadline=self.a._deadline();op=uuid.uuid4().hex;tick=f"awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime\n"
+        body=self._bindings_guard(before,location,new_locked=new_locked)+f'test ! -e {path}; test ! -L {path}\n'+tick
+        body+=f'umask 077; cat > {path}\ntest "$(stat -c %s {path})" = {item["bytes"]}\n'+tick+f'chmod 700 {path}\n'+tick
+        def follow(ack):
+            meta=self._program_read(path,item,before['data']['dev']);after=self._snapshot(location,new_locked=new_locked);self._same(before,after)
+            return {'remote_path':path,'artifact':item,'remote_metadata':meta}
+        self.operations.append({'label':'stage2-upload-'+key,'opid':op})
+        return self._request('stage2-upload-'+key,self._wrap(body),payload=payload,mutating=True,limit=4096,validator=self._empty,followup=follow,op_id=op)
+    def _archive(self,before):
+        self._program_read(self.remote_archiver,self.m['artifacts']['archiver'],before['data']['dev'])
+        self._time();deadline=self.a._deadline();op=uuid.uuid4().hex
+        args=['archive',self.a.txid,self.a.boot_id,op,str(deadline),str(before['data']['dev'])]+[str(before[k]['inode']) for k in ('data','local','tmp','old_lock','old_owner')]
+        def parse(raw):
+            rows=[json.loads(line) for line in raw.splitlines()];require(2<=len(rows)<=16,'native event count')
+            for r in rows:
+                require(r.get('schema')=='e5-old-lock-archive-v1' and r.get('old_txid')==OLD_TX and r.get('txid')==self.a.txid and r.get('boot_id')==self.a.boot_id and r.get('opid')==op and r.get('deadline_ms')==deadline,'native archive binding')
+                require(r.get('data_dev')==before['data']['dev'] and all(r.get(field)==before[key]['inode'] for field,key in [('data_ino','data'),('local_ino','local'),('tmp_ino','tmp'),('lock_ino','old_lock'),('owner_ino','old_owner')]),'native inode binding')
+                require(type(r.get('self_pid')) is int and r['self_pid']>0 and type(r.get('self_starttime')) is int and r['self_starttime']>0,'native process identity')
+            require(rows[0]['event']=='BEGIN' and rows[-1]['event']=='RESULT' and all(r['event']=='PHASE' for r in rows[1:-1]),'native start/end')
+            require(len({(r['self_pid'],r['self_starttime']) for r in rows})==1,'native process drift')
+            clocks=[r.get('checked_boottime_ms') for r in rows]
+            require(all(type(c) is int and 0<c<deadline for c in clocks) and clocks==sorted(clocks),'native checked clock')
+            result=rows[-1];require(all(result.get(k) is True for k in ('complete','renamed','fsync_completed','f2fs_confirmed','owner_unchanged')) and result.get('cancel_signal')==0 and result.get('outcome')=='COMPLETED','native archive incomplete')
+            return result
+        def follow(ack):
+            after=self._snapshot('archive');self._same(before,after)
+            durable(self.out/'OLD_LOCK_ARCHIVED.json',canonical({'native':ack,'before':before,'after':after})+b'\n');return after
+        self.operations.append({'label':'stage2-archive-old-lock','opid':op})
+        return self._request('stage2-archive-old-lock',self._bindings_guard(before,'old')+self.remote_archiver+' '+' '.join(args)+'\n',limit=32768,validator=parse,mutating=True,followup=follow,op_id=op)
+    def _create_new_lock(self,before):
+        self._time();deadline=self.a._deadline();op=uuid.uuid4().hex;tick=f"awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime\n"
+        body=self._bindings_guard(before,'archive')+f'test ! -e {LOCK}; test ! -L {LOCK}\n'+tick+f'umask 077; mkdir {LOCK}\n'+tick+f'printf "%s\\n" {self.a.txid} > {LOCK}/owner\n'+tick
+        def follow(ack):after=self._snapshot('archive',new_locked=True);self._same(before,after);return after
+        self.operations.append({'label':'stage2-new-lock','opid':op})
+        return self._request('stage2-new-lock',self._wrap(body),mutating=True,limit=4096,validator=self._empty,followup=follow,op_id=op)
+    def _baseline(self):
+        baseline=self.a.check_baseline();profile=self.a._profile()
+        for name,item in sorted(profile['partitions'].items()):
+            leaf=item['node'].rsplit('/',1)[-1]
+            script=f'readlink -f /dev/block/by-name/{name}\ncat /sys/class/block/{leaf}/dev\ncat /sys/class/block/{leaf}/size\ncat /sys/class/block/{leaf}/start\n'
+            got=self._request('stage2-geometry',script,limit=512).decode().splitlines()
+            require(got==[item['node'],item['dev'],str(item['bytes']//512),str(item['start_lba'])],'live geometry mismatch')
+        raw,_=self.a._read_twice('/dev/block/mmcblk0',0,32768);require(sha(raw)==profile['gpt_prefix_sha256'],'live GPT mismatch')
+        return baseline
+    def run(self):
+        require(not DEVICE_IO_DISABLED,'DEVICE_IO_DISABLED: preparation only')
+        require(not self.used,'no replay');self.used=True
+        require(self.out.is_absolute() and self.out.is_relative_to(ROOT/'evidence') and not self.out.exists() and not self.out.is_symlink() and all(not p.is_symlink() for p in self.out.parents),'new evidence output required')
+        with host_lock():
+            try:
+                self._contract();self.out.mkdir(mode=0o700);fsync_dir(self.out.parent)
+                durable(self.out/'INPUT.json',canonical({'request':self.request_binding,'manifest':self.manifest_binding,'review':self.review_binding})+b'\n')
+                baseline=self._baseline();before=self._snapshot('old',programs_absent=True)
+                durable(self.out/'old-owner.bin',bytes.fromhex(before['old_owner_hex']));durable(self.out/'OLD_LOCK_BEFORE.json',canonical(before)+b'\n')
+                uploads={'archiver':self._upload('archiver',self.remote_archiver,before,'old')}
+                after=self._archive(before);locked=self._create_new_lock(after)
+                for key,stem in STEMS.items():
+                    fresh=self._snapshot('archive',new_locked=True);self._same(locked,fresh)
+                    uploads[key]=self._upload(key,'/data/local/tmp/e5-clean-'+stem+'.'+self.a.txid,fresh,'archive',new_locked=True)
+                self._time();scan=self.a.occupancy();self._time()
+                after=self._snapshot('archive',new_locked=True);self._same(locked,after)
+                for key,entry in uploads.items():
+                    path=self.remote_archiver if key=='archiver' else '/data/local/tmp/e5-clean-'+STEMS[key]+'.'+self.a.txid
+                    require(self._program_read(path,self.m['artifacts'][key],before['data']['dev'])==entry['remote_metadata'],'program drift after scan')
+                final_baseline=self._baseline();require(final_baseline==baseline,'protected baseline changed')
+                result={'schema':'e5-next-scanner-deployment-result-v1','serial':SERIAL,'boot_id':self.a.boot_id,'txid':self.a.txid,
+                        'request':self.request_binding,'manifest':self.manifest_binding,'review':self.review_binding,'archive':self.archive,
+                        'uploads':uploads,'lock':after,'scanner':scan,'baseline':baseline,'operations':self.operations,
+                        'no_partition_or_rootfs_write':True,'no_reboot':True,'automatic_cleanup_retry_or_resume':False,
+                        'scanner_real_full_scan_passed':True,'noreplace_probe_passed':False,'approved_to_activate':False}
+                durable(self.out/'RESULT.json',canonical(result)+b'\n');self._time();check_shared_state()
+                durable(self.out/'COMPLETE.json',canonical({'schema':'e5-stage2-complete-v1','result':bind(self.out/'RESULT.json'),'all_requests_completed':True})+b'\n')
+                return result
+            except BaseException as exc:
+                if self.t is not None:
+                    try:self.t.mark_uncertain('stage2: '+type(exc).__name__+': '+str(exc))
+                    except BaseException:pass
+                if self.out.is_dir() and not (self.out/'STOP.json').exists():
+                    try:durable(self.out/'STOP.json',canonical({'error':type(exc).__name__,'reason':str(exc),'no_retry':True,'no_cleanup':True})+b'\n')
+                    except BaseException:pass
+                raise
+
+
+# Fixed host-only closure support. This gate never clears an operation marker.
+def _closure_api():
+    import hashlib as _h, stat as _s, types as _t
+    _p = Path('/REDACTED_HOST_PATH')
+    if _p.is_symlink() or any(x.is_symlink() for x in _p.parents):
+        raise RuntimeError('unsafe fixed closure source')
+    _before = _p.stat(); _raw = _p.read_bytes(); _after = _p.stat()
+    _identity = lambda s: (s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+    if not (_s.S_ISREG(_before.st_mode) and _before.st_nlink == 1 and
+            _identity(_before) == _identity(_after) and _h.sha256(_raw).hexdigest() == '0000000000000000000000000000000000000000000000000000000000000000'):
+        raise RuntimeError('fixed closure source pin changed')
+    _m = _t.ModuleType('_e5_fixed_readonly_closure'); _m.__file__ = str(_p)
+    exec(compile(_raw,str(_p),'exec'),_m.__dict__)
+    return _m
+
+if __name__=='__main__':raise SystemExit('Preparation-only library. No CLI or device execution.')

@@ -1,0 +1,116 @@
+"""Fixed nine physical NV reads and exact transcript verification. Never writes NV."""
+from pathlib import Path
+import hashlib,json,re,shlex,uuid
+import importlib.util as _iu,sys as _sys
+_cp=Path(__file__).resolve().with_name('common.py');_key='_e5_sim_common'
+if _key not in _sys.modules:
+ _sp=_iu.spec_from_file_location(_key,_cp);_cm=_iu.module_from_spec(_sp);_sys.modules[_key]=_cm;_sp.loader.exec_module(_cm)
+c=_sys.modules[_key]
+if Path(c.__file__).resolve()!=_cp:raise RuntimeError('common source conflict')
+NV_IO_DISABLED=False
+GEOMETRY_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CHUNK=4<<20
+BB='/data/adb/magisk/busybox'
+NETWORK={'registry':('dumpsys telephony.registry',1<<20),'connectivity':('dumpsys connectivity',2<<20)}
+def rows():
+ value=json.loads(c.read(c.HERE/'nv_geometry.json',GEOMETRY_SHA));r=value['rows']
+ c.require(len(r)==9 and {x['number'] for x in r}=={13,14,15,16,17,18,22,23,69},'fixed nine geometry');return r
+
+def guard(r):
+ c.require(r in rows(),'NV target outside fixed geometry');node=r['node'];leaf='mmcblk0p'+str(r['number']);ma,mi=map(int,r['dev'].split(':'))
+ return (f'test ! -L {node}; test -b {node}; test "$(readlink -f {node})" = {node}\n'+f'test "$(readlink -f /dev/block/by-name/{r["name"]})" = {node}\n'+f'test "$(cat /sys/class/block/{leaf}/dev)" = {r["dev"]}\n'+f'test "$(cat /sys/class/block/{leaf}/start)" = {r["start_lba"]}\n'+f'test "$(cat /sys/class/block/{leaf}/size)" = {r["bytes"]//512}\n'+f'test "$(stat -c %t:%T {node})" = {ma:x}:{mi:x}\n'+f'test "$(blockdev --getsize64 {node})" = {r["bytes"]}\n')
+def script(r,off,size,op,boot,hashed=False):
+ c.require(r in rows() and type(off) is int and type(size) is int and off>=0 and off%4096==0 and 0<size<=CHUNK and size%4096==0 and off+size<=r['bytes'] and re.fullmatch('[a-f0-9]{32}',op),'NV bounds')
+ c.validboot(boot);node=r['node'];g=guard(r);pipe=' | '+BB+' sha256sum' if hashed else ''
+ return (g+f'printf "SIMNV {op} {boot} {node} {off} {size} "; stat -c "%i %d" {node}\n'
+  +'printf "SIM %s\\n" "$(getprop gsm.sim.state)"\n'
+  +f'{BB} dd if={node} bs=4096 skip={off//4096} count={size} iflag=count_bytes status=none{pipe}\n'
+  +g+f'test "$(cat /proc/sys/kernel/random/boot_id)" = {boot}\ntest "$(getprop ro.boot.slot_suffix)" = _a\n'
+  +f'printf "\\nSIMNV {op} {boot} {node} {off} {size} "; stat -c "%i %d" {node}\n'
+  +'printf "SIM %s\\n" "$(getprop gsm.sim.state)"\n')
+def parse(raw,r,off,size,op,boot,hashed=False):
+ prefix=f'SIMNV {op} {boot} {r["node"]} {off} {size} '.encode();head,sep,body=raw.partition(b'\n');c.require(sep and head.startswith(prefix),'NV header')
+ identity=head[len(prefix):].split();c.require(len(identity)==2 and all(v.isdigit() and int(v)>0 for v in identity),'NV inode/dev')
+ first,sep,body=body.partition(b'\n');c.require(sep and first.startswith(b'SIM '),'NV SIM before');first=first[4:].decode('ascii');o=c.sibling('observe');c.require(o.sim_ready(first),'NV SIM not ready')
+ n=68 if hashed else size;c.require(len(body)>n and body[n:n+len(head)+2]==b'\n'+head+b'\n','NV exact length/inode/offset/boot footer')
+ last=body[n+len(head)+2:];c.require(last.startswith(b'SIM ') and last.endswith(b'\n') and b'\n' not in last[:-1],'NV SIM after framing');last=last[4:-1].decode('ascii');c.require(o.sim_ready(last),'NV SIM after not ready')
+ data=body[:n]
+ if hashed:c.require(re.fullmatch(rb'[a-f0-9]{64}  -\n',data),'NV hash response')
+ return data,tuple(map(int,identity)),[first,last]
+def network_script(kind,boot,op):
+ c.require(kind in NETWORK and re.fullmatch('[a-f0-9]{32}',op),'network read scope');c.validboot(boot)
+ return (f'printf "SIMNET {op} {boot} %s\\n" "$(getprop gsm.sim.state)"\n'+NETWORK[kind][0]+'\n'
+  +f'test "$(cat /proc/sys/kernel/random/boot_id)" = {boot}\ntest "$(getprop ro.boot.slot_suffix)" = _a\n'
+  +f'printf "\\nSIMNETEND {op} {boot} %s\\n" "$(getprop gsm.sim.state)"\n')
+def parse_network(raw,kind,boot,op):
+ c.require(len(raw)<=NETWORK[kind][1] and raw.endswith(b'\n'),'network cap');head,sep,rest=raw.partition(b'\n');body,sep2,tail=rest.rpartition(b'\nSIMNETEND ')
+ c.require(sep and sep2 and head.startswith(f'SIMNET {op} {boot} '.encode()) and tail.startswith(f'{op} {boot} '.encode()),'network identity framing')
+ states=[head.split(b' ')[-1].decode('ascii'),tail.rstrip(b'\n').split(b' ')[-1].decode('ascii')];c.require(all(c.sibling('observe').sim_ready(x) for x in states),'network SIM not ready')
+ c.require(bool(body.strip()) and not re.search(rb'Permission Denial|Can.t find service',body),'network service read failed');return states
+
+def capture(native,budget,folder):
+ c.require(not NV_IO_DISABLED,'NV_IO_DISABLED: no device reads');budget.check();folder=Path(folder);c.require(not folder.exists(),'new NV output');folder.mkdir(mode=0o700);c.sync(folder.parent)
+ items=[];started=c.now().isoformat()
+ for r in rows():
+  rawall=bytearray();parts=[];identity=None;states=[]
+  for off in range(0,r['bytes'],CHUNK):
+   n=min(CHUNK,r['bytes']-off);op=uuid.uuid4().hex
+   raw,meta,sim=native._request('sim-nv-read',script(r,off,n,op,native.boot_id),budget,limit=n+4096,validator=lambda x,r=r,off=off,n=n,op=op:parse(x,r,off,n,op,native.boot_id),op_id=op)
+   c.require(identity is None or identity==meta,'NV inode changed');identity=meta;rawall.extend(raw);parts.append((off,n,c.sha(raw)));states.append(sim)
+  budget.check();artifact=c.save(folder/(r['name']+'.bin'),bytes(rawall));budget.check();del rawall
+  for off,n,h in parts:
+   op=uuid.uuid4().hex;raw,meta,sim=native._request('sim-nv-hash',script(r,off,n,op,native.boot_id,True),budget,limit=4096,validator=lambda x,r=r,off=off,n=n,op=op:parse(x,r,off,n,op,native.boot_id,True),op_id=op)
+   c.require(meta==identity and raw[:64].decode()==h,'NV changed during two full passes; stop, no retry');states.append(sim)
+  items.append({**r,'artifact':{**artifact,'bytes':r['bytes']},'identity':list(identity),'sim_states_raw':states,'two_complete_passes_match':True})
+ network={}
+ for kind in NETWORK:
+  op=uuid.uuid4().hex
+  native._request('sim-network-'+kind,network_script(kind,native.boot_id,op),budget,limit=NETWORK[kind][1],validator=lambda x,kind=kind,op=op:parse_network(x,kind,native.boot_id,op),op_id=op)
+  network[kind]={'op_id':op,'raw_in_transport':True}
+ budget.check()
+ return c.save(folder/'COMPLETE.json',{'schema':'e5-sim-nine-nv-baseline-v1','serial':c.SERIAL,'boot_id':native.boot_id,'txid':native.txid,'started_at':started,'completed_at':c.now().isoformat(),'geometry_sha256':GEOMETRY_SHA,'source_sha256':c.sha(c.read(Path(__file__).resolve())),'items':items,'network':network,'read_only':True,'device_mutations':0,'approved_to_rearm':False})
+
+def validate_capture(binding,at,boot,tx,transport):
+ v=c.obj(binding);root=Path(binding['path']).parent;c.require(Path(binding['path']).name=='COMPLETE.json' and v.get('schema')=='e5-sim-nine-nv-baseline-v1','SIM NV completion')
+ c.require(v['serial']==c.SERIAL and v['boot_id']==boot and v['txid']==tx and v['geometry_sha256']==GEOMETRY_SHA and v['read_only'] is True and v['device_mutations']==0 and v['approved_to_rearm'] is False,'SIM NV identity/scope')
+ c.require(v['source_sha256'] in c.sibling('evidence_contract').source_variants(Path(__file__).resolve(),b'NV_IO_DISABLED=True'),'SIM NV producer source')
+ start,end=c.timestamp(v['started_at']),c.timestamp(v['completed_at']);c.require(start<=end<=at and (at-end).total_seconds()<900,'SIM NV age/order')
+ c.require(len(v['items'])==9 and [x['name'] for x in v['items']]==[r['name'] for r in rows()],'exact ordered nine NV')
+ data={};identities={};states={};expected=[]
+ for item,r in zip(v['items'],rows()):
+  c.require({k:item[k] for k in r}==r and item['two_complete_passes_match'] is True,'NV geometry differs')
+  a=item['artifact'];c.require(a['path']==str(root/(r['name']+'.bin')) and a['bytes']==r['bytes'],'NV artifact location/size');data[r['name']]=c.read(a['path'],a['sha256'],a['bytes']);identities[r['name']]=item['identity'];states[r['name']]=[]
+  for hashed in (False,True):expected += [(r,off,min(CHUNK,r['bytes']-off),hashed) for off in range(0,r['bytes'],CHUNK)]
+ folders=[]
+ for p in sorted(Path(transport).iterdir()):
+  if p.is_dir() and any(tag in p.name for tag in ('-sim-nv-read-','-sim-nv-hash-','-sim-network-')):folders.append(p)
+ c.require(len(folders)==len(expected)+len(NETWORK),'NV/network exact request count')
+ evidence={};e=c.sibling('evidence_contract')
+ for i,p in enumerate(folders):
+  receipt=c.obj(c.binding(p/'COMPLETE.json'));flight=c.obj(c.binding(p/'IN_FLIGHT.json'));m=c.obj(c.binding(p/'transport-result.json'));raw=c.read(p/'stdout.bin');err=c.read(p/'stderr.bin')
+  c.require(not (p/'UNCERTAIN.json').exists() and receipt.get('status')=='COMPLETE' and receipt.get('validated') is True and receipt.get('serial')==c.SERIAL and receipt.get('boot_id')==boot and receipt.get('txid')==tx and receipt.get('mutating') is False and receipt.get('reconciliation_only') is True and receipt.get('recovery_context') is None and receipt.get('payload_bytes')==0 and receipt.get('payload_sha256')==c.sha(b'') and receipt.get('deadline_seconds')==8 and receipt.get('automatic_retry') is False,'NV request receipt')
+  c.require(all(receipt.get(k)==val for k,val in flight.items() if k!='status') and receipt.get('stdout_sha256')==c.sha(raw) and receipt.get('argv_sha256')==c.sha(c.canonical(receipt['argv'])),'NV flight/receipt')
+  c.require(m.get('failure') is None and m.get('returncode')==0 and 0<=m['elapsed_seconds']<=8 and m.get('host_child_reaped') is True and m.get('stdin_bytes_sent')==0 and m.get('stdout_bytes')==len(raw) and m.get('stdout_sha256')==c.sha(raw) and not err and m.get('stderr_bytes')==0,'NV request failed')
+  op=receipt['op_id']
+  if i<len(expected):
+   r,off,n,hashed=expected[i];label='sim-nv-hash' if hashed else 'sim-nv-read';body=script(r,off,n,op,boot,hashed);limit=4096 if hashed else n+4096
+   value,identity,sim=parse(raw,r,off,n,op,boot,hashed);c.require(list(identity)==identities[r['name']],'NV inode drift');states[r['name']].append(sim);wanted=data[r['name']][off:off+n]
+   c.require(value==(c.sha(wanted)+'  -\n').encode() if hashed else value==wanted,'NV double read mismatch')
+  else:
+   kind=list(NETWORK)[i-len(expected)];label='sim-network-'+kind;body=network_script(kind,boot,op);limit=NETWORK[kind][1];parse_network(raw,kind,boot,op);c.require(v['network'][kind]=={'op_id':op,'raw_in_transport':True},'network raw binding')
+  c.require(receipt['label']==label and receipt['argv']==e.argv(e.base(boot,'rearm-with-sim',tx)+body) and receipt['output_limit']==limit,'NV source transcript differs')
+  for name in ('COMPLETE.json','IN_FLIGHT.json','transport-result.json','stdout.bin','stderr.bin'):evidence[p.name+'/'+name]=c.binding(p/name)['sha256']
+ for item in v['items']:c.require(item['sim_states_raw']==states[item['name']],'SIM raw observations changed')
+ return {'hashes':{k:c.sha(v) for k,v in data.items()},'raw_evidence_sha256':c.sha(c.canonical(evidence)),'completed_at':v['completed_at'],'network':v['network']}
+
+
+def check_live(native,budget,expected):
+ c.require(not NV_IO_DISABLED,'NV_IO_DISABLED');budget.check();c.require(set(expected)=={r['name'] for r in rows()},'exact prewrite NV set')
+ # Hash each complete fixed physical NV again just before BC32. No retry or NV write.
+ for r in rows():
+  h=hashlib.sha256();identity=None
+  for off in range(0,r['bytes'],CHUNK):
+   n=min(CHUNK,r['bytes']-off);op=uuid.uuid4().hex
+   raw,meta,states=native._request('sim-nv-prewrite-read',script(r,off,n,op,native.boot_id),budget,limit=n+4096,validator=lambda x,r=r,off=off,n=n,op=op:parse(x,r,off,n,op,native.boot_id),op_id=op)
+   c.require(identity is None or identity==meta,'prewrite NV identity changed');identity=meta;h.update(raw)
+  c.require(h.hexdigest()==expected[r['name']],'NV changed since reviewed baseline; stop before BC32')

@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""Offline-reviewed E5 first-install transaction. ALL device I/O HARD DISABLED.
+
+Only validate/plan CLI is usable. Live backend is actual code for future review,
+not a stub, but every subprocess boundary unconditionally checks LIVE_DISABLED.
+No environment variable or CLI option can bypass it. No FDL, retry or reboot.
+"""
+from __future__ import annotations
+import argparse
+import datetime
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shlex
+import struct
+import subprocess
+import tarfile
+import zlib
+
+LIVE_DISABLED = True
+SERIAL = "DEVICE_SERIAL_REDACTED"
+COMMIT = "569f13d4ce15585f70817c2a1e03bb574a84720b"
+BOOT_BYTES = 64 << 20
+MISC_BYTES = 1 << 20
+BC_OFFSET = 2048
+ROOT = Path(__file__).resolve().parent
+REMOTE_STAGE = "/data/e5linux-stage-20261013"
+REMOTE_FINAL = "/data/e5linux"
+SU = "/debug_ramdisk/su"
+BB = "/data/adb/magisk/busybox"
+PROTECTED = ("trustos_a", "trustos_b", "uboot_a", "uboot_b", "vbmeta_a", "vbmeta_b",
+             "init_boot_a", "init_boot_b", "sml_a", "sml_b", "teecfg_a", "teecfg_b", "boot_a")
+PROFILE_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+SOURCE_LOCK_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+CONVERTERS = {"sprd-bt-config.py": "0000000000000000000000000000000000000000000000000000000000000000",
+              "vbc-profile.py": "0000000000000000000000000000000000000000000000000000000000000000"}
+PROBE_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+class Refusal(RuntimeError):
+    pass
+
+def require(condition, message):
+    if not condition:
+        raise Refusal(message)
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+def file_hash(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def fsync_directory(path):
+    fd=os.open(path,os.O_RDONLY | os.O_DIRECTORY)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+
+def durable_write(path, data):
+    path=Path(path)
+    with path.open("xb") as f:
+        os.fchmod(f.fileno(),0o600);f.write(data);f.flush();os.fsync(f.fileno())
+    fsync_directory(path.parent)
+
+def pinned_json(path, expected):
+    raw = Path(path).read_bytes()
+    require(re.fullmatch(r"[a-f0-9]{64}", expected) and digest(raw) == expected, "manifest hash mismatch")
+    return json.loads(raw)
+
+def load_profile():
+    return pinned_json(ROOT / "device-profile.json", PROFILE_SHA256)
+
+def regular(path):
+    p = Path(path)
+    require(p.is_file() and not p.is_symlink(), "not a regular local input")
+    return p
+
+def artifact(base, entry):
+    name = PurePosixPath(entry["path"])
+    require(not name.is_absolute() and ".." not in name.parts, "unsafe artifact path")
+    p = regular(base / str(name))
+    require(p.resolve().is_relative_to(base.resolve()), "artifact escapes bundle")
+    require(p.stat().st_size == entry["bytes"] and file_hash(p) == entry["sha256"], "artifact size/hash mismatch")
+    return p
+
+def validate_boot_layout(path):
+    """Newly built Android v4 E5 image; log writes must not overlap image data."""
+    data=regular(path).read_bytes()
+    require(len(data)==BOOT_BYTES and data[:8]==b"ANDROID!", "invalid full boot image")
+    kernel, ramdisk=struct.unpack_from("<II",data,8)
+    require(struct.unpack_from("<I",data,40)[0]==4, "expected boot v4")
+    align=lambda x:(x+4095)//4096*4096
+    body=4096+align(kernel)+align(ramdisk)
+    require(data[-64:-60]==b"AVBf", "missing AVB footer")
+    original,offset,size=struct.unpack_from(">QQQ",data,len(data)-64+12)
+    require(kernel>0 and ramdisk>0 and body==original==offset and size>0, "inconsistent boot layout/footer")
+    require(offset+size<=56<<20 and data[offset:offset+4]==b"AVB0", "kernel/ramdisk/AVB overlaps 56MiB log start")
+    require(not any(data[56<<20:60<<20]), "new image diagnostic area is not empty")
+    return {"kernel_bytes":kernel,"ramdisk_bytes":ramdisk,"payload_end":offset+size,
+            "log_start":56<<20,"log_end":60<<20}
+
+def bc_validate(data, armable=True):
+    require(len(data) == 32 and data[4:8] == b"BCAB" and data[8] == 1 and data[9] & 7 == 2,
+            "invalid boot control format")
+    require(struct.unpack_from("<I", data, 28)[0] == zlib.crc32(data[:28]), "invalid boot control CRC")
+    require(data[:4] in (b"_a\0\0", b"_b\0\0"), "invalid slot suffix")
+    require(not data[13] & 1 and not data[15] & 1, "slot verity error")
+    if armable:
+        require(data[:4] == b"_a\0\0" and data[12] & 0x80 and data[12] & 15, "Android A not successful")
+        require(data[14] & 15 <= data[12] & 15, "pending B OTA / higher priority")
+    return data
+
+def bc_trial(before):
+    bc_validate(before)
+    out = bytearray(before)
+    out[:4] = b"_b\0\0"
+    out[12] = (before[12] & 0xf0) | 14
+    out[14] = 0x2f  # B priority 15, two attempts, not marked successful.
+    struct.pack_into("<I", out, 28, zlib.crc32(out[:28]))
+    return bytes(out)
+
+def runtime_bc_templates(before):
+    """Exact fixed upstream build-boot-image.py transform, not a copy of live BC.
+    Keep this separate from flash.py's host trial (which preserves A tries).
+    """
+    bc_validate(before)
+    a = bytearray(before); b = bytearray(before); priority = before[12] & 15
+    a[:4] = b"_a\0\0"; a[12] = priority | 0x90
+    b[:4] = b"_b\0\0"; b[12] = ((priority-1) & 15) | 0x90; b[14] = 0x2f
+    for out in (a, b):
+        struct.pack_into("<I", out, 28, zlib.crc32(out[:28]))
+    return bytes(a), bytes(b)
+
+def misc_changed_only_bc(before, after, bc):
+    require(len(before) == len(after) == MISC_BYTES, "short misc readback")
+    require(after[:BC_OFFSET] == before[:BC_OFFSET] and after[BC_OFFSET+32:] == before[BC_OFFSET+32:],
+            "misc changed outside approved 32 bytes")
+    require(after[BC_OFFSET:BC_OFFSET+32] == bc, "misc 32-byte readback mismatch")
+
+def safe_tar(path):
+    """Device archive is data only. Never host-extract it, or accept donor NV."""
+    with tarfile.open(path, "r:") as t:
+        members = t.getmembers()
+        require(members, "empty device files archive")
+        seen = set(); entries={}
+        for m in members:
+            p = PurePosixPath(m.name)
+            require(not p.is_absolute() and ".." not in p.parts and str(p) not in seen, "unsafe/duplicate tar member")
+            seen.add(str(p))
+            entries[str(p)]=m
+            require(m.isfile() or m.isdir(), "archive links/devices not allowed")
+            require(str(p) in ("lib", "lib/firmware", "opt", "opt/e5", "opt/e5/android") or
+                    str(p).startswith(("lib/firmware/", "opt/e5/android/")), "unexpected archive tree")
+            require(m.uid == m.gid == 0 and not m.mode & 0o6000, "unsafe archive ownership/mode")
+            require(not any(x in p.parts for x in ("nv", "block", "nr_fixnv1_a", "calinv")), "donor NV not allowed")
+        for n in ("lib/firmware/wcnmodem.bin", "lib/firmware/l_agdsp_a.img",
+                  "lib/firmware/sprd/marlin3lite_pskey.bin", "lib/firmware/sprd/marlin3lite_rf.bin",
+                  "opt/e5/android/vendor/bin/modem_control", "opt/e5/android/dev/__properties__/property_info"):
+            require(n in seen and entries[n].isfile() and entries[n].size > 0, "required own-device file missing/empty: " + n)
+        dsp=entries["lib/firmware/l_agdsp_a.img"]
+        require(dsp.size==6291456 and t.extractfile(dsp).read(11).startswith(b"SharkL5_AUD"), "wrong own-device audio DSP image")
+
+def validate_device_provenance(tar_path, provenance_path, approval):
+    """Bind reviewed collection/conversion evidence to every regular tar member.
+    A synthetic test archive can never pass this installation gate.
+    """
+    provenance=json.loads(regular(provenance_path).read_text())
+    require(provenance["schema"]==1 and provenance["serial"]==SERIAL and
+            provenance["source_build"]=="TS305_V03_20241128_2301" and provenance["source_commit"]==COMMIT,
+            "wrong own-device provenance identity")
+    require(provenance["synthetic_fixture"] is False and provenance["nv_included"] is False,
+            "synthetic/donor NV package forbidden")
+    require(provenance["converter_hashes"]==CONVERTERS and
+            provenance["collector_sha256"]==file_hash(ROOT/"collect-own-device.sh"), "conversion/collection source mismatch")
+    require(approval["reviewed"] is True and approval["collection_manifest_sha256"]==provenance["collection_manifest_sha256"] and
+            re.fullmatch(r"[a-f0-9]{64}",provenance["collection_manifest_sha256"]), "unreviewed own-device collection")
+    tar_record=provenance["device_files_tar"]
+    require(tar_record["bytes"]==tar_path.stat().st_size and tar_record["sha256"]==file_hash(tar_path), "provenance covers a different tar")
+    with tarfile.open(tar_path,"r:") as t:
+        rows=[{"name":str(PurePosixPath(m.name)),"bytes":m.size,"sha256":digest(t.extractfile(m).read())} for m in t if m.isfile()]
+    require(rows==provenance["outputs"], "tar members differ from reviewed conversion outputs")
+    return provenance
+
+def validate_bundle(path, expected):
+    path = regular(path); base = path.parent
+    require(not (base/"FAILED_NOT_INSTALLABLE").exists(), "FAILED_NOT_INSTALLABLE: binding did not finish safely")
+    b = pinned_json(path, expected)
+    require(b["schema"] == 1 and b["serial"] == SERIAL and b["source_commit"] == COMMIT, "wrong bundle identity")
+    require(b["device_profile"] == "e5" and b["mode"] == "userdata-first-install", "wrong package mode")
+    require(b["device_profile_sha256"] == PROFILE_SHA256, "wrong frozen device profile")
+    source_lock=pinned_json(ROOT/"source-lock.json",SOURCE_LOCK_SHA256)
+    require(b["submodules"] == source_lock["submodules"], "submodules differ from fixed main gitlinks")
+    required = {"boot", "rootfs_gz", "device_files_tar", "device_files_provenance", "install_conf", "fscrypt_probe", "runtime_audit"}
+    require(set(b["artifacts"]) == required, "unexpected/missing artifacts")
+    paths = {k: artifact(base, v) for k, v in b["artifacts"].items()}
+    require(paths["boot"].stat().st_size == BOOT_BYTES, "boot image must cover exact partition")
+    validate_boot_layout(paths["boot"])
+    probe=paths["fscrypt_probe"].read_bytes()
+    require(digest(probe)==PROBE_SHA256,"fscrypt probe differs from reviewed static build")
+    require(len(probe)>=64 and probe[:6]==b"\x7fELF\x02\x01" and struct.unpack_from("<H",probe,18)[0]==183,
+            "policy probe must be little-endian aarch64 ELF64")
+    phoff=struct.unpack_from("<Q",probe,32)[0];phsize,phnum=struct.unpack_from("<HH",probe,54)
+    require(phsize>=56 and phnum>0 and phoff+phsize*phnum<=len(probe), "invalid probe ELF program headers")
+    require(all(struct.unpack_from("<I",probe,phoff+i*phsize)[0]!=3 for i in range(phnum)), "policy probe must be static (no ELF interpreter)")
+    e = b["artifacts"]["rootfs_gz"]; h = hashlib.sha256(); size = 0; header=b""
+    with gzip.open(paths["rootfs_gz"], "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            size += len(chunk); require(size <= e["raw_bytes"], "decompression exceeds manifest")
+            if not header: header=chunk[:4096]
+            h.update(chunk)
+    require(size == e["raw_bytes"] and h.hexdigest() == e["raw_sha256"], "decompressed rootfs size/hash mismatch")
+    require(size >= 1 << 30 and size % (1 << 20) == 0, "rootfs must be pre-sized in builder")
+    require(header[1080:1082]==b"\x53\xef", "decompressed image is not ext4")
+    safe_tar(paths["device_files_tar"])
+    validate_device_provenance(paths["device_files_tar"],paths["device_files_provenance"],b["device_files_review"])
+    audit = json.loads(paths["runtime_audit"].read_text())
+    require(audit["source_commit"] == COMMIT and audit["boot_sha256"] == b["artifacts"]["boot"]["sha256"] and
+            audit["rootfs_raw_sha256"] == e["raw_sha256"], "runtime audit does not cover images")
+    for gate in ("a_block_writes_absent", "nv_physical_readonly_before_vendor", "nv_store_unseeded",
+                 "runtime_misc_templates_match_this_device", "rootfs_ext4_checked",
+                 "first_trial_android_default", "persist_log_write_bounded_56_to_60_mib"):
+        require(audit.get(gate) is True, "runtime audit unresolved: " + gate)
+    runtime_a, runtime_b = runtime_bc_templates(bytes.fromhex(b["approved_bc_before_hex"]))
+    require(b["runtime_misc_a_hex"] == runtime_a.hex() and b["runtime_misc_b_hex"] == runtime_b.hex(),
+            "runtime boot-control templates must match the fixed builder's transform of this approved BC")
+    # Confidential settings are never logged. No arbitrary shell content accepted.
+    conf = paths["install_conf"].read_text()
+    fields = {}
+    for line in conf.splitlines():
+        m = re.fullmatch(r"(E5_APN|E5_WIFI_SSID|E5_WIFI_KEY|E5_WIFI_CHANNEL|E5_DEFAULT_BOOT)='([^'\r\n]*)'", line)
+        require(m is not None and m[1] not in fields, "unsafe/duplicate install setting")
+        fields[m[1]] = m[2]
+    require(set(fields) == {"E5_APN", "E5_WIFI_SSID", "E5_WIFI_KEY", "E5_WIFI_CHANNEL", "E5_DEFAULT_BOOT"}, "missing settings")
+    require(fields["E5_DEFAULT_BOOT"] == "android" and 8 <= len(fields["E5_WIFI_KEY"]) <= 63,
+            "first trial must default back to Android; invalid key")
+    require(fields["E5_WIFI_CHANNEL"] in ("36", "40", "44", "48", "149", "153", "157", "161"), "invalid channel")
+    require(1 <= len(fields["E5_WIFI_SSID"].encode()) <= 32 and len(fields["E5_APN"]) <= 100, "invalid settings length")
+    return b, paths
+
+class Journal:
+    def __init__(self, path):
+        self.path = Path(path)
+        self.stream = self.path.open("x", encoding="utf-8")
+        os.chmod(self.path, 0o600)
+        self.stream.flush(); os.fsync(self.stream.fileno()); fsync_directory(self.path.parent)
+    def event(self, event, **fields):
+        self.stream.write(json.dumps({"at": datetime.datetime.now().astimezone().isoformat(), "event": event, **fields}) + "\n")
+        self.stream.flush(); os.fsync(self.stream.fileno())
+    def close(self):
+        self.stream.close()
+
+def adb_shell_argv(adb, script):
+    """One remote shell argument; su receives exactly one correctly quoted command."""
+    return [str(adb), "-s", SERIAL, "shell", "-T", SU + " -c " + shlex.quote("set -eu\n" + script)]
+
+class AdbBackend:
+    """Implemented transport; hard gate is checked at EACH subprocess call."""
+    def __init__(self, adb, adb_sha256, profile):
+        self.adb = regular(adb)
+        require(file_hash(self.adb) == adb_sha256, "ADB executable hash mismatch")
+        self.profile = profile
+        require(profile == load_profile(), "device profile not the frozen audited profile")
+    def shell(self, script, payload=None, timeout=1800):
+        require(not LIVE_DISABLED, "LIVE_DISABLED: no ADB/device execution in this preparation version")
+        result = subprocess.run(adb_shell_argv(self.adb, script), input=payload,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+        require(result.returncode == 0 and not result.stderr, "remote command failed/stderr; stop without retry")
+        return result.stdout
+    def read(self, part):
+        p = self.profile["partitions"][part]
+        out = self.shell(f"cat {shlex.quote(p['node'])}")
+        require(len(out) == p["bytes"], "short full-partition binary read")
+        return out
+    def upload(self, path, target, approved):
+        require(target.startswith(REMOTE_STAGE + "/") and re.fullmatch(r"[a-zA-Z0-9_./-]+", target), "unsafe stage target")
+        data = regular(path).read_bytes()
+        require(len(data)==approved["bytes"] and digest(data)==approved["sha256"],
+                "upload artifact changed after approval; no transfer attempted")
+        # No append, retries, shell expansion or package execution.
+        self.shell(f"test ! -e {target}; test ! -L {target}; umask 077; cat > {target}", data)
+        self.verify_file(target, approved["bytes"], approved["sha256"])
+    def verify_file(self, target, size, expected):
+        q = shlex.quote(target)
+        actual = self.shell(f"test -f {q}; test ! -L {q}; stat -c %s {q}; sha256sum {q}").decode().split()
+        require(actual[:2] == [str(size), expected], "remote file hash/size mismatch")
+    def protected_hashes(self):
+        return {p: digest(self.read(p)) for p in PROTECTED}
+    def preflight(self, require_data=True):
+        expected_props = {"ro.serialno": SERIAL, "ro.product.model": "E5", "ro.board.platform": "ums9621",
+                          "ro.build.display.id": "TS305_V03_20241128_2301", "ro.boot.slot_suffix": "_a",
+                          "ro.boot.verifiedbootstate": "orange", "ro.boot.flash.locked": "0"}
+        for key, value in expected_props.items():
+            require(self.shell("getprop " + key).decode().strip() == value, "Android identity/state changed: " + key)
+        require(self.shell("id -u").strip() == b"0", "not root")
+        for name, p in self.profile["partitions"].items():
+            node = p["node"]; leaf = node.split("/")[-1]
+            out = self.shell(f"test -b {node}; readlink -f /dev/block/by-name/{name}; cat /sys/class/block/{leaf}/dev; "
+                             f"cat /sys/class/block/{leaf}/size; cat /sys/class/block/{leaf}/start; "
+                             f"blockdev --getsize64 {node}").decode().splitlines()
+            require(out == [node, p["dev"], str(p["bytes"]//512), str(p["start_lba"]), str(p["bytes"])],
+                    "partition identity/geometry changed: " + name)
+        g = self.shell("dd if=/dev/block/mmcblk0 bs=512 count=64 2>/dev/null")
+        require(len(g) == 32768 and digest(g) == self.profile["gpt_prefix_sha256"], "GPT prefix changed")
+        require(self.protected_hashes() == self.profile["protected_hashes"], "protected boot chain changed")
+        if require_data:
+            mounts = self.shell("cat /proc/mounts").decode().splitlines()
+            rows = [x.split() for x in mounts if len(x.split()) >= 4 and x.split()[1] == "/data"]
+            require(len(rows) == 1 and rows[0][2] == "f2fs" and "rw" in rows[0][3].split(","), "data must be rw F2FS")
+            src = self.shell("readlink -f " + shlex.quote(rows[0][0])).decode().strip()
+            require(src == "/dev/block/mmcblk0p70", "data is encrypted mapper or wrong block device")
+    def free_bytes(self):
+        line = self.shell("df -Pk /data").decode().splitlines()[-1].split()
+        require(len(line) >= 6 and line[3].isdigit(), "cannot parse free data space")
+        return int(line[3]) * 1024
+    def stage_files(self, bundle, paths):
+        require(self.free_bytes() >= bundle["artifacts"]["rootfs_gz"]["raw_bytes"] +
+                sum(x["bytes"] for x in bundle["artifacts"].values()) + (1 << 30), "insufficient free space")
+        # First install only. Refuse previous installs, links and incomplete attempts.
+        self.shell(f"mkdir /data/local/tmp/e5-install-20261013.lock; "
+                   f"test ! -e {REMOTE_STAGE}; test ! -L {REMOTE_STAGE}; test ! -e {REMOTE_FINAL}; "
+                   f"test ! -L {REMOTE_FINAL}; umask 077; mkdir {REMOTE_STAGE}")
+        for key, name in (("fscrypt_probe", "fscrypt-probe"), ("rootfs_gz", "openwrt.ext4.gz"),
+                          ("device_files_tar", "device-files.tar"), ("install_conf", "openwrt-install.conf"), ("boot", "boot.img")):
+            self.upload(paths[key], REMOTE_STAGE + "/" + name, bundle["artifacts"][key])
+        probe = REMOTE_STAGE + "/fscrypt-probe"
+        require(self.shell(f"chmod 700 {probe}; {probe} {REMOTE_STAGE}").strip() == b"unencrypted", "stage directory has policy")
+        e = bundle["artifacts"]["rootfs_gz"]
+        require(self.free_bytes() >= e["raw_bytes"] + (1 << 30), "free space changed after upload")
+        self.shell(f"{BB} gzip -t {REMOTE_STAGE}/openwrt.ext4.gz; "
+                   f"{BB} gzip -dc {REMOTE_STAGE}/openwrt.ext4.gz > {REMOTE_STAGE}/openwrt.ext4.part; sync")
+        self.verify_file(REMOTE_STAGE+"/openwrt.ext4.part", e["raw_bytes"], e["raw_sha256"])
+        for name in ("openwrt.ext4.part", "device-files.tar", "openwrt-install.conf", "boot.img"):
+            require(self.shell(f"{probe} {REMOTE_STAGE}/{name}").strip() == b"unencrypted", "file has encryption or unknown policy")
+        self.shell(f"mv {REMOTE_STAGE}/openwrt.ext4.part {REMOTE_STAGE}/openwrt.ext4; "
+                   f"printf 'openwrt\\n' > {REMOTE_STAGE}/boot-os; "
+                   f"printf 'android\\n' > {REMOTE_STAGE}/openwrt-default-boot; "
+                   f"chmod 600 {REMOTE_STAGE}/*; chmod 700 {probe}; sync")
+        # One directory rename is the commit. Keep evidence; no automatic cleanup.
+        self.shell(f"test ! -e {REMOTE_FINAL}; test ! -L {REMOTE_FINAL}; {BB} mv -T {REMOTE_STAGE} {REMOTE_FINAL}; sync")
+        self.verify_file(REMOTE_FINAL+"/openwrt.ext4", e["raw_bytes"], e["raw_sha256"])
+    def write_boot_b(self, image, expected_sha256):
+        data = regular(image).read_bytes()
+        require(len(data) == BOOT_BYTES and digest(data)==expected_sha256,
+                "boot image changed after approval; no write attempted")
+        # Exactly one block-write invocation. Full readback is mandatory upstream.
+        self.shell(f"{BB} dd of=/dev/block/mmcblk0p37 bs=1048576 count=64 iflag=fullblock conv=notrunc,fsync 2>/dev/null", data)
+    def write_misc_bc(self, bc):
+        require(len(bc) == 32, "wrong boot-control length")
+        self.shell(f"{BB} dd of=/dev/block/mmcblk0p3 bs=1 seek=2048 count=32 iflag=fullblock conv=notrunc,fsync 2>/dev/null", bc)
+    def collect_vendor(self, output_directory):
+        """Collection only: local raw inputs for the separately reviewed converter.
+        No NV snapshot is seeded; new Linux builds its own private NV copies.
+        """
+        self.preflight(require_data=False)
+        before = self.protected_hashes()
+        script = (ROOT / "collect-own-device.sh").read_text()
+        self.shell(script)
+        dest = Path(output_directory); dest.mkdir(mode=0o700, parents=False, exist_ok=False)
+        rows=[]
+        for name in ("android-subset.tar", "firmware-raw.tar"):
+            remote="/data/local/tmp/e5-collect-20261013/"+name
+            record=self.shell(f"stat -c %s {remote}; sha256sum {remote}").decode().split()
+            raw=self.shell("cat "+remote)
+            require(len(record)>=2 and str(len(raw))==record[0] and digest(raw)==record[1], "collection transfer mismatch")
+            target=dest/name
+            with target.open("xb") as f: f.write(raw); f.flush(); os.fsync(f.fileno())
+            rows.append({"name":name,"bytes":len(raw),"sha256":digest(raw)})
+        require(self.protected_hashes()==before, "protected partitions changed during collection")
+        report={"serial":SERIAL,"source_build":"TS305_V03_20241128_2301","script_sha256":digest(script.encode()),
+                "files":rows,"raw_only":True,"requires_conversion_review":True,"nv_included":False}
+        (dest/"collection.json").write_text(json.dumps(report,indent=2)+"\n")
+        return report
+
+def apply_transaction(device, bundle, paths, profile, evidence):
+    """Called only after validate_bundle. A/B chain copying is absent by design."""
+    evidence = Path(evidence); evidence.mkdir(mode=0o700, parents=False, exist_ok=False)
+    fsync_directory(evidence.parent); fsync_directory(evidence)
+    journal = Journal(evidence/"journal.jsonl")
+    try:
+        journal.event("START", serial=SERIAL, mode="install", boot_sha256=bundle["artifacts"]["boot"]["sha256"])
+        device.preflight()
+        before_hashes = device.protected_hashes()
+        before_boot = device.read("boot_b"); before_misc = device.read("misc")
+        require(digest(before_boot) == bundle["approved_boot_b_before_sha256"], "boot B changed before plan")
+        require(digest(before_misc) == bundle["approved_misc_before_sha256"], "misc changed before plan")
+        bc = bc_validate(before_misc[BC_OFFSET:BC_OFFSET+32]); trial = bc_trial(bc)
+        require(bc.hex() == bundle["approved_bc_before_hex"], "BC differs from approved/runtime templates")
+        for name, data in (("boot_b.before.bin", before_boot), ("misc.before.bin", before_misc)):
+            durable_write(evidence/name,data)
+            require(digest((evidence/name).read_bytes()) == digest(data), "host backup mismatch")
+        journal.event("BACKUPS_VERIFIED", boot_b=digest(before_boot), misc=digest(before_misc))
+        device.stage_files(bundle, paths)
+        device.preflight()
+        require(device.protected_hashes() == before_hashes, "protected chain changed during file preparation")
+        require(device.read("misc") == before_misc and device.read("boot_b") == before_boot, "target changed during preparation")
+        journal.event("BEGIN_BOOT_B")
+        device.write_boot_b(paths["boot"],bundle["artifacts"]["boot"]["sha256"])
+        readback = device.read("boot_b")
+        durable_write(evidence/"boot_b.readback.bin",readback)
+        require(digest(readback) == bundle["artifacts"]["boot"]["sha256"] and len(readback) == BOOT_BYTES, "boot B full readback mismatch")
+        require(device.protected_hashes() == before_hashes, "protected A/chain changed after boot B write")
+        require(device.read("misc") == before_misc, "misc changed before activation")
+        journal.event("VERIFIED_BOOT_B", sha256=digest(readback))
+        journal.event("BEGIN_MISC", offset=BC_OFFSET, bytes=32, before=digest(bc), after=digest(trial))
+        device.write_misc_bc(trial)
+        after = device.read("misc"); durable_write(evidence/"misc.readback.bin",after)
+        misc_changed_only_bc(before_misc, after, trial)
+        require(device.protected_hashes() == before_hashes, "protected A/chain changed after misc write")
+        journal.event("VERIFIED_MISC", sha256=digest(after))
+        journal.event("COMPLETE_NO_REBOOT")
+    except BaseException as error:
+        journal.event("STOP_NO_RETRY_NO_ROLLBACK_NO_REBOOT", error_type=type(error).__name__, reason=str(error))
+        raise
+    finally:
+        journal.close()
+
+def restore_transaction(device, boot_original, misc_original, current_boot_sha, current_misc_sha, evidence):
+    """ADB-only explicit restoration: boot_b + exact original BC32, never A.
+    Does not need a usable /data. Requires A Android root/ADB; no-ADB recovery is
+    a DIFFERENT FDL paired-boot plan owned by the large-partition tool.
+    """
+    evidence = Path(evidence); evidence.mkdir(mode=0o700, exist_ok=False)
+    fsync_directory(evidence.parent); fsync_directory(evidence)
+    journal = Journal(evidence/"journal.jsonl")
+    try:
+        oldboot = regular(boot_original).read_bytes(); oldmisc = regular(misc_original).read_bytes()
+        require(len(oldboot) == BOOT_BYTES and len(oldmisc) == MISC_BYTES, "restore input sizes")
+        original_profile=load_profile()
+        require(digest(oldboot)==original_profile["original_boot_b_sha256"] and
+                digest(oldmisc)==original_profile["original_misc_sha256"], "restore sources are not this device's frozen originals")
+        bc_validate(oldmisc[BC_OFFSET:BC_OFFSET+32])
+        device.preflight(require_data=False); protected = device.protected_hashes()
+        cb = device.read("boot_b"); cm = device.read("misc")
+        require(digest(cb) == current_boot_sha and digest(cm) == current_misc_sha, "restore preimage changed")
+        # Scope is 32 B only: do not silently erase other newer misc contents.
+        require(cm[:BC_OFFSET] == oldmisc[:BC_OFFSET] and cm[BC_OFFSET+32:] == oldmisc[BC_OFFSET+32:], "misc outside BC differs; new review required")
+        journal.event("BEGIN_RESTORE_BOOT_B", current=current_boot_sha, wanted=digest(oldboot))
+        device.write_boot_b(boot_original,original_profile["original_boot_b_sha256"])
+        rb=device.read("boot_b"); durable_write(evidence/"boot_b.restore.readback.bin",rb)
+        require(rb == oldboot and device.protected_hashes() == protected, "restore boot/readback/protected mismatch")
+        require(device.read("misc") == cm, "misc changed during restore")
+        journal.event("VERIFIED_RESTORE_BOOT_B")
+        journal.event("BEGIN_RESTORE_MISC")
+        device.write_misc_bc(oldmisc[BC_OFFSET:BC_OFFSET+32])
+        rm=device.read("misc"); durable_write(evidence/"misc.restore.readback.bin",rm)
+        require(rm == oldmisc and device.protected_hashes() == protected, "restore misc/readback/protected mismatch")
+        journal.event("COMPLETE_NO_REBOOT")
+    except BaseException as error:
+        journal.event("STOP_NO_RETRY_NO_ROLLBACK_NO_REBOOT", error_type=type(error).__name__, reason=str(error))
+        raise
+    finally:
+        journal.close()
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("mode", choices=("plan", "live-install", "live-restore", "live-collect"))
+    p.add_argument("--manifest", required=True, type=Path)
+    p.add_argument("--manifest-sha256", required=True)
+    p.add_argument("--output", type=Path)
+    p.add_argument("--adb", type=Path)
+    p.add_argument("--evidence", type=Path)
+    args=p.parse_args()
+    if args.mode.startswith("live-"):
+        require(not LIVE_DISABLED, "LIVE_DISABLED: preparation build has no authorized device execution")
+        require(args.adb is not None and args.evidence is not None, "live bindings missing")
+        request=pinned_json(args.manifest,args.manifest_sha256)
+        require(request["serial"]==SERIAL and request["device_profile_sha256"]==PROFILE_SHA256, "live request identity mismatch")
+        device=AdbBackend(args.adb,request["adb_sha256"],load_profile())
+        if args.mode=="live-install":
+            bundle, paths=validate_bundle(args.manifest,args.manifest_sha256)
+            apply_transaction(device,bundle,paths,load_profile(),args.evidence)
+        elif args.mode=="live-restore":
+            require(request["mode"]=="restore-original-boot-b-and-bc32", "wrong recovery request")
+            bo=artifact(args.manifest.parent,request["boot_original"])
+            mo=artifact(args.manifest.parent,request["misc_original"])
+            restore_transaction(device,bo,mo,request["current_boot_b_sha256"],request["current_misc_sha256"],args.evidence)
+        else:
+            require(request["mode"]=="collect-own-device-raw" and request["collector_sha256"]==file_hash(ROOT/"collect-own-device.sh"), "collector not approved")
+            device.collect_vendor(args.evidence)
+        return
+    bundle, paths=validate_bundle(args.manifest, args.manifest_sha256)
+    result={"live_disabled":LIVE_DISABLED,"serial":SERIAL,"source_commit":COMMIT,
+            "manifest_sha256":args.manifest_sha256,"ready_for_device":False,
+            "write_targets":[{"node":"/dev/block/mmcblk0p37","offset":0,"bytes":BOOT_BYTES},
+                             {"node":"/dev/block/mmcblk0p3","offset":BC_OFFSET,"bytes":32}],
+            "files_destination":REMOTE_FINAL,"automatic_reboot":False,"automatic_retry":False,
+            "bootchain_copy":False,"remaining_gates":["independent code review", "explicit execution authorization", "reviewed live dispatch binding", "fresh post-decryption device preflight"]}
+    text=json.dumps(result,ensure_ascii=False,indent=2)+"\n"
+    if args.output:
+        with args.output.open("x") as f: f.write(text)
+    else: print(text,end="")
+
+if __name__ == "__main__":
+    try: main()
+    except (Refusal, KeyError, OSError, ValueError) as error:
+        raise SystemExit("REFUSED: "+str(error))

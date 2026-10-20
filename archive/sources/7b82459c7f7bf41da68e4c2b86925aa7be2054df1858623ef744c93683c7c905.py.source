@@ -1,0 +1,61 @@
+from pathlib import Path
+import hashlib,struct,json,tarfile
+base=Path.cwd()
+artifact=base/'evidence/cellular-diagnosis-20261013/existing-linux-files-snapshot/e5linux.tar'
+out=base/'tools/e5_wan_candidate_prepare_20261013/actual'
+paths=['lib/netifd/proto/modemmanager.sh','usr/share/ModemManager/modemmanager.common','usr/bin/mmcli','usr/sbin/ModemManager','lib/netifd/netifd-proto.sh','etc/config/network']
+u16=lambda b,o:struct.unpack_from('<H',b,o)[0]
+u32=lambda b,o:struct.unpack_from('<I',b,o)[0]
+with tarfile.open(artifact) as archive:
+ f=archive.extractfile('e5linux/openwrt.ext4')
+ h=hashlib.sha256(); total=0
+ while b:=f.read(8<<20):h.update(b);total+=len(b)
+ assert total==2147483648 and h.hexdigest()=='0000000000000000000000000000000000000000000000000000000000000000'
+ def read(o,n):f.seek(o);r=f.read(n);assert len(r)==n;return r
+ sb=read(1024,1024);assert u16(sb,56)==0xef53
+ bs=1024<<u32(sb,24); ipg=u32(sb,40); iz=u16(sb,88); ds=max(32,u16(sb,254)); dt=(2 if bs==1024 else 1)*bs
+ def inode(n):
+  g,j=divmod(n-1,ipg);gd=read(dt+g*ds,ds);block=u32(gd,8)+(u32(gd,40)<<32 if ds>=64 else 0)
+  return read(block*bs+j*iz,iz)
+ def extents(b):
+  assert u16(b,0)==0xf30a
+  depth=u16(b,6); result=[]
+  for k in range(u16(b,2)):
+   o=12+k*12
+   if depth:
+    ptr=u32(b,o+4)+(u16(b,o+8)<<32);result+=extents(read(ptr*bs,bs))
+   else:
+    length=u16(b,o+4);assert length<=32768
+    result.append((u32(b,o),length,u32(b,o+8)+(u16(b,o+6)<<32)))
+  return result
+ def data(n):
+  ino=inode(n); size=u32(ino,4)+(u32(ino,108)<<32)
+  if (u16(ino,0)&0xf000)==0xa000 and size<=60:return ino[40:40+size]
+  assert u32(ino,32)&0x80000
+  v=bytearray(size)
+  for logical,count,physical in extents(ino[40:100]):
+   offset=logical*bs; amount=min(count*bs,size-offset)
+   if amount>0:v[offset:offset+amount]=read(physical*bs,amount)
+  return bytes(v)
+ def lookup(path):
+  node=2
+  for component in path.split('/'):
+   b=data(node);o=0;found=None
+   while o<len(b):
+    child=u32(b,o);length=u16(b,o+4);assert length>=8
+    name=b[o+8:o+8+b[o+6]].decode(errors='replace')
+    if child and name==component:found=child;break
+    o+=length
+   if found is None:raise FileNotFoundError(path)
+   node=found
+  return node
+ report={'raw_bytes':total,'raw_sha256':h.hexdigest(),'input':str(artifact),'method':'read-only tar member seek + ext4 inode/extent parse; no VM, mount, journal replay or device I/O','files':{}}
+ for p in paths:
+  try:n=lookup(p);b=data(n)
+  except FileNotFoundError:report['files'][p]={'present':False};continue
+  dest=out/p
+  if p!='etc/config/network':dest.parent.mkdir(parents=True,exist_ok=True);dest.write_bytes(b)
+  mode=u16(inode(n),0);report['files'][p]={'present':True,'inode':n,'mode':oct(mode),'bytes':len(b),'sha256':hashlib.sha256(b).hexdigest()}
+
+(out.parent/'actual-extraction.json').write_text(json.dumps(report,indent=2)+'\n')
+print(json.dumps(report,indent=2))

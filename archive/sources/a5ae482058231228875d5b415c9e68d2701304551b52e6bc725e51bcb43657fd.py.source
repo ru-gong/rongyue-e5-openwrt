@@ -1,0 +1,23 @@
+"""Read immutable local materials only; deny device/process/network and real state."""
+import sys
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2]
+FORBIDDEN=(ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED',ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED',ROOT/'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock')
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn','os.fork','pty.spawn'):raise AssertionError('external operation forbidden')
+ if event=='open' and args and isinstance(args[0],(str,bytes)):
+  p=Path(args[0]).absolute() if isinstance(args[0],str) else Path(args[0].decode()).absolute()
+  if any(p==q or p.is_relative_to(q) for q in FORBIDDEN):raise AssertionError('actual state/ledger forbidden')
+sys.addaudithook(audit)
+import ast,hashlib,importlib.util,json
+HERE=Path(__file__).resolve().parent
+spec=importlib.util.spec_from_file_location('_e5_sim_common',HERE/'common.py');c=importlib.util.module_from_spec(spec);sys.modules[spec.name]=c;spec.loader.exec_module(c)
+d=c.dependencies();m=c.load_runtime();p=c.material_check(m['bounded_boot_control'])
+for name,pin in d['no_sim_family']['files'].items():c.read(Path(d['no_sim_family']['path'])/name,pin)
+unchanged=[]
+for name in ('observe.py','evidence_contract.py','recovery.py','rearm.py','sim_nv.py','nv_origin.py','nv_geometry.json','acceptance-contract.json'):
+ raw=(HERE/name).read_bytes(); gates={'observe.py':(b'DEVICE_IO_ENABLED = True',b'DEVICE_IO_ENABLED = False'),'rearm.py':(b'REARM_IO_DISABLED=False',b'REARM_IO_DISABLED=True'),'sim_nv.py':(b'NV_IO_DISABLED=False',b'NV_IO_DISABLED=True')}; old_gate,new_gate=gates.get(name,(b'__NO_MATCH__',b'__NO_MATCH__')); raw=raw.replace(old_gate,new_gate); assert raw==(ROOT/'tools/e5_sim_rearm_b36a_prepare_20261016'/name).read_bytes();unchanged.append(name)
+for name in ('state_snapshot','normal_state','recovery_state','_closure_api'):
+ def node(path):return ast.dump(next(n for n in ast.parse(path.read_text()).body if isinstance(n,ast.FunctionDef) and n.name==name),include_attributes=False)
+ assert node(HERE/'common.py')==node(Path(d['no_sim_family']['path'])/'common.py')
+print(json.dumps({'schema':'e5-sim-lifecycle-local-material-smoke-v1','source_family':json.loads((HERE/'SOURCE_BINDINGS.json').read_bytes())['family'],'dependency_sha256':c.DEPENDENCIES_SHA,'runtime_pins':c.PINS,'unchanged_eight_files':unchanged,'profile_original_boot_b':p['original_boot_b_sha256'],'profile_original_misc':p['original_misc_sha256'],'fixed_materials_verified':True,'runtime_modules_loaded_only':True,'transport_backend_constructed':False,'real_state_ledger_access':False,'external_process_network_device_operations':False,'field_authority_created':False},sort_keys=True,indent=2))

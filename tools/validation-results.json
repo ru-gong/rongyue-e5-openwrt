@@ -1,0 +1,36 @@
+{
+  "schema": "e5-publication-host-validation-v1",
+  "date": "2026-10-20",
+  "host_platform": "macOS",
+  "device_connected_or_modified": false,
+  "linux_integration_harnesses_run": false,
+  "suites": [
+    {
+      "directory": "tools/occupancy-scanner",
+      "command": "python3 -B -m unittest -v test_native_occupancy_scanner test_kcmp test_final_identity_diagnostics test_lifecycle test_fd_objects",
+      "tests_run": 132,
+      "passed": 128,
+      "skipped": 4,
+      "failed": 0,
+      "errors": 0,
+      "seconds": 7.709,
+      "skip_reason": "Linux-only actual owned-child KCMP and cleanup checks",
+      "exit_code": 0
+    },
+    {
+      "directory": "tools/snapshot-validator",
+      "command": "python3 -B -m unittest -v test_snapshot_validation",
+      "tests_run": 11,
+      "passed": 11,
+      "skipped": 0,
+      "failed": 0,
+      "errors": 0,
+      "seconds": 0.103,
+      "exit_code": 0
+    }
+  ],
+  "limitations": [
+    "Host validation does not establish device installation or flashing acceptance.",
+    "Historical archive sources are sanitized non-executable references and were not retested as deployment packages."
+  ]
+}

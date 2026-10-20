@@ -1,0 +1,38 @@
+# 固定 569 作者版本：取消 userdata 挂载失败后的自动修复
+
+本工具只在 Mac 主机重打包本地文件。默认 `plan`，没有 ADB、SSH、USB、目标端安装、刷写或授权入口。显式 `build` 只读固定旧材料并写入固定的新材料目录；目标目录已经存在时拒绝覆盖。本次未启动 VM，也未执行任何目标端脚本或二进制。
+
+成品在 [materials/openwrt-no-auto-fsck-20261015](/REDACTED_HOST_PATH [candidate.json](/REDACTED_HOST_PATH `569f13d4ce15585f70817c2a1e03bb574a84720b` 的既有本机构建加两项本地安全调整：此前已审的诊断区限长，以及本轮仅修改 init 的挂载失败分支。它不是作者发布的原版二进制，也不是蜂窝故障修复。
+
+## 唯一运行逻辑变化
+
+`mount_userdata_root()` 正常挂载成功时仍返回成功。挂载失败时只记录失败并返回 1，交给原来的救援分支处理。已删除该分支对 `/etc/f2fs-repair.sh` 的加载/调用、修复成功后重臂 B，以及立即强制重启的动作。真实 cpio 75 个成员中仅 `init` 改变；其余 74 个成员及 trailer 原始记录逐字节不变。内核、命令行、DTB/驱动和蜂窝用户态均未改动。8 个待安装普通文件中，只有 `boot.img` 改变，其余 7 个完整 SHA 均保持原值。
+
+原救援行为仍在：写入固定 A 槽 BC32；提供救援 USB；若没有 `/run/stay`，原有约 600 秒安全计时器仍可强制重启回 Android。成功找到根文件系统时原计时器仍被取消。不得把“取消立即修复重启”表述成“不再自动回 Android”。
+
+## 保留的写入和限制
+
+- boot 运行时仍可能写 `boot_b` 的 `[56,60) MiB` 诊断窗，以及 `misc` 的 `[2048,2080)` 32 字节。A/B 模板完整 32 字节及 CRC 与旧成品相同；有效内核/initramfs/vbmeta 内容低于 56 MiB。
+- 正常 RW F2FS 挂载仍可发生内核恢复、checkpoint 和其他文件系统元数据写入，ext4 也有日志与正常写入。保留旧目录并不隔离同一 userdata 文件系统的元数据影响。
+- 新 rootfs 首启仍导入本机 vendor 文件、消费外层安装配置、创建其私有 NV 副本、更新系统配置/日志；默认启动目标仍为 Android。物理 NV 只读、来源和哈希必须在实机首次启动验收，静态结果不能替代。
+- 原 `/etc/f2fs-repair.sh`、`/repair/sbin/fsck.f2fs` 和 rootfs 的手动 fsck 工具保留且原样，避免扩大修改范围。本轮没有任何自动调用该修复脚本的 init 路径；也不授权将这些工具手动用于设备。
+
+完整 rootfs 4415 个普通文件的静态 token 清点见 [path-and-avb-audit.json](/REDACTED_HOST_PATH `/etc/config/fstab` 为 `check_fs=0`、`anon_mount=0`，且无 mount 条目；其 init/hotplug 仍会运行 `/sbin/block mount/hotplug`。`block` 二进制包含检查能力，现有 guard 只防误探测字符设备，不能称为全面禁用 fsck。此次没有发现另一条已配置的自动整 userdata F2FS 修复调用；这一结论限于已核对的真实脚本/配置和已知调用链，不能证明任意编译代码、内核或专有程序绝无其他写入。
+
+## AVB 不是重新签名
+
+重打包只更新 Android ramdisk 长度及 AVB footer 的内容/位置字段，保留原 vbmeta blob。解析其 boot hash descriptor 后，所存摘要对旧 Linux boot 与新 boot 均不匹配。本轮没有生成新签名，也没有声称签名验证通过；候选仍依赖本机既定的解锁/验证绕过启动链。解析、边界、CRC 和哈希验证仅证明文件结构与预期差异。
+
+## 主机复核与证据
+
+```sh
+cd /REDACTED_HOST_PATH
+python3 -B prepare.py plan
+python3 -B -m unittest -v test_prepare.py
+```
+
+21 项测试直接抽取新成品真实 init 函数，以 shell 内建桩测试成功、不同挂载失败、原救援分支选择等行为，并校验全体 cpio 差异、模板 CRC、诊断边界、其余 7 项整文件 SHA 和不允许覆盖输出。测试审计钩子在导入工具前禁止网络和非固定夹具进程。第一次测试仅因断言把 `no-auto-fsck` 日志误识别为 fsck 命令失败；测试更正为命令行匹配后全过，生产工具/产物未因该测试改变。两份日志均保留。
+
+`audit_paths.py` 只读实际 cpio/ext4，并保存选定的非敏感启动配置。它禁止所有子进程和网络；不会挂载文件系统或运行其中程序。
+
+固定候选及 runtime-audit 保留构建时的 `independent_review_pending`，后续独审与交付状态另存 DELIVERY，不回写候选哈希。尚未完成新 boot 的硬件启动验证；下一阶段驱动必须绑定新候选并通过实际前置门。此目录不提供任何实机批准、刷写请求或恢复 grant。

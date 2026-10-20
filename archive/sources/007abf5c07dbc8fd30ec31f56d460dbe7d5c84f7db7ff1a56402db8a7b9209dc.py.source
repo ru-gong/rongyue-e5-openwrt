@@ -1,0 +1,133 @@
+"""New-failure original B+BC32 recovery; host drafts are not authorization."""
+import argparse,datetime as dt,json,threading,time
+from pathlib import Path
+import importlib.util as _iu,sys as _sys
+_cp=Path(__file__).resolve().with_name('common.py');_key='_e5_sim_common'
+if _key not in _sys.modules:
+ _sp=_iu.spec_from_file_location(_key,_cp);_cm=_iu.module_from_spec(_sp);_sys.modules[_key]=_cm;_sp.loader.exec_module(_cm)
+c=_sys.modules[_key]
+if Path(c.__file__).resolve()!=_cp:raise RuntimeError('common module source conflict')
+e=c.sibling('evidence_contract')
+RECOVERY_IO_DISABLED=True
+DECISION='NEW_ORIGINAL_RECOVERY_ONLY_NO_REPLAY'
+
+def state_request(previous_observation,purpose,out,sim_confirmation=None):
+ c.require(purpose=='rearm-with-sim','SIM package only creates SIM rearm requests')
+ observed=c.validate_boot_observation(previous_observation);previous_boot=observed['boot_id'];snapshot=c.state_snapshot();c.recovery_state(snapshot)
+ p=c.output(out);s=c.save(p/'STATE_SNAPSHOT.json',snapshot)
+ request={'schema':'e5-next-cold-request-v2','serial':c.SERIAL,'previous_boot_id':previous_boot,'previous_observation':previous_observation,'state_snapshot':s,'purpose':purpose,'sim_confirmation':sim_confirmation}
+ e.observer.validate_policy(request);return c.save(p/'COLD_REQUEST.json',request)
+def reconcile(envelope_binding,tx,helper_owner_tx,out):
+ c.require(False,'RECOVERY_IO_DISABLED: original restoration is not provided by this SIM package')
+ cold=e.validate_cold(envelope_binding);env=c.obj(envelope_binding);state=c.obj(cold['state_snapshot']);c.recovery_state(state)
+ c.validtx(tx);c.require(tx not in state['used_txids'] and cold['boot_id'] not in state['previous_boots'],'new boot/new tx required')
+ c.require(cold['purpose'] in ('directory','recovery'),'SIM rearm uses its own restricted capture')
+ m=c.load_runtime();c.material_check(m['bounded_boot_control']);p=c.output(out);cancel=threading.Event()
+ native=c.backend(m,cold['boot_id'],tx,p/'transport',cancel,helper_owner_tx,readonly=True)
+ seconds=min(600,int((c.timestamp(cold['expires_at'])-c.now()).total_seconds())-5);c.require(seconds>=30,'cold lease insufficient')
+ rec=m['bounded_boot_control'].reconcile_readonly(native,p/'raw',total_seconds=seconds,cancel=cancel);c.assert_state(state)
+ c.save(p/'READONLY_RESULT.json',{'schema':'e5-next-readonly-v1','serial':c.SERIAL,'boot_id':cold['boot_id'],'txid':tx,'purpose':cold['purpose'],'reconciliation':c.binding(p/'raw/reconciliation.json'),'cold_envelope':e.binding_without_originals(env),'state_snapshot':cold['state_snapshot'],'helper_owner_tx':helper_owner_tx,'producer_source_sha256':c.sha(c.read(Path(__file__).resolve())),'source_pins':c.PINS,'transport_binding':c.binding(p/'transport/binding.json'),'device_writes':False,'native_helpers_executed':False,'approved_to_restore':False})
+ return rec
+
+def checked_readonly(result_binding):
+ result=c.obj(result_binding);env=result['cold_envelope'];cold=e.validate_cold_object(env,c.now());state=c.obj(cold['state_snapshot'])
+ c.require(cold['boot_id']==result['boot_id'] and cold['purpose']=='recovery','recovery cold source')
+ result,rec,p,transport_digest=e.validate_readonly(result_binding,c.now(),'recovery')
+ c.require(rec['boot_id'] not in state['previous_boots'] and result['txid'] not in state['used_txids'],'new boot/new tx required');return result,rec,p,state
+
+def proposal(result_binding,seconds=600):
+ result,rec,p,state=checked_readonly(result_binding);c.require(type(seconds) is int and 30<=seconds<=600 and seconds+5<c.remaining(rec),'restore budget exceeds snapshot lease')
+ return {'schema':'e5-bounded-boot-request-v3','serial':c.SERIAL,'boot_id':rec['boot_id'],'txid':result['txid'],'mode':'restore-original','total_seconds':seconds,'expected_before':rec['hashes'],'image':{'path':str(c.ORIGINAL_B),'sha256':p['original_boot_b_sha256'],'bytes':64<<20},'original_misc':{'path':str(c.ORIGINAL_MISC),'sha256':p['original_misc_sha256'],'bytes':1<<20},'install_ready':None,'recovery':{'reconciliation_path':result['reconciliation']['path'],'reconciliation_sha256':result['reconciliation']['sha256']}}
+def draft(result_binding,out,seconds=600):
+ request=proposal(result_binding,seconds);p=c.output(out);rb=c.save(p/'REQUEST_PROPOSAL.json',request)
+ c.save(p/'BOOT_REVIEW.TEMPLATE.json',{'schema':'e5-explicit-boot-recovery-review-v3','serial':c.SERIAL,'proposal_sha256':c.sha(c.canonical(request)),'reconciliation_sha256':request['recovery']['reconciliation_sha256'],'ledger_head':c.obj(c.obj(result_binding)['state_snapshot'])['ledger_head'],'decision':'TEMPLATE_NOT_VALID_INDEPENDENT_REVIEW_REQUIRED'})
+ c.save(p/'READONLY_INPUT.json',result_binding);return rb
+
+def bind_request(result_binding,proposal_binding,review_binding,out):
+ request=c.obj(proposal_binding);c.require(request==proposal(result_binding,request['total_seconds']),'fixed original proposal changed')
+ result,rec,p,state=checked_readonly(result_binding)
+ expected={'schema':'e5-explicit-boot-recovery-review-v3','serial':c.SERIAL,'proposal_sha256':c.sha(c.canonical(request)),'reconciliation_sha256':result['reconciliation']['sha256'],'ledger_head':state['ledger_head'],'decision':DECISION}
+ c.require(c.obj(review_binding)==expected,'independent first recovery review required')
+ request=json.loads(json.dumps(request));request['recovery'].update(review_path=review_binding['path'],review_sha256=review_binding['sha256']);dest=c.output(out);rb=c.save(dest/'request.json',request)
+ bundle={'schema':'e5-uncertainty-recovery-bundle-v3','serial':c.SERIAL,'context':{'request_sha256':rb['sha256'],'txid':request['txid'],'boot_id':request['boot_id']},'request':rb,'reconciliation':result['reconciliation'],'markers':c.marker_hashes(state)}
+ bp=c.save(dest/'BUNDLE_PROPOSAL.json',bundle);c.save(dest/'READONLY_INPUT.json',result_binding);c.save(dest/'BUNDLE_REVIEW.TEMPLATE.json',{'schema':'e5-uncertainty-recovery-review-v3','serial':c.SERIAL,'proposal_sha256':c.sha(c.canonical(bundle)),'decision':'TEMPLATE_NOT_VALID_INDEPENDENT_REVIEW_REQUIRED'});return bp
+
+def validate_bundle(bundle_binding,result_binding):
+ bundle=c.obj(bundle_binding);result,rec,p,state=checked_readonly(result_binding);m=c.load_runtime();request=c.obj(bundle['request']);bare=json.loads(json.dumps(request));bare['recovery'].pop('review_path');bare['recovery'].pop('review_sha256')
+ c.require(bare==proposal(result_binding,request['total_seconds']) and bundle['reconciliation']==result['reconciliation'] and bundle['markers']==c.marker_hashes(state),'bundle scope/current state differs')
+ context,_=m['uncertainty_recovery']._validated_bundle(bundle,c.STATE);c.require(context['txid']==result['txid'] and context['txid'] not in state['used_txids'],'fresh read/request tx differs')
+ c.require(request['total_seconds']+5<c.remaining(rec),'expired budget');return bundle,context,m,result
+
+def bind_bundle(proposal_binding,review_binding,result_binding,out):
+ bundle={**c.obj(proposal_binding),'review':review_binding};p=c.output(out);bound=c.save(p/'bundle.json',bundle)
+ try:validate_bundle(bound,result_binding)
+ except BaseException as exc:c.save(p/'INVALID_NOT_EXECUTABLE.json',{'reason':str(exc)});raise
+ return bound
+
+def execute(bundle_binding,result_binding,out):
+ c.require(False,'RECOVERY_IO_DISABLED: original restoration is not provided by this SIM package')
+ c.require(not (Path(bundle_binding['path']).parent/'INVALID_NOT_EXECUTABLE.json').exists(),'invalid bundle directory')
+ bundle,context,m,result=validate_bundle(bundle_binding,result_binding);p=c.output(out);c.save(p/'INPUT.json',{'bundle':bundle_binding,'readonly':result_binding,'automatic_resume':False})
+ staged=m['uncertainty_recovery'].stage(bundle_binding['path'],bundle_binding['sha256']);c.require(staged==context,'grant mismatch')
+ cancel=threading.Event();native=c.backend(m,context['boot_id'],context['txid'],p/'transport',cancel,result['helper_owner_tx'],context=context)
+ return m['bounded_boot_control'].execute(native,bundle['request']['path'],bundle['request']['sha256'],p/'restore',cancel=cancel,absolute_deadline=time.monotonic()+min(c.obj(bundle['request'])['total_seconds'],c.remaining(c.obj(bundle['reconciliation']))-1))
+
+def refresh_request(prior_binding,out):
+ prior=c.obj(prior_binding);c.require(prior['cold_refresh'] is None,'use original cold envelope, not a recursive refresh');hist=e.historical_cold(prior,c.now());state=c.state_snapshot();c.normal_state(state)
+ p=c.output(out);sb=c.save(p/'STATE_SNAPSHOT.json',state);original=c.obj(prior['cold_request']);request={'schema':'e5-next-refresh-request-v1','serial':c.SERIAL,'boot_id':hist['boot_id'],'state_snapshot':sb,'prior_envelope':prior_binding,'purpose':hist['purpose'],'sim_confirmation':original['sim_confirmation']}
+ return c.save(p/'REFRESH_REQUEST.json',request)
+def refresh_envelope(prior_binding,complete_binding,review_binding,out):
+ prior=c.obj(prior_binding);c.require(prior['cold_refresh'] is None,'original cold envelope required');p=c.output(out);pair=c.save(p/'REFRESH_REVIEW_PAIR.json',{'schema':'e5-next-refresh-review-pair-v1','complete':complete_binding,'review':review_binding});env={**e.binding_without_originals(prior),'cold_refresh':pair}
+ try:e.validate_cold_object(env,c.now())
+ except BaseException as exc:c.save(p/'INVALID_NOT_READY.json',{'reason':str(exc)});raise
+ return c.save(p/'REFRESHED_ENVELOPE.json',env)
+
+def cold_envelope(complete_binding,review_binding,out):
+ cold=c.obj(complete_binding)
+ envelope={'schema':'e5-next-directory-evidence-v1','serial':c.SERIAL,'boot_id':cold['boot_id'],'cold_request':cold['request'],'cold_complete':complete_binding,'cold_review':review_binding,'cold_refresh':None,'readonly_result':None,'original_review':None}
+ e.validate_cold_object(envelope,c.now());return c.save(c.output(out)/'COLD_ENVELOPE.json',envelope)
+def directory_envelope(cold_binding,result_binding,review_binding,out):
+ env=c.obj(cold_binding);c.require(env['readonly_result'] is None and env['original_review'] is None,'cold-only input required');env={**env,'readonly_result':result_binding,'original_review':review_binding}
+ p=c.output(out);bound=c.save(p/'DIRECTORY_EVIDENCE.json',env)
+ try:e.validate_directory_ready(bound,env['boot_id'],c.now())
+ except BaseException as exc:c.save(p/'INVALID_NOT_READY.json',{'reason':str(exc)});raise
+ return bound
+
+def plan():return {'schema':'e5-next-recovery-plan-v1','io_disabled':RECOVERY_IO_DISABLED,'restore_ranges':{'boot_b':[0,67108864],'misc':[2048,32]},'new_boot_new_tx_fresh16raw_dual_review':True,'snapshot_seconds':900,'scanner_required':False,'automatic_reboot_retry_cleanup':False,'host_state_untouched':True}
+def main(argv=None):
+ ap=argparse.ArgumentParser(description=__doc__);sub=ap.add_subparsers(dest='mode');sub.add_parser('plan')
+ for mode in ('state-request','refresh-request','refresh-envelope','cold-envelope','directory-envelope','reconcile','draft','bind-request','bind-bundle','validate','execute'):
+  parser=sub.add_parser(mode);parser.add_argument('--tool-manifest-sha',required=True)
+  if mode=='state-request':
+   parser.add_argument('--previous-evidence',required=True);parser.add_argument('--previous-evidence-sha',required=True);parser.add_argument('--purpose',choices=('directory','recovery','rearm-with-sim'),required=True);parser.add_argument('--sim-confirmation');parser.add_argument('--sim-confirmation-sha')
+  else:
+   parser.add_argument('--input',required=True);parser.add_argument('--sha256',required=True)
+   if mode=='reconcile':parser.add_argument('--txid',required=True);parser.add_argument('--helper-owner-tx',required=True)
+   if mode in ('directory-envelope','bind-request','bind-bundle','validate','execute'):parser.add_argument('--readonly-result',required=True);parser.add_argument('--readonly-sha256',required=True)
+   if mode in ('refresh-envelope','cold-envelope','directory-envelope','bind-request','bind-bundle'):parser.add_argument('--review',required=True);parser.add_argument('--review-sha256',required=True)
+   if mode=='refresh-envelope':parser.add_argument('--prior',required=True);parser.add_argument('--prior-sha256',required=True)
+   if mode=='draft':parser.add_argument('--seconds',type=int,default=600)
+  if mode!='validate':parser.add_argument('--output',required=True)
+ args=ap.parse_args(argv);mode=args.mode or 'plan'
+ if mode=='plan':value={'io_disabled':True,'scope':'SIM-only request/cold envelope host helpers; no original restore endpoint'}
+ else:
+  c.require(mode in ('state-request','refresh-request','refresh-envelope','cold-envelope'),'SIM component does not expose original restore/directory commands')
+  if mode in ('reconcile','execute'):c.require(not RECOVERY_IO_DISABLED,'RECOVERY_IO_DISABLED: no device or host-barrier transition')
+  c.verify_manifest(args.tool_manifest_sha)
+  if mode=='state-request':value=state_request({'path':args.previous_evidence,'sha256':args.previous_evidence_sha},args.purpose,args.output,{'path':args.sim_confirmation,'sha256':args.sim_confirmation_sha} if args.sim_confirmation else None)
+  else:
+   item={'path':args.input,'sha256':args.sha256}
+   if mode=='refresh-request':value=refresh_request(item,args.output)
+   elif mode=='refresh-envelope':value=refresh_envelope({'path':args.prior,'sha256':args.prior_sha256},item,{'path':args.review,'sha256':args.review_sha256},args.output)
+   elif mode=='cold-envelope':value=cold_envelope(item,{'path':args.review,'sha256':args.review_sha256},args.output)
+   elif mode=='directory-envelope':value=directory_envelope(item,{'path':args.readonly_result,'sha256':args.readonly_sha256},{'path':args.review,'sha256':args.review_sha256},args.output)
+   elif mode=='reconcile':value=reconcile(item,args.txid,args.helper_owner_tx,args.output)
+   elif mode=='draft':value=draft(item,args.output,args.seconds)
+   else:
+    result={'path':args.readonly_result,'sha256':args.readonly_sha256}
+    if mode=='bind-request':value=bind_request(result,item,{'path':args.review,'sha256':args.review_sha256},args.output)
+    elif mode=='bind-bundle':value=bind_bundle(item,{'path':args.review,'sha256':args.review_sha256},result,args.output)
+    elif mode=='validate':value={'context':validate_bundle(item,result)[1],'offline_only':True,'approved_to_execute':False}
+    else:value=execute(item,result,args.output)
+ print(json.dumps(value,indent=2));return 0
+if __name__=='__main__':main()

@@ -1,0 +1,71 @@
+"""Fixed host-only three-gate copy. No device/transport/state/approval API."""
+import argparse, ast, difflib, hashlib, json, os
+from pathlib import Path
+
+ROOT = Path('/REDACTED_HOST_PATH')
+SOURCE = ROOT/'tools/e5_sim_rearm_441f60bc8933be12_prepare_20261016'
+TARGET = ROOT/'tools/e5_sim_rearm_441f60bc8933be12_live_20261016'
+CONTROL = Path(__file__).resolve().parent
+MANIFEST_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+REVIEW = ROOT/'research/audit/sim-lifecycle-actual-independent-review-20261016.json'
+REVIEW_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+EDITS = {
+ 'observe.py': (b'DEVICE_IO_ENABLED = False', b'DEVICE_IO_ENABLED = True'),
+ 'rearm.py': (b'REARM_IO_DISABLED=True', b'REARM_IO_DISABLED=False'),
+ 'sim_nv.py': (b'NV_IO_DISABLED=True', b'NV_IO_DISABLED=False'),
+}
+def sha(b): return hashlib.sha256(b).hexdigest()
+def encode(v): return (json.dumps(v,ensure_ascii=False,sort_keys=True,indent=2)+'\n').encode()
+def read(p):
+ assert p.is_absolute() and p.is_file() and not p.is_symlink() and all(not x.is_symlink() for x in p.parents)
+ assert p.stat().st_nlink == 1
+ return p.read_bytes()
+def write(p,b):
+ with p.open('xb') as f: f.write(b);f.flush();os.fsync(f.fileno())
+ fd=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY)
+ try: os.fsync(fd)
+ finally: os.close(fd)
+def render():
+ manifest_raw=read(SOURCE/'MANIFEST.json');assert sha(manifest_raw)==MANIFEST_SHA
+ assert sha(read(REVIEW))==REVIEW_SHA
+ m=json.loads(manifest_raw);data={};changes={};patch=[]
+ for name,record in m['files'].items():
+  assert Path(name).name==name
+  raw=read(SOURCE/name);assert len(raw)==record['bytes'] and sha(raw)==record['sha256']
+  new=raw
+  if name in EDITS:
+   old,value=EDITS[name];assert raw.splitlines().count(old)==1
+   new=raw.replace(old+b'\n',value+b'\n');assert new!=raw
+   changes[name]={'before':sha(raw),'after':sha(new),'old':old.decode(),'new':value.decode()}
+   patch.extend(difflib.unified_diff(raw.decode().splitlines(True),new.decode().splitlines(True),fromfile=str(SOURCE/name),tofile=str(TARGET/name)))
+  if name.endswith('.py'):ast.parse(new)
+  data[name]=new
+ assert set(changes)==set(EDITS)
+ assert data['recovery.py']==read(SOURCE/'recovery.py') and b'RECOVERY_IO_DISABLED=True\n' in data['recovery.py']
+ assert data['common.py']==read(SOURCE/'common.py') and data['DEPENDENCIES.json']==read(SOURCE/'DEPENDENCIES.json')
+ m['files']={n:{'bytes':len(b),'sha256':sha(b)} for n,b in data.items()}
+ m['gates']={'observe.DEVICE_IO_ENABLED':True,'rearm.REARM_IO_DISABLED':False,'sim_nv.NV_IO_DISABLED':False,'recovery.RECOVERY_IO_DISABLED':True}
+ m['purpose']='SIM-only three-gate enabled copy; actual field evidence required before execution'
+ m['source_prepare_manifest']={'path':str(SOURCE/'MANIFEST.json'),'sha256':MANIFEST_SHA}
+ m['source_prepare_independent_review']={'path':str(REVIEW),'sha256':REVIEW_SHA}
+ m['mechanical_gate_changes']=changes
+ m['independent_review']='PENDING_SEPARATE_ENABLED_COPY_REVIEW'
+ m['first_install_and_NV_field_evidence']='PENDING_NOT_CREATED'
+ m['not_device_authorization']=True
+ return data,encode(m),''.join(patch).encode(),changes
+def main():
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',nargs='?',choices=('plan','copy'),default='plan');a=p.parse_args()
+ data,manifest,patch,changes=render()
+ report={'schema':'e5-sim-three-gate-host-copy-v1','source':str(SOURCE),'source_manifest_sha256':MANIFEST_SHA,'target':str(TARGET),'target_manifest_sha256':sha(manifest),'changes':changes,'unchanged_files':sorted(set(data)-set(EDITS)),'generic_recovery_disabled':True,'field_evidence_created':False,'device_or_state_operations':False,'mode':a.mode}
+ if a.mode=='copy':
+  assert not TARGET.exists() and not TARGET.is_symlink()
+  TARGET.mkdir(mode=0o700)
+  for name,raw in data.items():write(TARGET/name,raw)
+  write(TARGET/'MANIFEST.json',manifest)
+  write(TARGET/'LIVE_RUN_NOTES.md',b'# Enabled SIM copy\n\nOnly observe/rearm/sim_nv gates are enabled. Generic recovery remains disabled and rejects. Source README/tests describe the historical preparation package; do not run its disabled-gate test suite against this live copy. No field request/review was created. Actual first-install, no-SIM overall acceptance, fresh SIM cold/NV/network evidence and independent BC32 review remain mandatory. No automatic reboot/retry.\n')
+  write(TARGET/'SHA256SUMS',(''.join(sha(read(TARGET/n))+'  '+n+'\n' for n in sorted([*data,'MANIFEST.json','LIVE_RUN_NOTES.md']))).encode())
+  write(CONTROL/'ENABLED_COPY.patch',patch)
+  report['files']={n:{'bytes':len(read(TARGET/n)),'sha256':sha(read(TARGET/n))} for n in sorted([*data,'MANIFEST.json','LIVE_RUN_NOTES.md','SHA256SUMS'])}
+  write(CONTROL/'HOST_COPY.json',encode(report))
+ print(json.dumps(report,ensure_ascii=False,indent=2))
+if __name__=='__main__':main()

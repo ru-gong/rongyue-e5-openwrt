@@ -1,0 +1,59 @@
+# E5 下一阶段核心工具：准备版
+
+本目录是独立新实现与适配，保留所有旧冻结目录。设备相关入口均为字面量硬禁；默认 `workflow.py plan` 只输出范围。准备期没有运行 ADB、USB、设备 SSH、AT、设备辅助程序，也没有清理真实事务状态。这里的测试通过不是 E5 实机验收，也不构成刷机授权。
+
+## 固定入口与阶段
+
+```sh
+python3 -B tools/e5_nextphase_core_prepare_20261015/workflow.py plan
+python3 -B tools/e5_nextphase_core_prepare_20261015/workflow.py verify-materials
+python3 -B tools/e5_nextphase_core_prepare_20261015/prepare_requests.py
+```
+
+最后一条仅打印未填现场值、未批准的请求骨架。需要保存时用 `--output` 指向不存在的新本机文件。它不产生通过凭据。
+
+后续独立启用副本支持 `workflow.py validate REQUEST_ABSOLUTE_PATH SHA256` 和 `execute REQUEST_ABSOLUTE_PATH SHA256`。每次只执行一个阶段，不串行自动推进，不重启，不自动重试或恢复。正式请求必须绑定本次真实 boot ID、同一辅助程序 owner tx、独立新证据目录、原始请求 SHA、已批准范围及新鲜独审。
+
+| phase | 所需现场证据 | 行为 |
+|---|---|---|
+| probe | 原件恢复后的健康证据、修复 scanner 部署完成链 | 新上传专用小程序，在新事务锁内验证不覆盖改名和有限清理 |
+| inventory | 部署完成链、当前原件及健康证明 | 只读 active/stage/archive/failed 固定角色 |
+| backup | 当前完整清单和部署链 | 完整复制指定目录到新的 Mac tar，重新核验内容与元数据 |
+| stage | 部署、probe 完成链及当前原件 | 独占新建 stage，4 MiB 以下分块写固定八文件，逐块读回、最终核验 |
+| activate | 上述链、当前原目录完整备份及新 stage 清单 | active→archive，再 stage→active；不覆盖，每步核验 |
+| install | 上述链、真实 activate journal/回执/目录证明 | 新取九项物理 NV 只读基线；候选 B 64 MiB，最后 misc@2048 的32字节；全量读回 |
+| rollback | 当前原 B/misc 已恢复、历史激活链、当前候选完整备份 | active→failed（如存在），archive→active；不覆盖或删除 |
+
+固定目录：`/data/e5linux`、`/data/e5linux.stage.<tx>`、`/data/e5linux.archive.<tx>`、`/data/e5linux.failed.<tx>`。目录备份不是整 F2FS、xattr 或整机快照。两次改名不是原子交换。
+
+## 证据和时间限制
+
+`cold_bridge.py` 在导入前核对 evidence_contract/common/observe 三个实际源的 SHA，再重新验证原始 21 样本、初末诊断、16 项双遍分区读取。不会把旧 plan 或布尔通过字段转为有效证据。新 B/misc 必须为原件、13项保护区/GPT与本机 profile 相符。
+
+大文件阶段完成后，允许使用独立同 boot 只读刷新入口：沿用原始冷启动事实、取得当前健康/日志/PID1原文，再完成新的16项原始读取及独审。刷新不延长旧 raw 的900秒有效期。UNKNOWN 或 boot变化不能这样续接；需新的冷启动和针对现场的恢复审阅。
+
+phase_evidence 复核真实部署/探针/激活链；探针成功可在同一 owner 下跨启动保留，但当前 data/锁/owner身份及程序内容必须重新检查。不能因历史文件写着成功而直接放行。
+
+每次主机设备请求最多8秒，读取 shell 6秒，native有独立短绝对期限。整个阶段共用取消和总期限，安装引擎接受外层剩余绝对期限，不在 NV读取之后重新获得完整预算。stage/backup可较长；改名和分区写仍要求完整阶段能装入新证据租约。
+
+任意超时、取消、短读、ACK丢失、核验失败、未知状态都保留现场，停止后续操作。USB断开或本机进程退出不证明设备端操作没有发生。不能自动重放、删除锁、清 marker 或扩大超时通过检查。
+
+## A 槽保护和恢复
+
+原生写范围仅 boot_b `/dev/block/mmcblk0p37`、64 MiB，以及 misc `/dev/block/mmcblk0p3` 偏移2048的32字节。完整 misc 的其余字节、boot_a与12项其他保护分区、GPT在前后核验。九项物理NV工具只读，没有对应写入口。
+
+新恢复工具位于 `../e5_next_recovery_prepare_20261015`，区分普通 COMPLETE 后试启失败和中断 UNKNOWN，两者均需要新的启动/新请求/新鲜16项原始证据及两层独审，最终仍只恢复本机原 B和原BC32。普通完整安装后失败不会伪造 UNKNOWN，也不会因 ledger COMPLETE 而无法申请原件恢复。
+
+恢复自身失败、Android A/root/data不可用、保护区或misc窗外变化、目录身份不明、文件系统错误或新panic均停止。FDL不是本范围后备入口；它会改动A、完整misc等额外范围，不能擅自使用。
+
+## 候选和验收
+
+候选固定在 `materials/openwrt-no-auto-fsck-20261015`。相对作者版候选只删除 init 挂载失败分支的自动全 userdata fsck/再武装/强制重启调用；其余七项外层文件、内核和蜂窝代码不改。正常 F2FS mount recovery/checkpoint 仍可能改文件系统元数据。候选没有重新签名，依赖已有解锁/验证绕过；离线结构检查不能证明实机启动。
+
+无卡首启和正常回 Android 先验收；随后按明确通知装移动 SIM1、联通 SIM2，以专用 BC32-only工具试启，不再刷 B。Linux只读检查使用 `../e5_next_acceptance_prepare_20261015` 的新合同。新安装可能生成新SSH主机密钥，先现场核验，不能沿用旧known_hosts或关闭检查。运行后物理九NV两遍哈希及新工作副本origin须与本次试启前基线比较。
+
+运行允许：新候选目录内初始化、日志/工作NV、boot_b [56,60) MiB诊断、misc [2048,2080)启动记录及正常文件系统元数据。候选保留失败USB救援与约600秒自动回A计时器；这不是所有启动故障均可回A的保证。取日志在正常重启前完成。蜂窝/双卡/热点/短信实际通过后才单独准备OpenClash。
+
+## 启用交付规则
+
+本目录保持禁用并封存。最终执行确认后，只创建独立启用副本，按交付 `ACTIVATION_RECIPE.json` 的限定 gate与路径/pin变更生成，重新核验所有源/材料和启用差异。四个包一次性形成稳定版本；不能在 probe 成功后再更改 core 源或清单，否则先前完成证据会因绑定不同而失效。不得直接修改冻结准备源，不得生成虚假的当前设备请求/审阅。独立副本启用只解除工具保险，仍必须逐阶段通过真实现场门；不会自动连接设备或执行。离线复制和重封入口见 `../e5_activation_prepare_20261015`。

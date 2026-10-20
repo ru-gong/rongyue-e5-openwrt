@@ -1,0 +1,193 @@
+"""Host-only finite-budget tests; no process, socket or device methods."""
+import sys
+def sentinel(event,args):
+ if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':raise AssertionError('external operation forbidden')
+sys.addaudithook(sentinel)
+import ast,copy,datetime as dt,hashlib,importlib.util,json,threading,time,types,unittest
+from pathlib import Path
+from unittest.mock import patch
+ROOT=Path(__file__).resolve().parents[2]
+CORE=ROOT/'tools/e5_nextphase_core_budget_prepare_20261015'; REC=ROOT/'tools/e5_next_recovery_budget_prepare_20261015'
+sys.path.insert(0,str(CORE))
+import bounded_boot_control as boot
+import workflow
+import directory_session as session
+spec=importlib.util.spec_from_file_location('_e5_next_common',REC/'common.py');common=importlib.util.module_from_spec(spec);sys.modules[spec.name]=common;spec.loader.exec_module(common)
+contract=common.sibling('evidence_contract')
+
+def load_fixture(name,path,replace=()):
+ module=types.ModuleType(name);module.__file__=str(path);sys.modules[name]=module
+ text=path.read_text()
+ for old,new in replace:
+  assert text.count(old)==1;text=text.replace(old,new)
+ exec(compile(text,str(path),'exec'),module.__dict__);return module
+
+class BudgetTests(unittest.TestCase):
+ def setUp(self):
+  self.cut=common.timestamp(contract.DIRECTORY_POLICY_NOT_BEFORE);self.end=self.cut+dt.timedelta(seconds=700);self.now=self.end+dt.timedelta(seconds=100)
+ def review(self,seconds=10800):
+  return {'captured_at':self.now.isoformat(),'expires_at':(self.now+dt.timedelta(seconds=seconds)).isoformat(),'directory_budget_policy':contract.directory_budget_policy()}
+ def test_directory_extended_explicit_new_policy(self):
+  v=contract.reviewed_lease(self.review(),self.now,'directory',self.end,self.cut+dt.timedelta(seconds=1));self.assertEqual(v,self.end+dt.timedelta(seconds=10800))
+ def test_recovery_and_rearm_reject_extended(self):
+  for purpose in ('recovery','rearm-with-sim'):
+   with self.assertRaises(RuntimeError):contract.reviewed_lease(self.review(),self.now,purpose,self.end)
+ def test_missing_wrong_source_or_seconds_policy_rejected(self):
+  for change in ('missing','source','seconds'):
+   r=self.review()
+   if change=='missing':r.pop('directory_budget_policy')
+   elif change=='source':r['directory_budget_policy']['contract_sha256']='0'*64
+   else:r['directory_budget_policy']['seconds']=10801
+   with self.assertRaises(RuntimeError):contract.reviewed_lease(r,self.now,'directory',self.end)
+ def test_old_start_or_end_cannot_acquire_new_lease(self):
+  for end,start in ((self.cut-dt.timedelta(seconds=1),self.cut-dt.timedelta(seconds=601)),(self.end,self.cut-dt.timedelta(seconds=1))):
+   with self.assertRaises(RuntimeError):contract.reviewed_lease(self.review(),self.now,'directory',end,start)
+ def test_review_must_be_generated_within900(self):
+  with self.assertRaises(RuntimeError):contract.reviewed_lease(self.review(),self.now,'directory',self.now-dt.timedelta(seconds=900))
+ def test_future_or_expired_review_refused(self):
+  for at in (self.now-dt.timedelta(seconds=1),self.now+dt.timedelta(seconds=10800)):
+   with self.assertRaises(RuntimeError):contract.reviewed_lease(self.review(),at,'directory',self.end)
+ def test_legacy900_preserves_exact_expiry(self):
+  r=self.review(900);r.pop('directory_budget_policy');end=contract.reviewed_lease(r,self.now,'directory',self.end);self.assertEqual(end,self.end+dt.timedelta(seconds=900))
+  with self.assertRaises(RuntimeError):contract.reviewed_lease(r,end,'directory',self.end)
+ def test_late_legacy_review_never_revalidates_expired_evidence(self):
+  r={'captured_at':(self.end+dt.timedelta(seconds=800)).isoformat(),'expires_at':(self.end+dt.timedelta(seconds=1700)).isoformat()}
+  with self.assertRaisesRegex(RuntimeError,'effective lease expired'):contract.reviewed_lease(r,self.end+dt.timedelta(seconds=1000),'directory',self.end)
+ def test_raw_purpose_isolation(self):
+  rec={'captured_at':self.end.isoformat()};at=self.end+dt.timedelta(seconds=901)
+  self.assertEqual(contract.raw_remaining(rec,at,'directory'),9899)
+  for purpose in ('recovery','rearm-with-sim','unknown'):
+   with self.assertRaises(RuntimeError):contract.raw_remaining(rec,at,purpose)
+  with self.assertRaises(RuntimeError):common.remaining(rec,at)
+ def test_raw_future_and_directory_max(self):
+  rec={'captured_at':self.end.isoformat()}
+  for at in (self.end-dt.timedelta(seconds=1),self.end+dt.timedelta(seconds=10800)):
+   with self.assertRaises(RuntimeError):contract.raw_remaining(rec,at,'directory')
+ def test_default_boot_budget_still900(self):
+  boot.Budget(900)
+  with self.assertRaises(RuntimeError):boot.Budget(901)
+ def test_only_install_budget_accepts3600(self):
+  boot.Budget(3600,install_linux=True)
+  with self.assertRaises(RuntimeError):boot.Budget(3601,install_linux=True)
+  with self.assertRaises(RuntimeError):boot.Budget(3600,install_linux=False)
+ def test_budget_cancel_and_deadline(self):
+  cancel=threading.Event();b=boot.Budget(3600,cancel,lambda:0,install_linux=True);cancel.set()
+  with self.assertRaises(RuntimeError):b.check()
+  b=boot.Budget(3600,clock=lambda:0,install_linux=True);b.clock=lambda:3600
+  with self.assertRaises(RuntimeError):b.check()
+ def test_execute_selects_only_install_mode(self):
+  tree=ast.parse((CORE/'bounded_boot_control.py').read_text());fn=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='execute')
+  call=next(x for x in ast.walk(fn) if isinstance(x,ast.Call) and isinstance(x.func,ast.Name) and x.func.id=='Budget')
+  self.assertEqual(ast.unparse(call.keywords[0].value),"r['mode'] == 'install-linux'")
+ def test_perrequest_and_ranges_unchanged(self):
+  old=ROOT/'tools/e5_nextphase_core_live_176656abb97d4b2c'
+  self.assertEqual((CORE/'bounded_transport.py').read_bytes(),(old/'bounded_transport.py').read_bytes())
+  def methods(path,names):
+   t=ast.parse(path.read_text());return {x.name:ast.dump(x,include_attributes=False) for x in ast.walk(t) if isinstance(x,ast.FunctionDef) and x.name in names}
+  for file,names in [('android_directory_adapter.py',{'_request','_read_once','_read_twice','_hash','_deadline','_write_file_chunk','inspect','move'}),('bounded_boot_control.py',{'write_chunk','read_chunk','_write_one','reconcile_readonly','_recovery_gate','approved_request','verify_install_ready'})]:
+   self.assertEqual(methods(CORE/file,names),methods(old/file,names))
+  self.assertEqual((REC/'observe.py').read_bytes(),(ROOT/'tools/e5_next_recovery_live_176656abb97d4b2c/observe.py').read_bytes())
+ def test_embedded_collector_gate_matches_disabled_source(self):
+  d=ROOT/'tools/e5_next_acceptance_budget_prepare_20261015';source=(d/'collect.py').read_bytes();shell=(d/'collect.sh').read_bytes()
+  self.assertEqual(shell.count(source),1);self.assertIn(b'DEVICE_IO_DISABLED = True',source)
+ def test_disabled_writer_entrypoints(self):
+  for call in (lambda:workflow.execute({}),lambda:boot.execute(None,'x','x','x'),lambda:common.sibling('recovery').execute({}, {}, '/unexecuted'),lambda:common.sibling('rearm').run({}, {}, '/unexecuted')):
+   with self.assertRaises((RuntimeError,TypeError)):call()
+
+# Reuse actual frozen temporary-fixture suite with only future budget metadata.
+wf=load_fixture('_budget_workflow_fixtures',ROOT/'tools/e5_nextphase_core_prepare_20261015/test_workflow.py')
+class WorkflowBudgetTests(wf.WorkflowTests):
+ def test_phase_budget_limits(self):
+  inputs={'probe':{},'inventory':{'roles':['active']},'backup':{'inventory':{},'output':'/unexecuted'},'stage':{},'activate':{'directory_request':{}},'rollback':{'directory_request':{}},'install':{'boot_request':{}}}
+  caps={'probe':900,'inventory':3600,'backup':5400,'stage':7200,'activate':5400,'rollback':5400,'install':3600}
+  for phase,maximum in caps.items():
+   r=copy.deepcopy(self.request);r.update(phase=phase,inputs=inputs[phase],total_seconds=maximum,requirements={'deployment':{}})
+   if phase in ('stage','activate','rollback','install'):r['requirements']['probe']={}
+   if phase=='install':r['requirements']['activation']={}
+   self.assertEqual(self.check(r)['total_seconds'],maximum)
+   r['total_seconds']=maximum+1
+   with self.assertRaisesRegex(RuntimeError,'time budget'):self.check(r)
+
+sf=load_fixture('_budget_session_fixtures',ROOT/'tools/e5_nextphase_core_prepare_20261015/test_directory_session.py')
+old_init=sf.FakeBackend.__init__
+def backend_init(self,*args):
+ old_init(self,*args);self.transaction_deadline=time.monotonic()+5400;self.cancel_event=threading.Event()
+sf.FakeBackend.__init__=backend_init
+class PhaseFitTests(unittest.TestCase):
+ def test_all_phases_insufficient_lease_prevents_adapter_creation(self):
+  for phase in workflow.PHASES:
+   for remaining in (100,605):
+    request={'phase':phase,'total_seconds':600,'requirements':{},'txid':'0'*16,'cold_ready':{},'boot_id':'x'}
+    mods={'directory_session':None,'bounded_boot_control':None,'phase_evidence':types.SimpleNamespace(validate_requirements=lambda *a:{}),'cold_bridge':types.SimpleNamespace(validate_directory_ready=lambda *a:{'expires_at':(dt.datetime.now(dt.timezone.utc)+dt.timedelta(seconds=remaining)).isoformat()})}
+    with patch.object(workflow,'WORKFLOW_IO_DISABLED',False),patch.object(workflow,'validate_request',return_value=request),patch.object(workflow,'verify_materials',return_value={}),patch.object(workflow,'load_modules',return_value=mods),patch.object(workflow,'make_adapter') as adapter:
+     with self.assertRaisesRegex(RuntimeError,'full phase does not fit'):workflow.execute({})
+     adapter.assert_not_called()
+
+class SessionBudgetTests(sf.SessionTests):
+ def test_same_instance_16minute_review_valid_and_new_instance_refused(self):
+  self.cold['expires_at']=(sf.NOW+dt.timedelta(seconds=10800)).isoformat();bound=self.bind();tx=self.open(bound)
+  future=sf.NOW+dt.timedelta(seconds=1000)
+  # fake transport captures no device IO; actual validators/journal/transaction run.
+  with patch.object(session,'_now',return_value=future),patch.object(sf,'NOW',future):
+   with self.assertRaisesRegex(RuntimeError,'review missing'):self.open(bound,name='other-session')
+   self.assertEqual(tx.activate()['state'],'ACTIVE')
+ def test_admitted_transaction_deadline_refuses_move(self):
+  tx=self.open();tx._phase_deadline=time.monotonic()-1;self.backend.transaction_deadline=tx._phase_deadline
+  with self.assertRaisesRegex(RuntimeError,'admitted phase expired'):tx._move('move-active-to-archive','active',self.original,'ARCHIVE')
+  self.assertFalse(self.backend.moves)
+ def test_admitted_request_path_sha_immutable(self):
+  tx=self.open();tx.request_sha256='0'*64
+  with self.assertRaisesRegex(RuntimeError,'admitted request changed'):tx._move('move-active-to-archive','active',self.original,'ARCHIVE')
+  self.assertFalse(self.backend.moves)
+ def test_admitted_cancellation_stops(self):
+  tx=self.open();self.backend.cancel_event.set()
+  with self.assertRaisesRegex(RuntimeError,'admitted phase expired'):tx._move('move-active-to-archive','active',self.original,'ARCHIVE')
+
+nf=load_fixture('_budget_evidence_fixtures',ROOT/'tools/e5_boot_lineage_repair_prepare_20261015/test_next.py',[("spec=importlib.util.spec_from_file_location('_e5_next_common',Path(__file__).with_name('common.py'));c=importlib.util.module_from_spec(spec);sys.modules[spec.name]=c;spec.loader.exec_module(c)","c=sys.modules['_e5_next_common']")])
+class EvidenceBudgetTests(nf.Tests):
+ def test_source_variants_and_namespace(self):
+  self.assertEqual(len(contract.source_variants(Path(nf.r.__file__),b'RECOVERY_IO_DISABLED=True')),2)
+  self.assertIs(contract.c,common);self.assertEqual(Path(common.__file__).resolve(),REC/'common.py')
+  self.assertEqual(Path(boot.__file__).resolve(),CORE/'bounded_boot_control.py')
+ def test_default_all_device_gates(self):
+  # Historical observer bytes intentionally enabled, never invoke it in tests.
+  with patch.object(common,'load_runtime',side_effect=AssertionError('must not import runtime')):
+   for call in (lambda:nf.r.reconcile({},nf.TX,nf.TX,'/unused'),lambda:nf.r.execute({}, {},'/unused'),lambda:nf.arm.capture({},nf.TX,'/unused'),lambda:nf.arm.run({}, {},'/unused'),lambda:nf.arm.backend({},nf.NEW,nf.TX,None,None)):
+    with self.assertRaisesRegex(RuntimeError,'IO_DISABLED'):call()
+  self.assertTrue(nf.o.DEVICE_IO_ENABLED)
+ def long_fixture(self,started=None):
+  self.clock=common.timestamp(contract.DIRECTORY_POLICY_NOT_BEFORE)+dt.timedelta(seconds=1000)
+  env,rb,out=self.raw_fixture();v=common.obj(env)
+  cr=common.obj(v['cold_review']);cr.update(expires_at=(self.clock+dt.timedelta(seconds=10800)).isoformat(),directory_budget_policy=contract.directory_budget_policy());v['cold_review']=self.write('long-cold-review.json',cr)
+  result=common.obj(rb);result['cold_envelope']=contract.binding_without_originals(v)
+  if started is not False:result['capture_started_at']=(started or self.clock-dt.timedelta(seconds=100)).isoformat()
+  rb=self.write('evidence/raw-capture/READONLY_RESULT.json',result);v['readonly_result']=rb
+  rr=common.obj(v['original_review']);rr.update(readonly_result=rb,expires_at=(self.clock+dt.timedelta(seconds=10800)).isoformat(),directory_budget_policy=contract.directory_budget_policy());v['original_review']=self.write('long-original-review.json',rr)
+  return self.write('long-envelope.json',v),rb,out
+ def test_actual_long_cold_and_raw_chain_after_policy(self):
+  env,rb,_=self.long_fixture();at=self.clock+dt.timedelta(seconds=1000)
+  gate=contract.validate_directory_ready(env,nf.NEW,at)
+  self.assertGreater(common.timestamp(gate['expires_at']),at);self.assertEqual(gate['status'],'ORIGINALS_VERIFIED')
+ def test_actual_legacy_review_delayed_800_cannot_extend900(self):
+  env,_=self.cold_fixture();v=common.obj(env);cold=common.obj(v['cold_complete']);end=self.clock-dt.timedelta(seconds=98)
+  r=common.obj(v['cold_review']);r.update(captured_at=(end+dt.timedelta(seconds=800)).isoformat(),expires_at=(end+dt.timedelta(seconds=1700)).isoformat());v['cold_review']=self.write('delayed-review.json',r);env=self.write('delayed-envelope.json',v)
+  with self.assertRaisesRegex(RuntimeError,'cold evidence lease expired'):contract.validate_cold(env,end+dt.timedelta(seconds=1000))
+ def test_actual_cold_start_before_policy_cannot_extend(self):
+  env,_,_=self.long_fixture();v=common.obj(env);cold=common.obj(v['cold_complete']);end=self.clock-dt.timedelta(seconds=98)
+  with patch.object(contract,'DIRECTORY_POLICY_NOT_BEFORE',(end-dt.timedelta(seconds=100)).isoformat()):
+   r=common.obj(v['cold_review']);r['directory_budget_policy']=contract.directory_budget_policy();v['cold_review']=self.write('policy-review.json',r);env=self.write('policy-envelope.json',v)
+   with self.assertRaisesRegex(RuntimeError,'old evidence'):contract.validate_cold(env,self.clock)
+ def test_long_original_missing_start_refused(self):
+  env,_,_=self.long_fixture(False)
+  with self.assertRaises((KeyError,RuntimeError)):contract.validate_original(env,self.clock)
+ def test_long_original_old_start_refused(self):
+  env,_,_=self.long_fixture(common.timestamp(contract.DIRECTORY_POLICY_NOT_BEFORE)-dt.timedelta(seconds=1))
+  with self.assertRaisesRegex(RuntimeError,'old evidence'):contract.validate_original(env,self.clock)
+ def test_long_original_future_start_refused(self):
+  env,_,_=self.long_fixture(common.timestamp(contract.DIRECTORY_POLICY_NOT_BEFORE)+dt.timedelta(seconds=1001))
+  with self.assertRaisesRegex(RuntimeError,'timing order'):contract.validate_original(env,self.clock)
+ def test_old_raw_producer_cannot_mint_long_chain(self):
+  env,rb,_=self.long_fixture();v=common.obj(env);result=common.obj(rb);result['producer_source_sha256']=common.sha(common.read(ROOT/'tools/e5_next_recovery_live_176656abb97d4b2c/recovery.py'));rb=self.write('evidence/raw-capture/READONLY_RESULT.json',result);v['readonly_result']=rb;env=self.write('old-source-envelope.json',v)
+  with self.assertRaisesRegex(RuntimeError,'producer binding'):contract.validate_original(env,self.clock)
+
+if __name__=='__main__':unittest.main(verbosity=2)

@@ -1,0 +1,179 @@
+"""Offline lock lineage repair. No device entry, subprocess, or state cleanup.
+
+The historical probe legitimately changed its parent directory timestamps.
+Derive expected metadata from its completed, independently read back result;
+never adopt timestamps from the current failing run.
+"""
+import copy
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+OLD = ROOT / 'evidence/author-closed-fd-install-20261019'
+CURRENT = ROOT / 'evidence/author-new-slot-install-20261019'
+CORE = ROOT / 'tools/e5_nextphase_core_live_69b2a5b04287f071'
+CASE = ROOT / 'tools/e5_new_slot_stop_prepare_20261019/CASE.json'
+CASE_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+TX = '855ae61b90f0f332'
+BOOT = '00000000-0000-4000-8000-000000000001'
+TIME_FIELDS = ('mtime', 'ctime', 'mtime_text', 'ctime_text')
+
+
+def need(value, reason):
+    if not value:
+        raise ValueError(reason)
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def bind(path):
+    return {'path': str(path), 'sha256': sha(path.read_bytes())}
+
+
+def parse_stat(raw):
+    fields = raw.decode().split('|')
+    need(len(fields) == 14, 'exact stat fields')
+    return dict(mode_bits=fields[0], dev=int(fields[1]), inode=int(fields[2]),
+                bytes=int(fields[3]), mode=fields[4], uid=int(fields[5]),
+                gid=int(fields[6]), nlink=int(fields[7]), mtime=fields[8],
+                ctime=fields[9], mtime_text=fields[10], ctime_text=fields[11],
+                rdev_major=int(fields[12], 16), rdev_minor=int(fields[13], 16))
+
+
+def normalize_probe(row, kind):
+    value = dict(row)
+    value['mode_bits'] = format(value['mode_bits'], 'x')
+    value['mode'] = format(value['mode'], 'o')
+    value['mtime_text'] = value.pop('mtime_ns_text')
+    value['ctime_text'] = value.pop('ctime_ns_text')
+    value['type'] = kind
+    return value
+
+
+def corrected_lock(known, after):
+    """Only the directory's four time fields may advance at this known probe."""
+    result = copy.deepcopy(known)
+    for target, source, kind in (('new_lock', 'lock', 'd'),
+                                 ('new_owner', 'owner', 'f')):
+        previous = known[target]
+        actual = normalize_probe(after[source], kind)
+        need(set(actual) == set(previous), 'metadata field set')
+        for key in previous:
+            if target == 'new_lock' and key in TIME_FIELDS:
+                continue
+            need(actual[key] == previous[key], 'unexpected lineage drift: '+target+'/'+key)
+        if target == 'new_lock':
+            for key in ('mtime', 'ctime'):
+                need(int(actual[key]) >= int(previous[key]), 'time moved backwards')
+        result[target] = actual
+    need(after['owner_sha256'] == sha((TX+'\n').encode()), 'owner bytes')
+    return result
+
+
+def exact_current_match(expected, current):
+    for current_key, source_key in (('old_lock', 'new_lock'),
+                                    ('old_owner', 'new_owner')):
+        actual = dict(current[current_key])
+        actual['type'] = 'd' if current_key == 'old_lock' else 'f'
+        need(actual == expected[source_key], 'current metadata differs: '+current_key)
+
+
+def load_and_verify_history():
+    raw = CASE.read_bytes()
+    need(sha(raw) == CASE_SHA, 'fixed prior case')
+    case = json.loads(raw)
+    # Check the original case's hashes of the proof parser and every historical
+    # deployment/probe file before invoking its host-only proof functions.
+    selected = {}
+    for relative, pin in case['files'].items():
+        if any(relative.startswith(str(p.relative_to(ROOT))+'/') for p in
+               (CORE, OLD/'scanner-execution', OLD/'probe-execution')):
+            path = ROOT / relative
+            need(path.is_file() and not path.is_symlink(), 'pinned regular proof')
+            data = path.read_bytes()
+            need(len(data) == pin['bytes'] and sha(data) == pin['sha256'], 'historical proof drift')
+            selected[relative] = pin
+    need(str((CORE/'phase_evidence.py').relative_to(ROOT)) in selected, 'parser not pinned')
+    spec = importlib.util.spec_from_file_location('_lock_lineage_proof', CORE/'phase_evidence.py')
+    proof = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(proof)
+    manifest_path = CORE/'SOURCE_MANIFEST.json'
+    manifest = json.loads(manifest_path.read_bytes())
+    manifest['_bound_manifest_sha256'] = sha(manifest_path.read_bytes())
+    deployed = proof.deployment(bind(OLD/'scanner-execution/result/COMPLETE.json'), manifest, TX)
+    probed = proof.probe(bind(OLD/'probe-execution/COMPLETE.json'), manifest, TX, deployed)
+    need(probed['result']['boot_id'] == BOOT, 'historical boot')
+    after = probed['result']['after']
+    mutation = OLD/'probe-execution/transport/000075-noreplace-probe-00000000000000000000000000000000'
+    part = mutation/'part-001-probe-fixed-state'
+    begin = json.loads((part/'IN_FLIGHT.json').read_bytes())
+    lines = (part/'stdout.bin').read_bytes().splitlines()
+    op = lines[0].split(b'\t')[1].decode()
+    need(lines[0] == f'SNAP\t{op}\t{BOOT}'.encode() and
+         lines[-1] == f'END\t{op}\t{BOOT}'.encode(), 'probe raw framing')
+    need(begin['label'] == 'probe-fixed-state' and len(lines) == 8, 'probe final followup')
+    for index, role in enumerate(('data', 'local', 'tmp', 'lock', 'owner'), 1):
+        name, value = lines[index].split(b'\t', 1)
+        need(name.decode() == role, 'probe raw role')
+        expected = normalize_probe(after[role], 'f' if role == 'owner' else 'd')
+        expected.pop('type')
+        need(parse_stat(value) == expected, 'probe summary disconnected from final raw')
+    need(lines[-2] == f'OWNER\t{after["owner_sha256"]}  /data/local/tmp/e5-clean-directory.lock/owner'.encode(), 'probe raw owner SHA')
+    corrected = corrected_lock(case['retained_device_state']['current_lock'], after)
+    return case, corrected, {'original_case': bind(CASE), 'probe': probed['binding'],
+                            'final_probe_readback': bind(part/'stdout.bin'),
+                            'historical_files_rehashed': len(selected),
+                            'historical_deployment_and_probe_replayed': True}
+
+
+def current_readonly_replay():
+    case, corrected, history = load_and_verify_history()
+    q = CURRENT/'scanner-execution/transport/000062-stage2-state-old-00000000000000000000000000000000'
+    raw = (q/'stdout.bin').read_bytes()
+    done = json.loads((q/'COMPLETE.json').read_bytes())
+    need(done['validated'] is True and done['stdout_sha256'] == sha(raw), 'current completed read')
+    rows = {}
+    for line in raw.splitlines()[1:-2]:
+        key, value = line.split(b'\t', 1)
+        rows[key.decode()] = parse_stat(value)
+    need(raw.splitlines()[-2] == ('OLD_OWNER\t'+TX).encode(), 'current owner')
+    # Confirm all actual requests finished without sending even one mutation.
+    operations = list((CURRENT/'scanner-execution/transport').glob('*/IN_FLIGHT.json'))
+    need(len(operations) == 62, 'exact stopped request set')
+    for operation in operations:
+        before = json.loads(operation.read_bytes())
+        finished = json.loads((operation.parent/'COMPLETE.json').read_bytes())
+        result = json.loads((operation.parent/'transport-result.json').read_bytes())
+        need(before['mutating'] is False and before['payload_bytes'] == 0 and
+             finished['validated'] is True and result['returncode'] == 0 and
+             result['failure'] is None and result['host_child_reaped'] is True,
+             'stopped run contains uncompleted/mutating operation')
+    stale = case['retained_device_state']['current_lock']
+    try:
+        exact_current_match(stale, rows)
+    except ValueError:
+        stale_reproduced = True
+    else:
+        stale_reproduced = False
+    need(stale_reproduced, 'stale-case refusal not reproduced')
+    exact_current_match(corrected, rows)
+    return {'schema': 'e5-lock-time-lineage-offline-repair-v1', 'history': history,
+            'current_readback': bind(q/'stdout.bin'), 'current_requests': 62,
+            'current_mutations': 0, 'old_case_refusal_reproduced': True,
+            'historical_probe_metadata_matches_current': True,
+            'proposed_current_lock': corrected, 'device_execution_enabled': False,
+            'shared_stop_or_uncertainty_cleared': False,
+            'current_installed_family_changed': False}
+
+
+if __name__ == '__main__':
+    result = current_readonly_replay()
+    with (HERE/'ROOT_CAUSE_REPLAY.json').open('x') as stream:
+        json.dump(result, stream, ensure_ascii=False, indent=2)
+        stream.write('\n')
+    print(json.dumps({k:v for k,v in result.items() if k not in ('history','proposed_current_lock')}, ensure_ascii=False))

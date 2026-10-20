@@ -1,0 +1,48 @@
+# 7d125fa2 部分部署停止的保留式续接材料
+
+本目录是 **DISABLED 准备版**。未修改真实共享状态、原 evidence、boot ledger、手机文件或分区；没有执行设备命令。本轮发生的六项设备变更不得称为“零写入”。
+
+固定事件是 serial `DEVICE_SERIAL_REDACTED`、tx `7d125fa2bd1c4e63`、boot `00000000-0000-4000-8000-000000000001`：82 个顶层操作和 14 个附属读回完成；第 83 个只读 occupancy 返回 70，原生结果为 E2BIG/累计 FD 检查数 131073。旧锁已归档、新锁及 owner 已建立、四个辅助程序已写入并读回。系统分区和 rootfs 未发出写命令；操作后的保护分区复核没有执行。现有结果不是部署完成，不能供 probe/目录操作使用。
+
+## 固定证据与最短顺序
+
+`CASE.json` 固定 506 个原始/源码/复核文件，共 185,188,243 字节，83 个精确 argv 与远端脚本 SHA、14 个 followup、六项变更及程序 payload SHA；另固定 shared `completed` 的 551 个条目、ACTIVE、UNCERTAIN、原 ledger 全长与链头。14 个 followup 的 `mutating` 字段继承父请求，不能据此当成新增 14 次写入；其已固定脚本、零 payload 和完成读回证据单独验证。原 independent STOP report 同时固定。
+
+后续真正执行只可依次进行：
+
+1. 独审本目录及新整体 bundle；另建仅 host gate 单字面启用副本并固定 SHA。当前本目录 `HOST_CLOSURE_ENABLED=False`，不能 close。
+2. root 独占全局/serial 锁，执行这个固定 case 的 host close。原 `RECOVERY_PENDING.json` 及旧零写入归档不动；新增永久 `RECOVERY_TRANSITION.json`，将当前 ACTIVE/UNCERTAIN 原字节 no-replace 移至 `partial-deployment-closures/7d125fa2bd1c4e63`。保留 ledger prefix、副本及明确“不就绪”的 receipt。没有设备动作、boot ledger 追加、清理、自动重试或部署 COMPLETE。
+3. 使用新整体 bundle、新 tx、真实新 boot，完成原有冷启动观察与独审，再完成原 B/full misc/GPT/13 保护分区的原始双遍只读及独审。上次读前基线不能替代这一步。历史冷记录仅用作 boot 排除，不能延长旧 lease 或改成当前批准。
+4. 新阶段2必须真实读取当前 7d 锁/owner 身份；确认上次保留 archive 与四个旧程序仍精确吻合，才按原有六变更结构归档 `lock` 至 `lock.archive.7d125fa2bd1c4e63.NEW_TX`、建立新 owner、上传固定新 helper。新文件必须不存在，旧程序及旧 archive 不覆盖。
+5. 新 scanner 必须完整成功；随后再复核保留物与保护分区。只有新 RESULT/COMPLETE 和原有 phase evidence 真正通过，才进入 probe、目录备份/stage/activate、候选 B/BC32 及验收。
+
+这些步骤共用原 serial-wide state 和 ledger 路径，不能另建 state 绕开停止。close 本身不证明当前设备状态、原 B/misc 后验或 scanner 实机兼容；新六变更也不是本目录的主机测试已完成事实。
+
+## 主机接口与中断
+
+默认只读计划命令：
+
+```sh
+python3 -B tools/e5_partial_deploy_closure_prepare_20261016/closure.py plan
+```
+
+后续经独审、独立单门启用副本才可运行其 `closure.py close`；不得改本准备源。消费端继续固定加载此禁用准备源，仅调用 `validate_closed` / `transport_gate` / `normal_gate` / `augment_snapshot` / `snapshot_gate`，不是启用 close 的副本。receipt 绑定 CASE，不混称二者 source SHA 相同。
+
+主机归档沿用已经审过的 `renamex_np(RENAME_EXCL)` / Linux `renameat2(RENAME_NOREPLACE)`，无普通 rename fallback。先落永久屏障，再原子移走每个 marker；同字节恢复、文件 fsync、archive/其父/state 三层 fsync 均必须成功才有 receipt。残留 `.preparing` 不完整或任何外来状态均拒绝。测试中的 resume 仅证明同一固定主机事务的人工重进语义；产品没有自动重跑。后续 ledger/完成记录有增长或新 marker 后不能再次 close 本案。
+
+旧 6c405 仍被原 PENDING 阻断；b36a 仍被新增永久 TRANSITION 阻断。新消费者必须完整验证两份归档，不把 marker 伪装为 ABSENT；旧 46d 与当前 7d 的 tx/boot 都排除。任何新 ACTIVE/UNCERTAIN/RECOVERY_ONLY、局部 STOP 或 poisoned transport 继续阻断。今后的原 B/BC32 恢复仅用 `RECOVERY_REPAIR_TRANSITION.json` 临时 grant，不移动两个永久屏障，也不扩大原恢复写集。
+
+## 整体包机械衔接
+
+`OVERLAY_MANIFEST.json` 给出七个完整 source overlay 与基底 b36a SHA：transport、boot、uncertainty、workflow、common、stage2、phase_evidence。root 负责拓扑重封核心路径/source pins/cold deps/manifest，并保留所有原包。workflow support 键仍是 `closure`、`closure_case`；新 closure 内部固定旧 closure source SHA，旧模块再验证自己的原 CASE。
+
+stage2 的 OLD_TX/OLD_BOOT 已改为 7d/1f898；增加六个固定只读保留物检查，在新变更前后各执行一次。`phase_evidence.py` 已改 OLD_TX，并严格重放六种 retained 标签的前后两组：前组在首次变更前，后组在唯一成功 scanner 后；每个原始 stat/hash/owner 与固定 CASE 和结果摘要一一对应，拒绝缺项、额外项、乱序、payload 或变更请求；新 native archiver 的 OLD_TX 同字面 delta 及 tmp owner `2000:2000/0771` 由 build agent 提供独立 ARM 产物。runner/observe/evidence_contract 原逻辑不在本 overlay 中改动。新的 scanner/archiver artifact SHA 必须由最终 manifest 固定，不能先用 placeholder 执行。
+
+## 测试范围
+
+- `test_closure.py`：27 项合成主机文件测试，含 10 个中断点及三层 fsync 失败后恢复、原字节保留、外来状态/重复关闭/错误脚本/缺读回拒绝、ledger 前缀与追加链、双 retired 集合。
+- `test_consumers.py`：24 项 fake transport / AST / 主机 fixture 测试，含旧消费者继续阻断、新请求失败继续 UNKNOWN、双 permanent 与 future recovery grant 共存、历史 snapshot 不重贴当前状态、固定旧程序和锁漂移拒绝。future grant 生命周期测试 mock 了原 `_validated_bundle`；不是重新证明其全部实机恢复核准。
+- `test_phase_retained.py`：14 项固定标签/原始数据/时序/摘要负向回归；除部署函数的有限衔接外，原 phase 函数 AST 逐项不变。
+- 实际 `plan` 仅读取固定 case，成功表示这次 STOP 的证据一致；没有运行实际 close 或设备入口。
+
+主机测试不等于手机 scanner/F2FS 断电/恢复已通过；未知和超时仍原地停止，不修改扫描上限或跳过占用检查。

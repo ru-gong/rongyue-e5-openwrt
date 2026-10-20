@@ -1,0 +1,248 @@
+import copy
+import gzip
+import io
+import json
+from pathlib import Path
+import shlex
+import struct
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+import zlib
+import e5_install as e
+
+WORKSPACE = Path(__file__).resolve().parents[2]
+ORIGINAL = WORKSPACE / "evidence/preflight-20261013/recovery-backup-04"
+
+class FakeDevice:
+    """Bytes held in memory only. No transport, device nodes or subprocesses."""
+    def __init__(self, boot, misc, fault=None):
+        self.parts={"boot_b":boot,"misc":misc}
+        self.protected=e.load_profile()["protected_hashes"].copy()
+        self.writes=[]; self.fault=fault; self.staged=False
+    def preflight(self, require_data=True):
+        if require_data and self.fault=="encrypted": raise e.Refusal("encrypted data")
+    def protected_hashes(self): return self.protected.copy()
+    def read(self, part):
+        data=self.parts[part]
+        if self.fault=="short_boot_readback" and self.writes and part=="boot_b": return data[:-1]
+        return data
+    def stage_files(self, bundle, paths):
+        self.staged=True
+        if self.fault=="stage_failure": raise e.Refusal("failed upload")
+        if self.fault=="concurrent_misc": self.parts["misc"]=b"X"+self.parts["misc"][1:]
+    def write_boot_b(self, image, expected_sha256):
+        data=Path(image).read_bytes()
+        e.require(e.digest(data)==expected_sha256,"boot changed before write")
+        self.writes.append("boot_b")
+        if self.fault=="partial_boot":
+            self.parts["boot_b"]=data[:32]+self.parts["boot_b"][32:]
+            raise e.Refusal("disconnect after partial write")
+        self.parts["boot_b"]=data
+        if self.fault=="a_changed": self.protected["boot_a"]="f"*64
+    def write_misc_bc(self, bc):
+        self.writes.append("misc32")
+        data=bytearray(self.parts["misc"]);data[2048:2080]=bc
+        if self.fault=="misc_outside": data[0]^=1
+        if self.fault=="misc_inside": data[2048]^=1
+        self.parts["misc"]=bytes(data)
+
+class CoreTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.boot=(ORIGINAL/"boot_b.full.raw.bin").read_bytes()
+        cls.misc=(ORIGINAL/"misc.full.raw.bin").read_bytes()
+        cls.bc=cls.misc[2048:2080]
+        cls.temp=tempfile.TemporaryDirectory();cls.base=Path(cls.temp.name)
+        cls.image=cls.base/"new-boot.bin"
+        # Synthetic bytes; never a bootable image and never allowed onto hardware.
+        cls.image.write_bytes(b"N"*e.BOOT_BYTES)
+    @classmethod
+    def tearDownClass(cls):cls.temp.cleanup()
+    def bundle(self):
+        return {"artifacts":{"boot":{"sha256":e.file_hash(self.image)}},
+                "approved_boot_b_before_sha256":e.digest(self.boot),
+                "approved_misc_before_sha256":e.digest(self.misc),"approved_bc_before_hex":self.bc.hex()}
+    def attempt(self, fault=None):
+        dev=FakeDevice(self.boot,self.misc,fault)
+        td=tempfile.TemporaryDirectory();self.addCleanup(td.cleanup);dest=Path(td.name)/"run"
+        return dev,dest
+    def test_real_current_crc_and_three_distinct_states(self):
+        self.assertEqual(e.bc_validate(self.bc),self.bc)
+        trial=e.bc_trial(self.bc);a,b=e.runtime_bc_templates(self.bc)
+        self.assertEqual(self.bc[12],0xff);self.assertEqual(trial[12],0xfe)
+        self.assertEqual(a[12],0x9f);self.assertEqual(b[12],0x9e)
+        for x in (trial,a,b): self.assertEqual(struct.unpack_from("<I",x,28)[0],zlib.crc32(x[:28]))
+    def test_bad_crc_rejected(self):
+        b=bytearray(self.bc);b[20]^=1
+        with self.assertRaises(e.Refusal): e.bc_trial(bytes(b))
+    def test_bad_magic_rejected_even_valid_crc(self):
+        b=bytearray(self.bc);b[4]^=1;struct.pack_into("<I",b,28,zlib.crc32(b[:28]))
+        with self.assertRaises(e.Refusal):e.bc_trial(bytes(b))
+    def test_pending_ota_rejected(self):
+        b=bytearray(self.bc);b[12]=0x8e;b[14]=0x0f;struct.pack_into("<I",b,28,zlib.crc32(b[:28]))
+        with self.assertRaises(e.Refusal):e.bc_trial(bytes(b))
+    def test_unknown_verity_and_unsuccessful_A_rejected(self):
+        for index,value in ((12,0x7f),(13,1),(15,1)):
+            b=bytearray(self.bc);b[index]=value;struct.pack_into("<I",b,28,zlib.crc32(b[:28]))
+            with self.assertRaises(e.Refusal):e.bc_trial(bytes(b))
+    def test_success_exact_two_writes_no_reboot(self):
+        dev,dest=self.attempt();e.apply_transaction(dev,self.bundle(),{"boot":self.image},e.load_profile(),dest)
+        self.assertEqual(dev.writes,["boot_b","misc32"])
+        e.misc_changed_only_bc(self.misc,dev.parts["misc"],e.bc_trial(self.bc))
+        events=[json.loads(l)["event"] for l in (dest/"journal.jsonl").read_text().splitlines()]
+        self.assertEqual(events[-1],"COMPLETE_NO_REBOOT")
+        self.assertEqual(events.count("BEGIN_BOOT_B"),1)
+    def test_early_failures_never_write_blocks(self):
+        for fault in ("encrypted","stage_failure","concurrent_misc"):
+            with self.subTest(fault=fault):
+                dev,dest=self.attempt(fault)
+                with self.assertRaises(e.Refusal):e.apply_transaction(dev,self.bundle(),{"boot":self.image},e.load_profile(),dest)
+                self.assertEqual(dev.writes,[])
+    def test_boot_failures_never_arm_misc_or_retry_or_rollback(self):
+        for fault in ("partial_boot","short_boot_readback","a_changed"):
+            with self.subTest(fault=fault):
+                dev,dest=self.attempt(fault)
+                with self.assertRaises(e.Refusal):e.apply_transaction(dev,self.bundle(),{"boot":self.image},e.load_profile(),dest)
+                self.assertEqual(dev.writes,["boot_b"])
+                self.assertEqual(dev.parts["misc"],self.misc)
+                events=(dest/"journal.jsonl").read_text();self.assertIn("STOP_NO_RETRY_NO_ROLLBACK_NO_REBOOT",events)
+    def test_misc_whole_partition_diff_guard_and_bad_readback(self):
+        for fault in ("misc_outside","misc_inside"):
+            with self.subTest(fault=fault):
+                dev,dest=self.attempt(fault)
+                with self.assertRaises(e.Refusal):e.apply_transaction(dev,self.bundle(),{"boot":self.image},e.load_profile(),dest)
+                self.assertEqual(dev.writes,["boot_b","misc32"])
+    def test_reuse_journal_directory_refused(self):
+        dev,dest=self.attempt();dest.mkdir()
+        with self.assertRaises(FileExistsError):e.apply_transaction(dev,self.bundle(),{"boot":self.image},e.load_profile(),dest)
+        self.assertEqual(dev.writes,[])
+    def test_directory_fsync_failure_prevents_block_writes(self):
+        dev,dest=self.attempt()
+        with patch.object(e,"fsync_directory",side_effect=OSError("directory durability unavailable")):
+            with self.assertRaises(OSError):e.apply_transaction(dev,self.bundle(),{"boot":self.image},e.load_profile(),dest)
+        self.assertEqual(dev.writes,[])
+    def test_restore_only_B_and_BC32(self):
+        dev,dest=self.attempt();dev.parts["boot_b"]=self.image.read_bytes()
+        b=bytearray(self.misc);b[2048:2080]=e.bc_trial(self.bc);dev.parts["misc"]=bytes(b)
+        e.restore_transaction(dev,ORIGINAL/"boot_b.full.raw.bin",ORIGINAL/"misc.full.raw.bin",
+                              e.digest(dev.parts["boot_b"]),e.digest(dev.parts["misc"]),dest)
+        self.assertEqual(dev.writes,["boot_b","misc32"])
+        self.assertEqual(dev.parts,{"boot_b":self.boot,"misc":self.misc})
+    def test_restore_stops_on_outside_misc_difference(self):
+        dev,dest=self.attempt();dev.parts["misc"]=b"X"+self.misc[1:]
+        with self.assertRaises(e.Refusal):
+            e.restore_transaction(dev,ORIGINAL/"boot_b.full.raw.bin",ORIGINAL/"misc.full.raw.bin",
+                                  e.digest(dev.parts["boot_b"]),e.digest(dev.parts["misc"]),dest)
+        self.assertEqual(dev.writes,[])
+    def test_transport_hard_gate_precedes_subprocess(self):
+        d=e.AdbBackend(Path(__file__),e.file_hash(__file__),e.load_profile())
+        with patch("e5_install.subprocess.run",side_effect=AssertionError("must not call")):
+            with self.assertRaises(e.Refusal):d.shell("id")
+    def test_live_gate_not_overridden_by_environment(self):
+        with patch.dict("os.environ",{"LIVE_DISABLED":"false","E5_LIVE":"1"}):
+            d=e.AdbBackend(Path(__file__),e.file_hash(__file__),e.load_profile())
+            with patch("e5_install.subprocess.run",side_effect=AssertionError("must not call")):
+                with self.assertRaises(e.Refusal):d.shell("id")
+    def test_su_quote_round_trip_and_binary_transport_flag(self):
+        script="printf '%s' \"$UNTRUSTED\"; echo 'a'\"'\"'b'\ncat /some/file"
+        args=e.adb_shell_argv("/fake adb",script)
+        self.assertEqual(args[:5],["/fake adb","-s",e.SERIAL,"shell","-T"])
+        self.assertEqual(shlex.split(args[5]),[e.SU,"-c","set -eu\n"+script])
+    def test_tampered_profile_refused_before_any_transport(self):
+        p=e.load_profile();p["partitions"]["boot_b"]["node"]="/dev/block/mmcblk0p36"
+        with self.assertRaises(e.Refusal):e.AdbBackend(Path(__file__),e.file_hash(__file__),p)
+    def test_manifest_hash_required(self):
+        p=self.base/"untrusted.json";p.write_text('{"serial":"other"}')
+        with self.assertRaises(e.Refusal):e.pinned_json(p,"0"*64)
+    def test_tar_traversal_and_link_rejected(self):
+        for name,kind in (("../escape",tarfile.REGTYPE),("opt/e5/android/link",tarfile.SYMTYPE),
+                          ("opt/e5/nv/calinv",tarfile.REGTYPE)):
+            t=self.base/"bad.tar"
+            with tarfile.open(t,"w") as tf:
+                x=tarfile.TarInfo(name);x.type=kind;x.linkname="/etc/passwd";tf.addfile(x)
+            with self.assertRaises(e.Refusal):e.safe_tar(t)
+    def test_artifact_path_escape_and_symlink_rejected(self):
+        with self.assertRaises(e.Refusal):e.artifact(self.base,{"path":"../outside"})
+        p=self.base/"linked";p.symlink_to(self.image)
+        with self.assertRaises(e.Refusal):e.artifact(self.base,{"path":"linked"})
+
+class PreflightTests(unittest.TestCase):
+    def device(self, fault=None):
+        p=e.load_profile()
+        class ReadOnlyTranscript(e.AdbBackend):
+            def __init__(self):self.profile=p
+            def protected_hashes(self):return p["protected_hashes"].copy()
+            def shell(self, script, payload=None, timeout=1800):
+                assert payload is None
+                props={"ro.serialno":e.SERIAL,"ro.product.model":"E5","ro.board.platform":"ums9621",
+                       "ro.build.display.id":"TS305_V03_20241128_2301","ro.boot.slot_suffix":"_a",
+                       "ro.boot.verifiedbootstate":"orange","ro.boot.flash.locked":"0"}
+                if script.startswith("getprop "):
+                    key=script[8:];v=props[key]
+                    if fault=="wrong_serial" and key=="ro.serialno":v="ANOTHER_DEVICE"
+                    return (v+"\n").encode()
+                if script=="id -u":return b"0\n"
+                if script.startswith("test -b "):
+                    node=script.split()[2].rstrip(';');item=next(x for x in p["partitions"].values() if x["node"]==node)
+                    dev=item["dev"]
+                    if fault=="wrong_major_minor" and node.endswith("p37"):dev="259:29"
+                    return ("\n".join([node,dev,str(item["bytes"]//512),str(item["start_lba"]),str(item["bytes"])])+"\n").encode()
+                if script.startswith("dd if=/dev/block/mmcblk0 "):
+                    b=(WORKSPACE/"evidence/stage1-20261013/apply-10/pgpt").read_bytes()
+                    return b[:-1] if fault=="short_gpt" else b
+                if script=="cat /proc/mounts":
+                    dev="/dev/block/dm-35" if fault=="mapper" else "/dev/block/mmcblk0p70"
+                    fs="ext4" if fault=="not_f2fs" else "f2fs"
+                    return f"{dev} /data {fs} rw,nosuid 0 0\n".encode()
+                if script.startswith("readlink -f "):return (script[12:]+"\n").encode()
+                raise AssertionError("unexpected command: "+script)
+        return ReadOnlyTranscript()
+    def test_frozen_geometry_and_raw_f2fs_pass(self):self.device().preflight()
+    def test_wrong_serial_geometry_gpt_or_mapper_fail(self):
+        for fault in ("wrong_serial","wrong_major_minor","short_gpt","mapper","not_f2fs"):
+            with self.subTest(fault=fault):
+                with self.assertRaises(e.Refusal):self.device(fault).preflight()
+
+class StagingCodeTests(unittest.TestCase):
+    def test_changed_tar_and_config_refused_before_transfer(self):
+        d=e.AdbBackend(Path(__file__),e.file_hash(__file__),e.load_profile())
+        with tempfile.TemporaryDirectory() as td:
+            for name in ("device-files.tar","openwrt-install.conf"):
+                p=Path(td)/name;p.write_bytes(b"approved")
+                record={"bytes":p.stat().st_size,"sha256":e.file_hash(p)}
+                p.write_bytes(b"modified")
+                with patch.object(d,"shell",side_effect=AssertionError("changed package must not transfer")):
+                    with self.assertRaisesRegex(e.Refusal,"changed after approval"):
+                        d.upload(p,e.REMOTE_STAGE+"/"+name,record)
+    def test_changed_boot_file_refused_before_transport(self):
+        d=e.AdbBackend(Path(__file__),e.file_hash(__file__),e.load_profile())
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"boot"
+            with p.open("wb") as f:f.truncate(e.BOOT_BYTES)
+            approved=e.file_hash(p)
+            with p.open("r+b") as f:f.write(b"changed after approval")
+            with patch.object(d,"shell",side_effect=AssertionError("must not transport changed image")):
+                with self.assertRaisesRegex(e.Refusal,"changed after approval"):d.write_boot_b(p,approved)
+    def test_archive_requires_converted_own_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"raw.tar"
+            with tarfile.open(p,"w") as f:
+                m=tarfile.TarInfo("lib/firmware/wcnmodem.bin");m.size=1;f.addfile(m,io.BytesIO(b"a"))
+            with self.assertRaises(e.Refusal):e.safe_tar(p)
+    def test_backend_block_targets_are_constants(self):
+        # Exercise real command construction without any subprocess/ADB.
+        calls=[]
+        class Capture(e.AdbBackend):
+            def __init__(self):pass
+            def shell(self,script,payload=None,timeout=1800):calls.append((script,len(payload)));return b""
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"boot"
+            with p.open("wb") as f:f.truncate(e.BOOT_BYTES)
+            d=Capture();d.write_boot_b(p,e.file_hash(p));d.write_misc_bc(bytes(32))
+        self.assertIn("of=/dev/block/mmcblk0p37",calls[0][0]);self.assertEqual(calls[0][1],e.BOOT_BYTES)
+        self.assertIn("of=/dev/block/mmcblk0p3 bs=1 seek=2048 count=32",calls[1][0]);self.assertEqual(calls[1][1],32)
+        self.assertFalse(any("p36" in x[0] for x in calls))
+
+if __name__=="__main__": unittest.main(verbosity=2)

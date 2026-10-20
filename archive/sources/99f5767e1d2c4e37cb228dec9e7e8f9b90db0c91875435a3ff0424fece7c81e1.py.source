@@ -1,0 +1,48 @@
+"""Fixed host evidence indexing, no device or shared-state mutations."""
+import hashlib,json,shlex
+from pathlib import Path
+R=Path(__file__).resolve().parents[2];H=Path(__file__).resolve().parent;RUN=R/'evidence/author-closed-fd-install-20261019';STATE=R/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+def sha(p):
+ h=hashlib.sha256()
+ with p.open('rb') as f:
+  for b in iter(lambda:f.read(1<<20),b''):h.update(b)
+ return h.hexdigest()
+def pin(p):assert not p.is_symlink() and p.is_file();return {'bytes':p.stat().st_size,'sha256':sha(p)}
+def rel(p):return str(p.relative_to(R))
+def obj(p):return json.loads(p.read_bytes())
+def operation(p):
+ b=obj(p/'IN_FLIGHT.json');q=shlex.split(b['argv'][-1]);assert q[:2]==['/debug_ramdisk/su','-c'] and len(q)==3
+ return {'folder':rel(p),'script_sha256':hashlib.sha256(q[2].encode()).hexdigest(),**{k:b[k] for k in ('op_id','label','argv_sha256','mutating','payload_bytes','payload_sha256')},'completed':(p/'COMPLETE.json').exists(),'parts':[operation(q) for q in sorted(p.glob('part-*'))]}
+def main():
+ assert not (H/'CASE.json').exists()
+ ledger=R/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl';rows=[json.loads(x) for x in ledger.read_bytes().splitlines()]
+ phases={n:{'directory':rel(RUN/(n+'-execution')),'operations':[operation(p) for p in sorted((RUN/(n+'-execution/transport')).iterdir()) if (p/'IN_FLIGHT.json').exists()]} for n in ('scanner','probe','inventory','backup','stage','resume-stage')}
+ assert [len(x['operations']) for x in phases.values()]==[201,75,374,694,82,65]
+ files={}
+ for phase in phases.values():
+  for p in sorted((R/phase['directory']).rglob('*')):
+   if p.is_file():files[rel(p)]=pin(p)
+ family=R/'tools/e5_activation_bundle_69b2a5b04287f071/RESULT.json';f=obj(family)
+ for p in [family,*[Path(x['path']) for x in f['files'].values()],R/'tools/e5_closed_fd_stop_live_20261019/closure.py',R/'tools/e5_closed_fd_stop_live_20261019/CASE.json',RUN/'NEW_SLOT_STOP_REVIEW.json',RUN/'NEW_SLOT_RAW_REPLAY.json',RUN/'original-e5linux.tar.verified.json',RUN/'HOST_INPUT_FIX_REVIEW.json',RUN/'inventory-execution/active.inventory.json']:
+  files[rel(p)]=pin(p)
+ # Previous fully acknowledged host validation STOP and its exact archival receipt.
+ host_archive=STATE/'host-stage-input-stops/855ae61b90f0f332'
+ for p in host_archive.iterdir():
+  if p.is_file():files[rel(p)]=pin(p)
+ large={rel(RUN/'original-e5linux.tar'):pin(RUN/'original-e5linux.tar')}
+ failed=next((RUN/'resume-stage-execution/transport').glob('*occupancy*'));last=json.loads((failed/'stdout.bin').read_bytes().splitlines()[-1])
+ prior=obj(R/'tools/e5_closed_fd_stop_live_20261019/CASE.json');dep=obj(RUN/'scanner-execution/result/RESULT.json')
+ def statline(row):return '|'.join([format(row['mode_bits'],'x'),*[str(row[k]) for k in ('dev','inode','bytes','mode','uid','gid','nlink','mtime','ctime','mtime_text','ctime_text','rdev_major','rdev_minor')]])
+ retained=[]
+ for x in prior['retained_read_items']:
+  item=dict(x);item['label']=item['label'].replace('retained-latest-','retained-generation5-');retained.append(item)
+ archived=dep['archive'];retained.extend([{'kind':'archive_dir','label':'stage2-retained-latest-archive-old_lock','path':archived,'expected_lines':[statline(dep['lock']['old_lock']),archived+'/owner']},{'kind':'archive_owner','label':'stage2-retained-latest-archive-old_owner','path':archived+'/owner','expected_lines':[statline(dep['lock']['old_owner']),'171634616886fc1a']}])
+ for key,a in sorted(dep['uploads'].items()):
+  line=statline(a['remote_metadata']);retained.append({'kind':'program','label':'stage2-retained-latest-program-'+key,'path':a['remote_path'],'expected_lines':[line,a['artifact']['sha256']+'  '+a['remote_path'],line]})
+ assert len(retained)==30 and len({x['label'] for x in retained})==30
+ c={'schema':'e5-fixed-newslot-stage-stop-case-v1','serial':'DEVICE_SERIAL_REDACTED','txid':'855ae61b90f0f332','boot_id':'00000000-0000-4000-8000-000000000001','state':rel(STATE),'global_lock':'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock','ledger':rel(ledger),'execution':rel(RUN/'resume-stage-execution'),'deployment_execution':rel(RUN/'scanner-execution'),'archive_rel':'new-slot-stage-stop-closures/855ae61b90f0f332','ledger_bytes':ledger.stat().st_size,'ledger_sha256':sha(ledger),'ledger_rows':len(rows),'ledger_head':rows[-1]['chain_sha256'],'files':files,'large_files':large,'phases':phases,'completed_baseline':{p.name:pin(p) for p in sorted((STATE/'completed').iterdir())},'markers':{n:pin(STATE/n) for n in ('ACTIVE.json','UNCERTAIN.json')},'review':{'path':rel(RUN/'NEW_SLOT_STOP_REVIEW.json'),'sha256':sha(RUN/'NEW_SLOT_STOP_REVIEW.json')},'source_family':{'path':rel(family),'sha256':sha(family)},'failed_scanner_result':last,'expected_error':'TransportError: transport failed/uncertain','retained_read_items':retained,'retained_device_state':{'current_owner_txid':'855ae61b90f0f332','current_lock':{k:dict(v,mode_bits=format(v['mode_bits'],'x')) for k,v in dep['lock'].items() if isinstance(v,dict)}},'preserved_partial':obj(R/'tools/e5_host_input_prepare_20261019/CASE.json')['partial']}
+ c['mutations']=[{k:x[k] for k in ('label','op_id','payload_bytes','payload_sha256')} for group in phases.values() for x in group['operations'] if x['mutating']]
+ assert len(c['mutations'])==11
+ raw=(json.dumps(c,sort_keys=True,separators=(',',':'))+'\n').encode();(H/'CASE.json').write_bytes(raw)
+ print(json.dumps({'case_sha256':hashlib.sha256(raw).hexdigest(),'files':len(files),'pinned_gib':sum(x['bytes'] for x in files.values())/(1<<30),'completions':len(c['completed_baseline']),'mutations':len(c['mutations'])}))
+if __name__=='__main__':main()

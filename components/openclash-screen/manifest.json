@@ -1,0 +1,9 @@
+{
+  "id": "openclash",
+  "api_version": 2,
+  "version": "1.1.1-local",
+  "name": {"zh": "OpenClash", "en": "OpenClash"},
+  "description": {"zh": "模式、节点与延迟", "en": "Modes, nodes and latency"},
+  "entry": "index-1.1.1.html",
+  "order": 10
+}

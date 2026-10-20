@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Independent bounded READ-ONLY capture. Default plan never starts ADB.
+
+Only the explicit capture subcommand creates a host evidence directory and
+uses the pinned shell -T transport. No device output files, uploads, lock,
+mount, AT, reboot, restore or write command exists. No automatic retry.
+"""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import shlex
+import signal
+import stat
+import subprocess
+import time
+
+ROOT = Path(__file__).resolve().parents[2]
+SERIAL = "DEVICE_SERIAL_REDACTED"
+BOOT_ID = "00000000-0000-4000-8000-000000000001"
+ADB = Path("/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb")
+ADB_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+PROFILE = ROOT / "tools/e5_android_install_live_20261013/device-profile.json"
+PROFILE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+SU = "/debug_ramdisk/su"
+BB = "/data/adb/magisk/busybox"
+DIRECTORY = "/data/e5linux"
+CHUNK = 4 << 20
+MAX_CHUNK = 16 << 20
+DEADLINE = 8.0
+STDERR_LIMIT = 16384
+METADATA_LIMIT = 1 << 20
+MAX_FILES = 4096
+MAX_DIRECTORY_BYTES = 16 << 30
+STAT_FORMAT = "%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T"
+TARGETS = {"gpt-prefix": ("/dev/block/mmcblk0", 32768),
+           "boot_b": ("/dev/block/mmcblk0p37", 67108864),
+           "misc": ("/dev/block/mmcblk0p3", 1048576)}
+PROTECTED = {"trustos_a":(4,6291456),"trustos_b":(5,6291456),"uboot_a":(8,3145728),"uboot_b":(9,3145728),
+             "vbmeta_a":(49,1048576),"vbmeta_b":(50,1048576),"init_boot_a":(40,8388608),"init_boot_b":(41,8388608),
+             "sml_a":(6,1048576),"sml_b":(7,1048576),"teecfg_a":(32,1048576),"teecfg_b":(33,1048576),"boot_a":(36,67108864)}
+TARGETS.update({k:(f"/dev/block/mmcblk0p{v[0]}",v[1]) for k,v in PROTECTED.items()})
+
+
+class Stop(RuntimeError):
+    pass
+
+
+def require(value, why):
+    if not value: raise Stop(why)
+
+
+def sha(data): return hashlib.sha256(data).hexdigest()
+def now(): return datetime.now(timezone.utc).isoformat()
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def hash_file(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for data in iter(lambda: f.read(1 << 20), b""): h.update(data)
+    return h.hexdigest()
+
+
+def fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def save(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data); f.flush(); os.fsync(f.fileno())
+    fsync_dir(path.parent)
+
+
+def save_json(path, obj): save(path, canonical(obj) + b"\n")
+
+
+def profile():
+    require(not PROFILE.is_symlink() and sha(PROFILE.read_bytes()) == PROFILE_SHA, "profile changed")
+    p = json.loads(PROFILE.read_bytes())
+    require(p["serial"] == SERIAL, "profile serial")
+    require(set(p["protected_hashes"])==set(PROTECTED),"protected scope differs")
+    for name in TARGETS.keys()-{"gpt-prefix"}:
+        require((p["partitions"][name]["node"], p["partitions"][name]["bytes"]) == TARGETS[name], "profile target mismatch")
+    return p
+
+
+def guard():
+    return f'''set -eu
+set -o pipefail
+test "$(id -u)" = 0
+test "$(getprop ro.serialno)" = {SERIAL}
+test "$(getprop ro.product.model)" = E5
+test "$(getprop ro.board.platform)" = ums9621
+test "$(getprop ro.build.display.id)" = TS305_V03_20241128_2301
+test "$(getprop ro.boot.slot_suffix)" = _a
+test "$(getprop sys.boot_completed)" = 1
+test "$(getprop gsm.sim.state)" = ABSENT,ABSENT
+test "$(cat /proc/sys/kernel/random/boot_id)" = {BOOT_ID}
+test "$(getprop ro.boot.verifiedbootstate)" = orange
+test "$(getprop ro.boot.flash.locked)" = 0
+test ! -L /data
+test "$(readlink -f /dev/block/by-name/userdata)" = /dev/block/mmcblk0p70
+test "$(cat /sys/class/block/mmcblk0p70/dev)" = 259:63
+source=$(awk '$2=="/data" {{print $1}}' /proc/mounts)
+case "$source" in /dev/block/by-name/userdata|/dev/block/mmcblk0p70) ;; *) exit 81;; esac
+test "$(readlink -f "$source")" = /dev/block/mmcblk0p70
+test "$(awk '$2=="/data" {{print $3}}' /proc/mounts)" = f2fs
+awk '$2=="/data" && $4 ~ /(^|,)rw(,|$)/ {{ok++}} END {{exit !(ok==1)}}' /proc/mounts
+'''
+
+
+def inactive():
+    return f'''test ! -L {DIRECTORY}; test -d {DIRECTORY}
+test "$(readlink -f {DIRECTORY})" = {DIRECTORY}
+for f in /sys/block/loop*/loop/backing_file; do
+ test -e "$f" || continue
+ b=$(cat "$f")
+ case "$b" in *e5linux*) exit 82;; esac
+done
+for ns in /proc/[0-9]*/mountinfo; do
+ test -f "$ns" || exit 83
+ awk '{{print $4; print $5}}' "$ns" | while IFS= read -r p; do
+  case "$p" in *e5linux*) exit 84;; esac
+ done
+done
+for f in /proc/[0-9]*/fd/*; do
+ test -L "$f" || continue
+ b=$(readlink "$f") || exit 85
+ case "$b" in {DIRECTORY}|{DIRECTORY}/*) exit 86;; esac
+done
+'''
+
+
+def safe_relative(name):
+    require(isinstance(name, str) and (name == "." or re.fullmatch(r"\./[A-Za-z0-9_./-]+", name)) and
+            ".." not in name.split("/") and "//" not in name, "unsafe directory name")
+    return name
+
+
+def parse_stat(raw):
+    fields = raw.decode("ascii").split("|")
+    require(len(fields) == 14, "invalid stat fields")
+    mode = int(fields[0], 16)
+    obj = {"mode_bits": mode, "dev": int(fields[1]), "inode": int(fields[2]), "bytes": int(fields[3]),
+           "mode": fields[4], "uid": int(fields[5]), "gid": int(fields[6]), "nlink": int(fields[7]),
+           "mtime": fields[8], "ctime": fields[9], "mtime_text": fields[10], "ctime_text": fields[11],
+           "rdev_major": int(fields[12],16), "rdev_minor": int(fields[13],16)}
+    require(all(obj[k] >= 0 for k in ("dev", "inode", "bytes", "uid", "gid", "nlink")), "negative stat")
+    obj["type"] = "f" if stat.S_ISREG(mode) else "d" if stat.S_ISDIR(mode) else "b" if stat.S_ISBLK(mode) else "unsupported"
+    return obj
+
+
+def inventory_script():
+    return guard() + inactive() + f'''printf 'BOOT\\0%s\\0' "$(cat /proc/sys/kernel/random/boot_id)"
+cd {DIRECTORY}
+{BB} find . -xdev -print0 | {BB} sort -z | while IFS= read -r -d '' f; do
+ case "$f" in *[!a-zA-Z0-9_./-]*) exit 87;; esac
+ test ! -L "$f"
+ if test -f "$f"; then test "$(stat -c %h "$f")" = 1
+ elif test -d "$f"; then :
+ else exit 88; fi
+ printf '%s\\0' "$f"
+ stat -c '{STAT_FORMAT}' "$f" | tr -d '\\n'
+ printf '\\0'
+done
+printf 'END\\0%s\\0' "$(cat /proc/sys/kernel/random/boot_id)"
+'''
+
+
+def parse_inventory(raw):
+    fields = raw.split(b"\0")
+    require(fields[-1] == b"" and fields[:2] == [b"BOOT", BOOT_ID.encode()] and
+            fields[-3:-1] == [b"END", BOOT_ID.encode()], "inventory envelope/boot mismatch")
+    items = fields[2:-3]; require(len(items) % 2 == 0 and len(items) <= MAX_FILES * 2, "inventory count")
+    rows = []
+    for i in range(0, len(items), 2):
+        row = {"path": safe_relative(items[i].decode("ascii")), **parse_stat(items[i+1])}
+        require(row["type"] in ("f", "d") and (row["type"] != "f" or row["nlink"] == 1), "unsafe tree type/link")
+        rows.append(row)
+    require(rows and rows[0]["path"] == "." and rows[0]["type"] == "d", "tree root missing")
+    require(len({r["path"] for r in rows}) == len(rows) and len({r["dev"] for r in rows}) == 1, "duplicate path or crossed filesystem")
+    require(sum(r["bytes"] for r in rows if r["type"] == "f") <= MAX_DIRECTORY_BYTES, "directory too large")
+    return rows
+
+
+def allowed_path(kind, name=None):
+    if kind in TARGETS:
+        require(name is None, "block path override forbidden")
+        return TARGETS[kind][0]
+    require(kind == "file", "unknown capture kind")
+    safe_relative(name); require(name != ".", "cannot read directory as a file")
+    return DIRECTORY + "/" + name[2:]
+
+
+def read_script(kind, offset, length, name=None, hash_only=False):
+    p = allowed_path(kind, name)
+    require(type(offset) is int and type(length) is int and offset >= 0 and offset % 4096 == 0 and
+            0 < length <= MAX_CHUNK, "read bounds")
+    if kind in TARGETS: require(offset + length <= TARGETS[kind][1], "block range exceeds allowlist")
+    # Each data chunk performs the full no-user check. Its immediately following
+    # independent hash repeats boot/path/stat; end inventory repeats no-user.
+    pre = guard() + (inactive() if kind == "file" and not hash_only else "")
+    pre += f'test ! -L {p}; test "$(readlink -f {p})" = {p}\n'
+    if kind == "file": pre += f'test -f {p}; test "$(stat -c %h {p})" = 1\n'
+    else: pre += f'test -b {p}\n'
+    # skip uses fixed 4096-byte blocks; count_bytes handles exact final bytes.
+    hash_pipe = f" | {BB} sha256sum" if hash_only else ""
+    return pre + f'''printf 'META\\t%s\\t%s\\t{offset}\\t{length}\\t' "$(cat /proc/sys/kernel/random/boot_id)" "$(readlink -f {p})"
+stat -c '{STAT_FORMAT}' {p}
+{BB} dd if={p} bs=4096 skip={offset//4096} count={length} iflag=count_bytes status=none{hash_pipe}
+printf '\\nEND\\t%s\\t%s\\t{offset}\\t{length}\\t' "$(cat /proc/sys/kernel/random/boot_id)" "$(readlink -f {p})"
+stat -c '{STAT_FORMAT}' {p}
+'''
+
+
+def decode_read(raw, kind, length, name=None, *, offset, requested_length):
+    first, sep, rest = raw.partition(b"\n")
+    require(sep and len(rest) >= length + 1, "short/missing binary envelope")
+    payload, trailer = rest[:length], rest[length:]
+    require(trailer.startswith(b"\nEND\t") and trailer.endswith(b"\n") and trailer.count(b"\n") == 2,
+            "binary framing/PTY corruption")
+    before = first.split(b"\t", 5); after = trailer[1:-1].split(b"\t", 5)
+    require(len(before) == len(after) == 6 and before[0] == b"META" and after[0] == b"END" and
+            before[1:] == after[1:] and before[1] == BOOT_ID.encode() and
+            before[2].decode() == allowed_path(kind, name) and before[3]==str(offset).encode() and
+            before[4]==str(requested_length).encode(), "boot/readlink/range/stat changed during read")
+    meta = parse_stat(before[5]); require(meta["type"] == ("f" if kind == "file" else "b"), "read target type")
+    if kind == "file": require(meta["nlink"] == 1, "file hardlinked")
+    return payload, meta
+
+
+def collect_process(argv, limit, *, popen=subprocess.Popen, clock=time.monotonic, selector=selectors.DefaultSelector):
+    """Bound stdout/stderr in memory; kill host child on any deadline/limit.
+
+    Killing ADB does not prove termination of an uninterruptible remote read.
+    A failure is terminal for this run and never retried.
+    """
+    started = clock(); proc = popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    sel = selector(); streams = {"stdout": bytearray(), "stderr": bytearray()}; failure = None
+    try:
+        for label, pipe in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            os.set_blocking(pipe.fileno(), False); sel.register(pipe, selectors.EVENT_READ, label)
+        while sel.get_map():
+            remaining = DEADLINE - (clock() - started)
+            if remaining <= 0: failure = "deadline"; break
+            for key, _ in sel.select(min(remaining, .1)):
+                block = os.read(key.fileobj.fileno(), 65536)
+                if not block: sel.unregister(key.fileobj); continue
+                maximum = limit if key.data == "stdout" else STDERR_LIMIT
+                room = maximum - len(streams[key.data])
+                streams[key.data].extend(block[:max(0, room)])
+                if len(block) > room: failure = "output_limit"; break
+            if failure: break
+        if failure: proc.kill()
+        try: proc.wait(timeout=max(.001, DEADLINE-(clock()-started)) if not failure else 1)
+        except subprocess.TimeoutExpired:
+            failure = "deadline"; proc.kill(); proc.wait(timeout=1)
+    except Exception as exc:
+        failure = "transport_exception: " + type(exc).__name__ + ": " + str(exc)
+        if proc.poll() is None:
+            proc.kill()
+            try: proc.wait(timeout=1)
+            except subprocess.TimeoutExpired: pass
+    finally:
+        sel.close(); proc.stdout.close(); proc.stderr.close()
+        if proc.poll() is None: proc.kill()
+    return {"stdout": bytes(streams["stdout"]), "stderr": bytes(streams["stderr"]),
+            "returncode": proc.returncode, "failure": failure, "elapsed_seconds": clock()-started}
+
+
+def status_probe_script():
+    return guard()+"printf 'E5_STDOUT_PROBE\\n'\nprintf 'E5_STDERR_PROBE\\n' >&2\nexit 37\n"
+
+
+class Capture:
+    def __init__(self, output, *, runner=collect_process, chunk_bytes=CHUNK):
+        self.output = Path(output); self.runner = runner; self.index = 0
+        require(chunk_bytes in (4<<20,16<<20),"only reviewed chunk choices")
+        self.chunk_bytes=chunk_bytes
+        self.profile = profile()
+        require(self.output.is_absolute() and not self.output.is_symlink() and
+                all(not p.is_symlink() for p in self.output.parents), "unsafe host output")
+        require(ADB.is_file() and not ADB.is_symlink() and hash_file(ADB) == ADB_SHA, "ADB changed")
+        self.output.mkdir(mode=0o700, exist_ok=False); fsync_dir(self.output.parent)
+        save_json(self.output / "plan.json", plan())
+
+    def query(self, label, script, limit, *, calibration=False):
+        self.index += 1; stem = f"{self.index:05d}-{label}"
+        require(re.fullmatch(r"[0-9A-Za-z_-]+", stem) and 0 < limit <= MAX_CHUNK + 4096, "request bounds")
+        require(not calibration or (label=="transport-status-probe" and script==status_probe_script()),"invalid special calibration")
+        save(self.output / (stem + ".sh.txt"), script.encode())
+        argv = [str(ADB), "-s", SERIAL, "shell", "-T", SU + " -c " + shlex.quote(script)]
+        try: result = self.runner(argv, limit)
+        except Exception as exc:
+            result={"stdout":b"","stderr":b"","returncode":None,"failure":"spawn_or_transport_exception: "+repr(exc),"elapsed_seconds":None}
+        for stream in ("stdout", "stderr"): save(self.output / (stem + "." + stream), result[stream])
+        meta = {k:v for k,v in result.items() if k not in ("stdout", "stderr")}
+        meta.update(label=label, captured_at=now(), script_sha256=sha(script.encode()), stdout_bytes=len(result["stdout"]),
+                    stdout_sha256=sha(result["stdout"]), stderr_bytes=len(result["stderr"]), limit=limit, deadline=DEADLINE,
+                    device_write_commands=False, automatic_retry=False)
+        save_json(self.output / (stem + ".json"), meta)
+        expected_exit=37 if calibration else 0
+        expected_stderr=b"E5_STDERR_PROBE\n" if calibration else b""
+        require(len(result["stdout"])<=limit and len(result["stderr"])<=STDERR_LIMIT and
+                result["failure"] is None and result["returncode"] == expected_exit and result["stderr"]==expected_stderr and
+                (not calibration or result["stdout"]==b"E5_STDOUT_PROBE\n"),
+                "read failed; partial evidence preserved; remote completion unknown; no retry")
+        return result["stdout"]
+
+    def read(self, kind, offset, length, name=None):
+        raw = self.query("read-"+kind, read_script(kind,offset,length,name), length+4096)
+        data,meta=decode_read(raw,kind,length,name,offset=offset,requested_length=length)
+        if kind in TARGETS and kind!="gpt-prefix":
+            require(f'{meta["rdev_major"]}:{meta["rdev_minor"]}'==self.profile["partitions"][kind]["dev"],"block rdev changed")
+        return data,meta
+
+    def geometry(self):
+        script=guard(); expected=[]
+        for name in sorted(self.profile["partitions"]):
+            row=self.profile["partitions"][name]; leaf=row["node"].rsplit("/",1)[1]
+            script+=f'readlink -f /dev/block/by-name/{name}\ncat /sys/class/block/{leaf}/dev\ncat /sys/class/block/{leaf}/start\ncat /sys/class/block/{leaf}/size\n'
+            expected += [row["node"],row["dev"],str(row["start_lba"]),str(row["bytes"]//512)]
+        script+=f'test "$(cat /proc/sys/kernel/random/boot_id)" = {BOOT_ID}\n'
+        require(self.query("geometry",script,32768).decode().splitlines()==expected,"geometry changed")
+
+    def transport_probe(self):
+        self.query("transport-status-probe",status_probe_script(),256,calibration=True)
+        first,_=self.read("misc",0,4096);second,_=self.read("misc",0,4096)
+        script=guard()+f'{BB} dd if=/dev/block/mmcblk0p3 bs=4096 count=1 status=none | {BB} sha256sum\ntest "$(cat /proc/sys/kernel/random/boot_id)" = {BOOT_ID}\n'
+        remote=self.query("binary-transport-proof",script,256)
+        require(re.fullmatch(rb"[0-9a-f]{64}  -\n",remote) and first==second and remote[:64].decode()==sha(first),
+                "binary transport or misc changed; stop")
+        save_json(self.output/"transport-proof.json",{"bytes":4096,"sha256":sha(first),"double_read_equal":True,"remote_hash_equal":True})
+
+    def capture_object(self, kind, length, destination, name=None, expected_stat=None):
+        path=self.output/destination; fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+        h=hashlib.sha256(); identity=None
+        with os.fdopen(fd,"wb") as f:
+            for offset in range(0,length,self.chunk_bytes):
+                amount=min(self.chunk_bytes,length-offset)
+                data,meta=self.read(kind,offset,amount,name)
+                require(identity is None or meta==identity,"target metadata changed between chunks")
+                if expected_stat is not None: require(meta==expected_stat,"file changed since inventory")
+                verified=self.query("verify-"+kind,read_script(kind,offset,amount,name,hash_only=True),4096)
+                hash_line,again=decode_read(verified,kind,68,name,offset=offset,requested_length=amount)
+                require(again==meta and re.fullmatch(rb"[0-9a-f]{64}  -\n",hash_line) and
+                        hash_line[:64].decode()==sha(data),"independent bounded chunk hash mismatch")
+                identity=meta; h.update(data); f.write(data); f.flush(); os.fsync(f.fileno())
+            f.flush();os.fsync(f.fileno())
+        fsync_dir(path.parent)
+        return {"kind":kind,"source":allowed_path(kind,name),"host_file":destination,"bytes":length,"sha256":h.hexdigest(),"stat":identity or expected_stat,
+                "independent_remote_chunk_hashes_verified":True}
+
+    def run(self, phase="all"):
+        require(phase in ("probe","blocks","directory","all"),"unknown phase")
+        results=[]
+        self.geometry(); self.transport_probe()
+        selected=TARGETS if phase in ("blocks","all") else {"gpt-prefix":TARGETS["gpt-prefix"]}
+        for name in selected:
+            item=self.capture_object(name,TARGETS[name][1],name+".bin")
+            if name=="gpt-prefix":require(item["sha256"]==self.profile["gpt_prefix_sha256"],"GPT fingerprint changed")
+            if name in PROTECTED:require(item["sha256"]==self.profile["protected_hashes"][name],"protected partition hash differs: "+name)
+            results.append(item)
+        if phase=="probe":
+            results.append(self.capture_object("boot_b",self.chunk_bytes,"boot_b-probe.bin"))
+        if phase in ("directory","all"):
+            raw=self.query("inventory-before",inventory_script(),METADATA_LIMIT); rows=parse_inventory(raw)
+            save_json(self.output/"inventory-before.json",rows)
+            require(os.statvfs(self.output).f_bavail*os.statvfs(self.output).f_frsize >
+                    2*sum(r["bytes"] for r in rows if r["type"]=="f")+(64<<20),"insufficient Mac space for files plus raw evidence")
+            for i,row in enumerate(rows):
+                if row["type"]=="f":
+                    expected={k:v for k,v in row.items() if k!="path"}
+                    results.append(self.capture_object("file",row["bytes"],f"directory-file-{i:04d}.bin",row["path"],expected))
+            after=parse_inventory(self.query("inventory-after",inventory_script(),METADATA_LIMIT))
+            save_json(self.output/"inventory-after.json",after)
+            require(after==rows,"directory changed during capture; no complete claim")
+        self.geometry()
+        save_json(self.output/"COMPLETE.json",{"schema":"e5-readonly-capture-v1","boot_id":BOOT_ID,"serial":SERIAL,"files":results,
+                   "requests":self.index,"device_writes":False,"full_directory":phase in ("directory","all"),
+                   "phase":phase,"chunk_bytes":self.chunk_bytes,
+                   "exterior_xattr_acl_selinux_backup":False,"not_a_point_in_time_filesystem_snapshot":True})
+        return results
+
+
+def plan():
+    return {"schema":"e5-readonly-capture-plan-v1","serial":SERIAL,"boot_id":BOOT_ID,"adb_sha256":ADB_SHA,"profile_sha256":PROFILE_SHA,
+            "block_reads":TARGETS,"directory":DIRECTORY,"default_chunk_bytes":CHUNK,"maximum_chunk_bytes":MAX_CHUNK,"per_request_seconds":DEADLINE,
+            "default":"plan only","execution_subcommand":"capture","writes_on_device":[],"automatic_retry":False,
+            "limits":["metadata/content consistency checks are not an atomic filesystem snapshot","exterior xattr/ACL/SELinux are not reconstructed",
+                      "reading may expose normal OS access accounting; no explicit device writes","host timeout cannot prove remote blocked read termination"]}
+
+
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__);sub=parser.add_subparsers(dest="command")
+    sub.add_parser("plan");live=sub.add_parser("capture")
+    live.add_argument("--output",type=Path,required=True);live.add_argument("--phase",choices=("probe","blocks","directory","all"),required=True)
+    live.add_argument("--chunk-mib",type=int,choices=(4,16),default=4)
+    args=parser.parse_args(argv)
+    if args.command!="capture": print(json.dumps(plan(),indent=2));return 0
+    def interrupted(signum, frame):
+        raise Stop("operator signal "+str(signum)+"; stop without retry")
+    signal.signal(signal.SIGINT,interrupted);signal.signal(signal.SIGTERM,interrupted)
+    cap=None
+    try:
+        cap=Capture(args.output,chunk_bytes=args.chunk_mib<<20);cap.run(args.phase);return 0
+    except Exception as exc:
+        if cap is not None:save_json(cap.output/"STOP.json",{"at":now(),"reason":str(exc),"no_retry":True,"complete":False})
+        print(str(exc));return 2
+
+
+if __name__=="__main__":raise SystemExit(main())

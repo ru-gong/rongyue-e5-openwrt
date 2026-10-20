@@ -1,0 +1,54 @@
+# 固定只读拒绝的主机结案工具（默认禁用）
+
+仅处理事务 `46d941e4703744fa` / boot `00000000-0000-4000-8000-000000000001` 的本机 `snapshot metadata: tmp` 拒绝。该事务的 62 个请求已逐项独审：22 次读、22 次 SHA、17 次几何、1 次旧锁状态；最后一个请求完整返回，主机属性约束不匹配。它不是一次已完成部署。
+
+本目录只包含 Mac 主机工具、精确证据清单、受限消费补丁和主机临时文件测试。没有设备、ADB、USB、SSH、VM 操作。原冻结工具、实际原始证据、ACTIVE/UNCERTAIN、boot ledger 均未改动。这里的“零写入”指本次工具没有发出设备修改命令，不包括 Android 自身背景活动。
+
+## 实际操作边界
+
+`closure.py plan` 是默认入口，只读取并完整验证固定证据。`closure.py close` 默认在取得锁或修改状态之前拒绝。必须另有独立审核的单门启用副本才可进行**纯主机**结案；本目录不生成它。
+
+```sh
+python3 -B /REDACTED_HOST_PATH plan
+```
+
+完整验证绑定 CASE 内冻结脚本/argv/raw/回执/旧源/请求/独审，完整执行目录清单、当前两 marker 原字节、全部 469 个既有 completed 回执，以及精确旧账本。不是从一个 `mutating:false` 布尔推断只读。本案 402 项主要材料约 178 MB；仅结案/显式重入全量读取。后续每请求 guard 只检查固定 CASE、专用收据、归档 marker、账本前缀及完整链；不反复读取大块 stdout，不依赖缓存。
+
+## 结案协议
+
+1. 取得既有全局设备锁，再取得同一 serial 的 STATE/LOCK；只接受原路径，不允许新建另一 state 绕过。
+2. 验证完整原案。创建并持久化 `RECOVERY_PENDING.json`，其专用 schema 为 `e5-readonly-closure-barrier-v1`。**永久保留此文件**，所有旧消费者因此继续拒绝。
+3. 在同一 state 内建立 `readonly-closures/46d941e4703744fa/`，保存原账本前缀副本；使用 macOS `renamex_np(RENAME_EXCL)` 或 Linux `renameat2(RENAME_NOREPLACE)` 原子无覆盖移动原 ACTIVE/UNCERTAIN。没有普通 rename/mv 回退。
+4. 核对原字节、证据和账本仍一致，成功 fsync 归档目录、其父目录与 state 三层后，才提交 `READONLY_ABORT_ARCHIVED_NOT_DEPLOYED.json`。不创建部署 COMPLETE、不清错误、不改 boot ledger、不移动任何设备文件。
+5. 任一失败保留当前状态。显式重新运行只允许核对同一个案/归档进度；部分或异物文件、额外操作、账本变化、completed 增长、标记身份变化都拒绝。读到相同字节不能代替 fsync：重入重新同步已存在文件的父目录，以及提交收据前的全部三层目录。成功的 host-only 结案也不证明设备稳定或扫描器通过。
+
+归档 inode 与 no-replace 检查依赖唯一操作者和共享锁；不声称能抵御另一个恶意 root 并发替换路径。Python 信号与原子 rename 交界发生中断，下一次只从已保存路径和字节判断，不自动撤销或设备重试。
+
+## 新消费者接口与旧请求隔离
+
+外部源码固定为本目录**禁用版** `closure.py`，以及固定 CASE。纯读取验证函数不受结案写门影响：
+
+- `validate_closed(state, ledger)`：检查专用永久屏障、完整归档和收据；账本必须保留原精确前缀，允许追加合法链记录。不代表普通状态。
+- `assert_new_identity(view, boot, tx)`：拒绝本案旧 boot、旧 tx；不接受自由批准布尔。
+- `transport_gate(...)`：以上检查加新身份、拒绝 `RECOVERY_TRANSITION.json`。**不豁免任何新 ACTIVE/UNCERTAIN/RECOVERY_ONLY 或内存 poison。** 原 transport 锁/模式逻辑继续处理它们。
+- `normal_gate(...)`：当前无新操作/恢复屏障，当前账本最新事件必须 COMPLETE。
+- `augment_snapshot(...)`：保留实际 closure-PENDING binding；将本案 boot/tx 加入永久 excluded/used。
+- `snapshot_gate(..., normal=...)`：验证历史 snapshot 自身的闭包/账本绑定，不把旧 snapshot 替换成当前状态。历史正常 snapshot 不等于当前正常；调用方的实时相等/新 cold/900 秒或 directory 专用期限检查照旧。
+
+未来受限原件恢复仍只允许 B 和 BC32。它使用**单独** `RECOVERY_TRANSITION.json` 作为过渡屏障，转成 RECOVERY_ONLY；不会移动永久 closure-PENDING。新消费者均识别这个过渡标记。旧恢复工具必须禁用，因其仍使用同名 PENDING 协议。局部执行目录的 STOP/UNKNOWN 检查没有豁免。
+
+`OVERLAY_MANIFEST.json` 提供 6 个完整、默认禁用的消费者源文件及原源 SHA，`consumer-overlay.patch` 展示差异：core 的 transport/boot/workflow/recovery transition，recovery/common，scanner/stage2_deploy。观察器与证据校验器的原生产字节没有修改。workflow 新增 `closure`、`closure_case` supporting bindings（均 `{path,sha256,bytes}`）；其他清单可记录同样字段。新包必须拓扑重封源码/pins，独审整个组合；不能把 overlay 原样直接当已激活包。
+
+scanner 的 tmp UID 兼容修正由集成者叠加另一份已审的唯一 tuple 修正，不属于本补丁。先保留所有原件，再产生新包。最近实际 cold COMPLETE 的完整历史重放须在新重封包验证；其旧 raw 只用于排除历史 boot，不能改贴当前 lease/批准。
+
+## 单门启用副本（供之后独审）
+
+结案执行副本只复制 `closure.py` 与 CASE 到独立 tools 子目录，将 `HOST_CLOSURE_ENABLED = False` 改为 `True`，其他源/CASE 逐字节相同；单独记录两源 SHA、字面 diff、用户授权及独审。它的源 SHA 与消费者引用的禁用版 SHA **不是同一个**。收据绑定相同 CASE，不冒充启用/禁用源码哈希相同。消费者始终验证本目录的禁用版；所以执行入口启用不需要再次改消费者 pin。
+
+现有工具没有收到结案执行，当前实际 markers 仍原位。后续还必须通过用户物理配合的新 boot、新 tx、完整当前只读证据、修复扫描器验证等原安装门；本收据不是设备批准令牌。
+
+## 本地验证
+
+`test_closure.py` 使用 Mac 临时目录，覆盖原字节、双锁、原生 no-replace、错误/篡改、逐阶段中断、部分文件、marker/receipt fsync 故障、未来账本追加和旧请求拒绝。`test_consumers.py` 只使用 fake transport 和主机临时状态，覆盖新正常操作/新 UNKNOWN、旧消费者拒绝、新恢复 transition 保留闭包、snapshot 历史语义与禁用门。导入前审计钩子拒绝进程/网络。
+
+未来恢复测试 mock 其已经独审的 bundle 核准函数，只验证新旧屏障共存的 host transition 生命周期；不声称重做了真实恢复核准或设备写入。没有 Linux/F2FS/设备实验；本次需要的是 Mac 主机文件归档，无新增 ARM 成品。

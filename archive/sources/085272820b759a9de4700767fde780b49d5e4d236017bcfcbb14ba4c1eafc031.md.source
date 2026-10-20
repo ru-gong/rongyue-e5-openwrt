@@ -1,0 +1,35 @@
+# 最终任务身份检查：诊断修订准备版
+
+仅修复最终 `/proc/PID/stat` 检查覆盖原始 errno 的问题。它不是扫描通过条件的放宽，也不是本轮停止原因的确认。
+
+原现场 `detail=stat-read` 说明最后一次检查未成功解析 stat；原代码随后统一写入 ESTALE，原始 errno 已不可恢复。因此现有证据不能证明 PID 复用，也不能区分正常退出、权限错误或其他读取失败。
+
+本版仅从 `tools/e5_scanner_kcmp_prepare_20261016` 复制 C 源和两份测试，原始 SHA 见 `INPUTS.json`。旧包、原清单、设备状态及 ledger 均未修改。
+
+## 修订范围
+
+- 最终读取 ENOENT/ESRCH：保留 errno，标记 `final-pid-gone-unknown`，记录 gone；仍立即 rc70。
+- 其他读取或解析错误：保留 errno 和原 `detail`，区分 read-error / parse-error。
+- deadline / cancel：分别保留 ETIMEDOUT / ECANCELED，不归为任务消失。
+- 只有 stat 完整解析成功才比较 starttime，或识别 Z/X；两者分别报告 start-drift / not-live，仍立即 rc70。
+- 新增三个诊断字段 `final_stat_expected_starttime`、`final_stat_observed_starttime`、`final_stat_observed_state`。读取/解析未成功时 observed 为 null，不能误解为观测到了 0。正常成功或其他检查阶段均为 null。
+
+扫描任务集合、KCMP 去重、逐任务 cwd/root/namespace/final 身份复核、FD/读量上限、native 7 秒期限合同均未改。原框架的远端 6 秒和主机 8 秒不在本补丁内，未改。没有重试、忽略消失、自动清理或接受未知状态。
+
+`DEVICE_EXECUTION_ENABLED=0` 保持。新增 fault 分支仅在 `E5_SCANNER_HOST_TEST` 编译内存在，不进入生产路径。
+
+## 本地验证
+
+在本目录运行：
+
+```sh
+python3 -B -m unittest -v test_native_occupancy_scanner test_kcmp test_final_identity_diagnostics
+```
+
+沿用测试审计钩子：只允许 Mac 本地编译器和临时测试二进制，禁止网络及其他子进程。测试在 `/tmp/e5-native-test-*/sandbox` 的合成 proc/sys/data 中运行。原套件也编译默认禁用的 Mac Mach-O，只验证生产门拒绝；这不是 Android ELF 构建。
+
+新增 15 个用例涵盖 ENOENT、ESRCH、EACCES、EIO、真实缺失 fixture 文件、格式/字段/PID 解析错误、starttime 变化、Z/X、实际取消处理、期限失败及正常路径。旧 89 个用例保持原字节；Mac 的四个 Linux syscall/child cleanup 用例按原规则跳过。准确结果见 `TEST_RESULTS.json` 和 `tests-macos.log`。
+
+## 未完成的验证
+
+本次无设备、ADB、USB、SSH、网络或 VM 操作，无 Android ELF 或启用产物；没有重新扫描现场。修改尚未被设备验证，也未解除任何停止记录，不可据此继续刷写。后续若另获执行安排，仍须独立审核、构建及真实检查；本准备包没有部署入口。

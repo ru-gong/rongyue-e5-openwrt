@@ -1,0 +1,109 @@
+"""Fixed ACK-boundary host checkpoint; no device commands or marker cleanup.
+
+Acquire the same serial lock only between completed requests. The current
+worker's nonblocking transport then refuses before dispatching another request.
+No signal, native cancellation, timeout extension, or writer is invoked.
+"""
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import time
+
+ENABLED=False
+ROOT=Path(__file__).resolve().parents[2]
+RUN=ROOT/'evidence/author-lock-lineage-install-20261020'
+STATE=ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+PID=29481
+EXPECTED_SUFFIX=' -u evidence/author-lock-lineage-install-20261020/run_entry.py phase stage'
+
+
+def need(ok,reason):
+    if not ok:raise RuntimeError(reason)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def save(path,value):
+    with path.open('x') as stream:
+        json.dump(value,stream,indent=2);stream.write('\n');stream.flush();os.fsync(stream.fileno())
+    fd=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def worker():
+    p=subprocess.run(['/bin/ps','-p',str(PID),'-o','uid=,lstart=,command='],capture_output=True,timeout=3)
+    if p.returncode:return None
+    text=p.stdout.decode().strip()
+    need(text.split()[0]==str(os.getuid()) and text.endswith(EXPECTED_SUFFIX),'fixed worker identity')
+    return text
+
+
+def completed_requests(folder):
+    rows=[]
+    for p in sorted(folder.glob('*/IN_FLIGHT.json')):
+        begin=json.loads(p.read_bytes())
+        done=json.loads((p.parent/'COMPLETE.json').read_bytes())
+        result=json.loads((p.parent/'transport-result.json').read_bytes())
+        need(done['status']=='COMPLETE' and done['validated'] is True and
+             all(done.get(k)==v for k,v in begin.items() if k!='status'), 'request lacks full completion')
+        need(result['failure'] is None and result['returncode']==0 and result['host_child_reaped'] is True,
+             'request transport failed')
+        parts=sorted(p.parent.glob('part-*/IN_FLIGHT.json'))
+        for index,part in enumerate(parts,1):
+            need(json.loads((part.parent/'PART_VERIFIED.json').read_bytes())==
+                 {'op_id':begin['op_id'],'part_index':index,'validated':True}, 'unverified followup')
+        if begin['mutating']:need(parts,'mutation missing independent readback')
+        rows.append({'op_id':begin['op_id'],'label':begin['label'],'mutating':begin['mutating'],
+                     'payload_bytes':begin['payload_bytes'],'complete_sha256':sha((p.parent/'COMPLETE.json').read_bytes())})
+    need(rows,'no requests')
+    return rows
+
+
+def execute():
+    need(ENABLED,'host checkpoint disabled')
+    evidence=RUN/'stage-execution';out=RUN/'stage-checkpoint'
+    need(not out.exists() and not out.is_symlink(),'new checkpoint record')
+    need(not (evidence/'COMPLETE.json').exists() and not (evidence/'STOP.json').exists(),'stage already ended')
+    identity=worker();need(identity is not None,'worker absent')
+    out.mkdir(mode=0o700)
+    save(out/'INTENT.json',{'kind':'planned-ACK-boundary-checkpoint','worker':identity,'pid':PID,
+         'scope':'serial lock only; no device command, signal, timeout extension or marker deletion',
+         'worker_source_sha256':sha((RUN/'run_entry.py').read_bytes()),'automatic_retry':False})
+    lock=STATE/'LOCK';need(not lock.is_symlink(),'lock symlink')
+    fd=os.open(lock,os.O_RDWR|os.O_NOFOLLOW)
+    acquired=False
+    try:
+        st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1,'lock identity')
+        end=time.monotonic()+120
+        while time.monotonic()<end:
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB);acquired=True;break
+            except BlockingIOError:time.sleep(0.005)
+        need(acquired,'no boundary acquired; no stop action taken')
+        need(not (STATE/'ACTIVE.json').exists() and not (STATE/'ACTIVE.json').is_symlink(),
+             'active request at checkpoint; no stop action taken')
+        before=completed_requests(evidence/'transport')
+        # No new request can pass _lock() while this lock is held. The worker
+        # refuses at its next dispatch; wait for that existing behavior.
+        end=time.monotonic()+30
+        while time.monotonic()<end and worker() is not None:time.sleep(0.1)
+        need(worker() is None,'worker has not stopped; retain checkpoint record')
+        after=completed_requests(evidence/'transport');need(after==before,'requests changed across checkpoint')
+        need(not (STATE/'ACTIVE.json').exists(),'unexpected active marker')
+        stop=json.loads((evidence/'STOP.json').read_bytes())
+        uncertainty=json.loads((STATE/'UNCERTAIN.json').read_bytes())
+        need(uncertainty['reason'] in ('workflow phase: BlockingIOError: '+stop['reason'],
+                                      'bounded stage: BlockingIOError: '+stop['reason']),
+             'unexpected worker stop')
+        save(out/'COMPLETE.json',{'kind':'ACK-boundary-host-checkpoint','worker':identity,'pid':PID,
+             'requests':before,'all_requests_completed':True,'no_device_request_dispatched_at_stop':True,
+             'active_marker_absent':True,'uncertainty_preserved':(STATE/'UNCERTAIN.json').exists(),
+             'stage_stop':stop,'remaining_prefix_requires_fresh_readonly_verification':True,
+             'resume_or_partition_write_authorized_by_this_record':False})
+    finally:os.close(fd)
+    return {'requests':len(before),'all_completed':True,'no_inflight_cancelled':True}
+
+
+if __name__=='__main__':
+    if len(sys.argv)==2 and sys.argv[1]=='stop-at-boundary':print(json.dumps(execute()))
+    else:print(json.dumps({'enabled':ENABLED,'mode':'PLAN_ONLY','worker':worker(),'device_commands':False}))

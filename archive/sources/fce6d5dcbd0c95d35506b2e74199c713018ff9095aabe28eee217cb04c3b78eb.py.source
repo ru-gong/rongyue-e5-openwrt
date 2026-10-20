@@ -1,0 +1,66 @@
+"""Host-only semantic model, not a scanner or a device executor.
+
+All observations supplied to this model are synthetic. pinned_path models the
+future C O_PATH acquisition requirement; it is not evidence or an authorization.
+"""
+from dataclasses import dataclass
+import stat
+
+SOCKFS = 0x534F434B
+PIPEFS = 0x50495045
+DEVICE_IO_DISABLED = True
+
+class Unknown(RuntimeError):
+    pass
+class Busy(RuntimeError):
+    pass
+
+@dataclass(frozen=True)
+class Object:
+    fd: int
+    dev: int
+    ino: int
+    mode: int
+    link: str
+    fs_magic: int
+    pinned_path: bool = True
+    identity_verified: bool = True
+
+    def kernel_stream(self):
+        return ((stat.S_ISSOCK(self.mode) and self.fs_magic == SOCKFS) or
+                (stat.S_ISFIFO(self.mode) and self.fs_magic == PIPEFS))
+
+    def strict_key(self):
+        return (self.fd, self.dev, self.ino, self.mode, self.link, self.fs_magic)
+
+
+def protected_path(path):
+    base = '/data/e5linux'
+    return path == base or path.startswith(base + '/') or path == base + ' (deleted)'
+
+
+def validate_snapshot(objects, protected_inodes=frozenset(), *, complete=True):
+    if not complete:
+        raise Unknown('incomplete enumeration or unresolved disappeared descriptor')
+    seen = set()
+    for item in objects:
+        # Positive occupancy can never be erased by a later object or pass.
+        if protected_path(item.link) or (item.dev, item.ino) in protected_inodes:
+            raise Busy('protected object observed')
+        if (type(item.fd) is not int or item.fd < 0 or item.fd in seen or
+                not item.pinned_path or not item.identity_verified):
+            raise Unknown('untrusted descriptor identity')
+        seen.add(item.fd)
+    return tuple(sorted((item.strict_key() for item in objects if not item.kernel_stream())))
+
+
+def compare_complete_pair(before, after, protected_inodes=frozenset(), *,
+                          before_complete=True, after_complete=True, already_busy=False):
+    if already_busy:
+        raise Busy('previous protected observation is sticky')
+    old = validate_snapshot(before, protected_inodes, complete=before_complete)
+    new = validate_snapshot(after, protected_inodes, complete=after_complete)
+    if old != new:
+        raise Unknown('filesystem or unclassified object set changed')
+    return {'model_only': True, 'observed_objects_checked': len(before) + len(after),
+            'non_stream_identity_sets_equal': True, 'device_execution_allowed': False}

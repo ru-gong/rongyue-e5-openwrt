@@ -1,0 +1,74 @@
+import ast,hashlib,json,tempfile,types,unittest
+from pathlib import Path
+from unittest.mock import patch
+import bounded_stage_fixed as s
+import host_inputs
+from test_partial import Fake,TX,BOOT
+class Artifact:
+ def __init__(self,path,size,sha256):self.path=path;self.size=size;self.sha256=sha256
+ def verify(self):
+  if self.path.stat().st_size!=self.size or hashlib.sha256(self.path.read_bytes()).hexdigest()!=self.sha256:raise RuntimeError('artifact mismatch')
+class Transport:
+ def __init__(self):self.recovery_context=None;self.reconciliation_only=False;self.errors=[]
+ def mark_uncertain(self,why):self.errors.append(why)
+class Adapter(Fake):
+ def __init__(self,out):super().__init__();self.evidence_dir=out;self.written={};self.actions=[];self.mutate=False
+ def _write_file_chunk(self,name,item,offset,payload,inode,identity):
+  assert name!='boot-os';assert tuple(identity)==(66367,19372);assert len(payload)<=s.CHUNK
+  if offset==0:assert name not in self.written;assert inode==0;self.written[name]=b''
+  assert len(self.written[name])==offset;self.written[name]+=payload;self.actions.append(('write',name,offset))
+  if self.mutate:self.mutate=False;item.path.write_bytes(b'X'*item.size)
+  return {'inode':100+list(self.written).index(name)}
+ def _request(self,label,script,**kw):
+  assert label=='fscrypt-check';self.actions.append(('fscrypt',script));return kw['validator'](b'UNENCRYPTED\n')
+ def inspect(self,role):self.actions.append(('inspect',role));return {'test_inventory':{k:hashlib.sha256(v).hexdigest() for k,v in self.written.items()}}
+class Stage(s.BoundedStage):
+ def _contract(self,*a):return self.module,self.transport
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.t=tempfile.TemporaryDirectory(prefix='e5-fixed-stage-test-');self.addCleanup(self.t.cleanup);self.root=Path(self.t.name).resolve();out=self.root/'out';out.mkdir();self.a=Adapter(out);self.stage=Stage(self.a);self.stage.transport=Transport()
+  def save(p,b):
+   with p.open('xb') as f:f.write(b)
+  self.stage.module=types.SimpleNamespace(Artifact=Artifact,transport_api=types.SimpleNamespace(save=save,save_json=lambda p,v:save(p,json.dumps(v).encode())))
+  self.art={};pinned={}
+  names=['boot.img','device-files.tar','fscrypt-probe','openwrt.ext4.gz','openwrt-install.conf']
+  for name in names:
+   data=b"E5_DEFAULT_BOOT='android'\n" if name=='openwrt-install.conf' else (name+'-data').encode();p=self.root/name;p.write_bytes(data);a=Artifact(p,len(data),hashlib.sha256(data).hexdigest());self.art[name]=a;pinned[name]=(a.size,a.sha256)
+  p=self.root/'raw';p.write_bytes(b'raw-image');self.raw=Artifact(p,9,hashlib.sha256(b'raw-image').hexdigest())
+  for k,v in [('PINNED',pinned),('RAW_BYTES',self.raw.size),('RAW_SHA',self.raw.sha256),('CHUNK',4)]:
+   q=patch.object(s,k,v);q.start();self.addCleanup(q.stop)
+  self.partial={'schema':'e5-stage-eight-byte-preimage-v1','txid':TX,'boot_id':BOOT,'path':self.a.path('stage'),'identity':[66367,19372],'file_meta':dict(self.a.meta),'file_sha256':hashlib.sha256(self.a.data).hexdigest()}
+ def runstage(self):return s.resume_stage(self.stage,self.art,self.raw,self.partial)
+ def test_skip_committed_marker_and_write_all_other_files(self):
+  v=self.runstage();self.assertNotIn('boot-os',self.a.written);self.assertEqual(len(self.a.written),7);self.assertEqual(self.a.written['openwrt-default-boot'],b'android\n');self.assertEqual(self.a.written['openwrt.ext4'],b'raw-image');self.assertFalse(self.stage.transport.errors)
+  for n,a in self.art.items():self.assertEqual(self.a.written[n],a.path.read_bytes())
+ def test_never_replay_same_instance(self):
+  self.runstage()
+  with self.assertRaisesRegex(s.Refusal,'no replay'):self.runstage()
+ def test_extra_partial_content_stops_before_write(self):
+  self.a.rows.append(dict(self.a.meta,path='./unknown'))
+  with self.assertRaises(s.Refusal):self.runstage()
+  self.assertFalse(self.a.written);self.assertTrue(self.stage.transport.errors)
+ def test_input_changed_during_write_stops_and_records_fields(self):
+  self.a.mutate=True
+  with self.assertRaises(host_inputs.InputChanged):self.runstage()
+  self.assertEqual(list(self.a.written),['boot.img']);self.assertTrue(self.stage.transport.errors);self.assertTrue((self.a.evidence_dir/'HOST_INPUT_FAILURE.json').exists())
+ def test_default_boot_cannot_change(self):
+  p=self.art['openwrt-install.conf'].path;p.write_bytes(b"E5_DEFAULT_BOOT='linux'\n");a=Artifact(p,p.stat().st_size,hashlib.sha256(p.read_bytes()).hexdigest());self.art['openwrt-install.conf']=a
+  with patch.dict(s.PINNED,{'openwrt-install.conf':(a.size,a.sha256)}):
+   with self.assertRaisesRegex(s.Refusal,'default'):self.runstage()
+  self.assertFalse(self.a.written)
+ def test_disabled_before_any_adapter_call(self):
+  with patch.object(s,'STAGE_IO_DISABLED',True):
+   with self.assertRaisesRegex(s.Refusal,'DISABLED'):self.runstage()
+  self.assertFalse(self.a.calls)
+ def test_real_adapter_contract_source_location(self):
+  self.assertEqual(s.LIVE,Path(__file__).resolve().parents[2]/'tools/e5_nextphase_core_live_69b2a5b04287f071')
+  self.assertEqual(s.file_sha(s.LIVE/'android_directory_adapter.py'),s.ADAPTER_SHA)
+  self.assertEqual(s.file_sha(s.LIVE/'bounded_transport.py'),s.TRANSPORT_SHA)
+ def test_fscrypt_shell_expression_identical_to_frozen_writer(self):
+  old=Path(__file__).resolve().parents[2]/'tools/e5_nextphase_core_live_69b2a5b04287f071/bounded_stage.py'
+  def expr(path):
+   tree=ast.parse(path.read_text());calls=[n for n in ast.walk(tree) if isinstance(n,ast.Call) and n.args and isinstance(n.args[0],ast.Constant) and n.args[0].value=='fscrypt-check'];return calls[-1].args[1]
+  a=compile(ast.Expression(expr(old)),'old','eval');b=compile(ast.Expression(expr(Path(s.__file__))), 'new','eval');env={'probe':'/data/stage/fscrypt-probe','target':'/data/stage/openwrt.ext4'};self.assertEqual(eval(a,env),eval(b,env))
+if __name__=='__main__':unittest.main(verbosity=2)

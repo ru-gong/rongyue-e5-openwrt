@@ -1,0 +1,159 @@
+"""Host fixtures only: process/socket audit hook is installed before import."""
+import sys
+def deny(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('external operation forbidden')
+sys.addaudithook(deny)
+import hashlib,json,os,tempfile,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+import bounded_stage as p
+TX='0123456789abcdef';BOOT='00000000-0000-4000-8000-000000000001'
+class Artifact:
+ def __init__(self,path,size=None,sha256=None):
+  self.path=Path(path);self.size=self.path.stat().st_size if size is None else size;self.sha256=p.sha(self.path.read_bytes()) if sha256 is None else sha256
+ def verify(self):
+  if self.path.is_symlink() or self.path.stat().st_size!=self.size or p.sha(self.path.read_bytes())!=self.sha256:raise p.Refusal('artifact changed')
+def save(path,data):
+ fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+ with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+def save_json(path,obj):save(path,(json.dumps(obj,sort_keys=True)+'\n').encode())
+class Fake:
+ def __init__(self,folder):
+  self.txid=TX;self.boot_id=BOOT;self.lock='/data/e5linux.lock';self.evidence_dir=folder;self.events=[];self.scripts=[];self.chunks=[];self.active=False;self.fail=None;self.bad_stage=None;self.parent_calls=0;self.parent_drift_at=None;self.ack=b'';self.bad_fscrypt=False;self.fail_chunk=None;self.fail_complete=False;self.next_inode=100;self.inodes={};self.contents={}
+  self.transport=SimpleNamespace(recovery_context=None,reconciliation_only=False,poisoned=False,mark_uncertain=self.poison)
+ def path(self,role):return '/data/e5linux' if role=='active' else '/data/e5linux.stage.'+TX
+ def _locked(self):return 'test fixed-owner\n'
+ def _deadline(self):return 6000
+ def poison(self,reason):self.transport.poisoned=True;self.events.append('UNKNOWN')
+ def occupancy(self):
+  self.events.append('occupancy')
+  if self.fail=='occupancy':raise p.Refusal('scanner UNKNOWN')
+ def _request(self,label,script,**kw):
+  self.events.append(label);self.scripts.append((label,script,kw,self.active))
+  old=self.active
+  if kw.get('mutating'):self.active=True
+  try:
+   if self.fail==label:raise TimeoutError('timeout/lost ACK')
+   if label=='bounded-stage-parents':
+    self.parent_calls+=1;raw=b'9 1\n9 2\n9 3\n'
+    if self.parent_drift_at==self.parent_calls:raw=b'9 1\n9 22\n9 3\n'
+   elif label=='bounded-stage-readback':raw=self.bad_stage or b'9 4 0 0 700\n'
+   elif label=='fscrypt-check':raw=b'ENCRYPTED\n' if self.bad_fscrypt else b'UNENCRYPTED\n'
+   else:raw=self.ack
+   result=kw['validator'](raw)
+   if kw.get('followup'):result=kw['followup'](result)
+   if kw.get('mutating'):
+    if self.fail_complete:raise OSError('COMPLETE persistence failed')
+    self.events.append(label+':COMPLETE')
+   return result
+  except BaseException:
+   if kw.get('mutating'):self.poison('request failed')
+   raise
+  finally:self.active=old
+ def _write_file_chunk(self,name,item,offset,payload,inode,identity):
+  self.events.append('chunk:'+name);self.chunks.append((name,offset,payload,inode,identity))
+  if len(self.chunks)==self.fail_chunk:raise p.Refusal('chunk/readback failed')
+  if offset==0:
+   self.next_inode+=1;self.inodes[name]=self.next_inode;self.contents[name]=b''
+  if inode not in (0,self.inodes[name]) or len(self.contents[name])!=offset:raise p.Refusal('chunk offset/inode')
+  self.contents[name]+=payload
+  return {'inode':self.inodes[name]}
+ def inspect(self,role):
+  self.events.append('inspect:'+role)
+  if self.fail=='inspect':raise p.Refusal('inventory differs')
+  return {'role':role,'txid':TX,'boot_id':BOOT,'files':{k:p.sha(v) for k,v in self.contents.items()}}
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve();self.inputs=self.root/'inputs';self.inputs.mkdir();self.out=self.root/'evidence';self.out.mkdir();self.a=Fake(self.out);self.w=p.BoundedStage(self.a)
+  self.artifacts={}
+  for name in p.PINNED:
+   data=b"E5_DEFAULT_BOOT='android'\n" if name=='openwrt-install.conf' else (name+'\0\xff').encode();f=self.inputs/name;f.write_bytes(data);self.artifacts[name]=Artifact(f)
+  raw=self.inputs/'raw.ext4';raw.write_bytes(b'raw\0pristine\xff');self.raw=Artifact(raw)
+  self.pins={n:(a.size,a.sha256) for n,a in self.artifacts.items()};self.module=SimpleNamespace(Artifact=Artifact,transport_api=SimpleNamespace(save=save,save_json=save_json))
+ def fake(self):
+  with patch.object(p,'STAGE_IO_DISABLED',False),patch.object(p,'PINNED',self.pins),patch.object(p,'RAW_BYTES',self.raw.size),patch.object(p,'RAW_SHA',self.raw.sha256),patch.object(p,'CHUNK',8),patch.object(self.w,'_contract',return_value=(self.module,self.a.transport)):
+   return self.w.run(self.artifacts,self.raw)
+ def test_disabled_before_contract(self):
+  with patch.object(self.w,'_contract',side_effect=AssertionError('transport forbidden')),self.assertRaisesRegex(p.Refusal,'STAGE_IO_DISABLED'):self.w.run(self.artifacts,self.raw)
+  self.assertEqual(self.a.events,[])
+ def test_exact_adapter_rejects_fake(self):
+  with self.assertRaisesRegex(p.Refusal,'exact real adapter'):self.w._contract(self.artifacts,self.raw)
+  self.assertEqual(self.a.events,[])
+ def test_success_eight_files_without_activation(self):
+  result=self.fake();self.assertEqual(result['role'],'stage');self.assertEqual(set(self.a.contents),set(self.artifacts)|{'openwrt.ext4','boot-os','openwrt-default-boot'})
+  for name,item in {**self.artifacts,'openwrt.ext4':self.raw}.items():self.assertEqual(p.sha(self.a.contents[name]),item.sha256)
+  self.assertEqual(self.a.contents['boot-os'],b'openwrt\n');self.assertEqual(self.a.contents['openwrt-default-boot'],b'android\n')
+  self.assertEqual(self.a.events.count('bounded-create-stage'),1);self.assertEqual(self.a.events.count('bounded-create-stage:COMPLETE'),1);self.assertFalse(self.a.transport.poisoned)
+  self.assertEqual((self.out/'BOUNDED_STAGE_RESULT.json').stat().st_mode&0o777,0o600)
+  self.assertFalse(json.loads((self.out/'BOUNDED_STAGE_RESULT.json').read_text())['activated'])
+ def test_create_same_active_and_deadlines(self):
+  self.fake();mutations=[r for r in self.a.scripts if r[2].get('mutating')];self.assertEqual(len(mutations),1)
+  label,script,kw,_=mutations[0];self.assertEqual(label,'bounded-create-stage');self.assertIn('timeout -s TERM 6',script);self.assertIn('set -o pipefail',script);self.assertIn('set -C',script)
+  self.assertEqual(script.count('mkdir '),1);self.assertIn('/proc/uptime',script[:script.index('mkdir ')]);self.assertIn('/proc/uptime',script[script.index('mkdir '):]);self.assertNotIn('rm ',script);self.assertNotIn('mv ',script)
+  self.assertTrue(next(r[3] for r in self.a.scripts if r[0]=='bounded-stage-readback'));self.assertTrue(all(r[4]==(9,4) for r in self.a.chunks))
+ def test_no_replay(self):
+  self.fake();count=len(self.a.events)
+  with self.assertRaisesRegex(p.Refusal,'no replay'):self.fake()
+  self.assertEqual(count,len(self.a.events))
+ def test_normal_modes_only(self):
+  for field,value in [('reconciliation_only',True),('recovery_context',{})]:
+   self.w.used=False;setattr(self.a.transport,field,value)
+   with self.assertRaisesRegex(p.Refusal,'normal-only'):self.fake()
+   setattr(self.a.transport,field,False if field=='reconciliation_only' else None)
+  self.assertFalse(self.a.scripts)
+ def test_local_input_drift_before_mutation(self):
+  self.artifacts['boot.img'].path.write_bytes(b'changed')
+  with self.assertRaisesRegex(p.Refusal,'artifact changed'):self.fake()
+  self.assertFalse(self.a.scripts)
+ def test_default_linux_refused_before_mutation(self):
+  item=self.artifacts['openwrt-install.conf'];item.path.write_bytes(b"E5_DEFAULT_BOOT='linux'\n");self.artifacts['openwrt-install.conf']=Artifact(item.path);self.pins['openwrt-install.conf']=(self.artifacts['openwrt-install.conf'].size,self.artifacts['openwrt-install.conf'].sha256)
+  with self.assertRaisesRegex(p.Refusal,'default must remain Android'):self.fake()
+  self.assertFalse(self.a.scripts)
+ def test_occupancy_unknown_no_create(self):
+  self.a.fail='occupancy'
+  with self.assertRaisesRegex(p.Refusal,'scanner UNKNOWN'):self.fake()
+  self.assertFalse(self.a.scripts);self.assertTrue(self.a.transport.poisoned)
+ def test_create_failure_no_chunks(self):
+  self.a.fail='bounded-create-stage'
+  with self.assertRaises(TimeoutError):self.fake()
+  self.assertFalse(self.a.chunks);self.assertTrue(self.a.transport.poisoned);self.assertNotIn('bounded-create-stage:COMPLETE',self.a.events)
+ def test_existing_stage_shell_guard(self):
+  self.a.fail='bounded-create-stage'
+  with self.assertRaises(TimeoutError):self.fake()
+  script=next(s for label,s,_,_ in self.a.scripts if label=='bounded-create-stage')
+  self.assertIn('test ! -e '+self.w.path,script);self.assertIn('test ! -L '+self.w.path,script)
+ def test_parent_change_during_create_stops(self):
+  self.a.parent_drift_at=2
+  with self.assertRaisesRegex(p.Refusal,'parent replaced'):self.fake()
+  self.assertFalse(self.a.chunks);self.assertNotIn('bounded-create-stage:COMPLETE',self.a.events)
+ def test_wrong_stage_metadata(self):
+  for raw in (b'10 4 0 0 700\n',b'9 0 0 0 700\n',b'9 4 2000 0 700\n',b'9 4 0 2000 700\n',b'9 4 0 0 755\n',b'9 4 0 0 700\nEXTRA\n'):
+   self.w.used=False;self.a.bad_stage=raw
+   with self.assertRaises(p.Refusal):self.fake()
+  self.assertFalse(self.a.chunks)
+ def test_bad_create_stdout_stops(self):
+  self.a.ack=b'failure text'
+  with self.assertRaisesRegex(p.Refusal,'unexpected create output'):self.fake()
+  self.assertFalse(self.a.chunks)
+ def test_lost_complete_stops_before_chunks(self):
+  self.a.fail_complete=True
+  with self.assertRaises(OSError):self.fake()
+  self.assertFalse(self.a.chunks);self.assertTrue(self.a.transport.poisoned)
+ def test_chunk_failure_stops_no_fscrypt_or_inspect(self):
+  self.a.fail_chunk=2
+  with self.assertRaisesRegex(p.Refusal,'chunk/readback failed'):self.fake()
+  self.assertEqual(len(self.a.chunks),2);self.assertFalse(any(e.startswith(('fscrypt-check','inspect:')) for e in self.a.events));self.assertFalse((self.out/'BOUNDED_STAGE_RESULT.json').exists())
+ def test_interrupt_poison(self):
+  with patch.object(self.a,'_write_file_chunk',side_effect=KeyboardInterrupt),self.assertRaises(KeyboardInterrupt):self.fake()
+  self.assertTrue(self.a.transport.poisoned);self.assertFalse((self.out/'BOUNDED_STAGE_RESULT.json').exists())
+ def test_fscrypt_rejects_result(self):
+  self.a.bad_fscrypt=True
+  with self.assertRaisesRegex(p.Refusal,'fscrypt policy'):self.fake()
+  self.assertNotIn('inspect:stage',self.a.events)
+ def test_result_persistence_failure_poison(self):
+  with patch.object(self.module.transport_api,'save_json',side_effect=OSError('disk full')),self.assertRaises(OSError):self.fake()
+  self.assertTrue(self.a.transport.poisoned)
+ def test_parent_parser_rejects_cross_device(self):
+  with patch.object(self.a,'_request',side_effect=lambda label,script,**kw:kw['validator'](b'9 1\n10 2\n9 3\n')),self.assertRaisesRegex(p.Refusal,'filesystem'):self.w._parents()
+if __name__=='__main__':unittest.main(verbosity=2)

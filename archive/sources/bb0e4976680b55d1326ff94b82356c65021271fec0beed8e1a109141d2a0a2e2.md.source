@@ -1,0 +1,13 @@
+# Fixed no-replace probe — preparation only
+
+This supplemental probe is separate from the frozen, already approved v3 tools. It addresses the v3 requirement to verify actual no-replace behavior on the device filesystem before any partition write. Its device paths and successful empty-directory cleanup require the supplemental scope in `../../v3补充_空目录改名测试范围_待确认_2026-10-14.md`.
+
+`noreplace_probe.c` retains `DEVICE_EXECUTION_ENABLED = 0`. `probe_host.py` retains `PROBE_IO_DISABLED = True`, has no enabling CLI/environment option, and is not an executable device workflow. No enabled probe binary has been prepared or uploaded. The three existing v3 helper binaries in the separate live directory do not grant permission to run this additional probe.
+
+The native probe accepts only `probe TXID BOOT_UUID OPID32 DEADLINE_MS DATADEV DATAINO LOCKDEV LOCKINO`. It creates two empty directories under the fixed transaction lock, checks that no-replace rejects an existing destination, moves the source to the third allowed name, and removes only its own two still-empty directories on the fully successful path. An error, cancellation or expired deadline leaves the current state intact. There is no recursive deletion, block write, reboot, retry or ordinary rename fallback.
+
+The host wrapper uses the pinned v3 transport and its persistent unresolved-operation barrier. Upload and execution each remain active until their independent readback completes. The wrapper rejects recovery/reconciliation modes. It checks the full helper bytes/SHA and stable metadata, the exact native event sequence, and the final absence of all three allowed directory names with unchanged parent/owner identity. Intermediate rename results are native observations, not an independent host inspection of the intermediate directories.
+
+Tests use temporary host fixtures and fake transports only. Mac tests exercise the equivalent local no-overwrite primitive; Linux HOST_TEST exercises `renameat2`. Neither proves this E5's F2FS support. Disabled production builds only test the disabled gate. Tests do not demonstrate power-loss safety or resolution of the existing Android watchdog/cellular issues.
+
+The final preparation manifest binds source, test evidence, independent review, and the supplemental scope. Hardware support remains unverified until the supplement is approved and a fresh device session completes all original v3 gates. A future enabled copy must differ only at the explicit execution gates, be rebuilt and hashed separately, and retain the frozen preparation sources.

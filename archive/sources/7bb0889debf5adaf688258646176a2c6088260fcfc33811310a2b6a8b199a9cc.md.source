@@ -1,0 +1,35 @@
+# 本机 BC32 单次重臂辅助工具
+
+这是独立的 **LIVE** 辅助程序。仅用于 `DEVICE_SERIAL_REDACTED` 在已安装本次固定 OpenWrt 并回到已解锁/root 的 Android A 后，再安排一次 Linux B 试启。主代理是唯一设备操作者；必须先取得本目录独立审查结果。原冻结安装器和固件没有改动。
+
+只接受已固定 final manifest：`0000000000000000000000000000000000000000000000000000000000000000`。路径在代码中固定，不能经 CLI 替换包、ADB、串号、分区、范围或原件。已启用 backend 也按文件 SHA 固定后才导入。`plan` 是纯本地校验，会解压校验完整 2 GiB rootfs。
+
+```sh
+python3 -B /REDACTED_HOST_PATH plan
+```
+
+经主代理核对并独审通过后唯一设备动作入口：
+
+```sh
+python3 -B /REDACTED_HOST_PATH live-rearm --evidence /REDACTED_HOST_PATH
+```
+
+要求 evidence 父目录已存在、目标不存在。已有目录和任何失败均停止，不覆盖、不续跑、不重试写入。
+
+边界：
+
+- 完整本地 manifest/artifact/runtime/本机 provenance 校验，再核原 misc 全 SHA 和本次完整 boot SHA。
+- 完整 Android A/root/固定 GPT/节点 major-minor/几何/13 项保护链/裸 F2FS preflight。双次 preflight 中任何条件变化均停止。
+- 当前 boot_b `[0,56 MiB)` 及 `[60 MiB,64 MiB)` 必须逐字节等于固定包，只允许 `[56 MiB,60 MiB)` 已审诊断窗具有历史内容。preflight 后直至写后，整个 boot_b（包括诊断窗）必须保持不变。
+- 当前 misc 全长 1 MiB，外部除 `[2048,2080)` 均逐字节等本机原件；当前 BC 必须 CRC 有效、A successful/可启动、没有更高优先级 B。保留当前 A 高位，仅将 A priority 降为 14、B 设为 0x2f、suffix B、重算 CRC。
+- 保存 fsync 的 full misc 原件、计划记录、journal，二次读回当前状态后才发 **一次**固定 backend `write_misc_bc`。只写物理 `/dev/block/mmcblk0p3` 的 32 B。没有 boot_b、boot_a、userdata、NV 或其它写命令。
+- 完整 misc 读回限定差异，检查 boot_b 完整不变和 13 项保护完整 hash。成功才保存 `result.json` 和 `COMPLETE_NO_REBOOT`。
+- 程序不重启、不改长期默认启动、不上传文件、不自动回滚。失败后可能已有部分/全部 32 B 写入，须留在 Android 由主代理检查当前实际状态；不能因失败自动重试。
+
+离线测试使用真实已批准包/原件的本地字节和 fake transport；每个外部进程 API 被 Python audit hook 禁止。测试不触碰设备，也不证明真实重臂/回退成功。
+
+```sh
+python3 -B /REDACTED_HOST_PATH
+```
+
+Linux 端的 `/opt/e5/e5-next-boot android|linux` 属实际固件已审操作：会改 misc32 和 rootfs 默认标记，另行决定重启；其成功与否仍须实机读回及重启验收。

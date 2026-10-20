@@ -1,0 +1,56 @@
+"""Prove one acknowledged sync-only seal and a failed read-only followup."""
+import hashlib,importlib.util,json,shlex,sys,types
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent
+RUN=ROOT/'evidence/author-fd-convergence-continuation-20261020';CORE=ROOT/'tools/e5_nextphase_core_live_265962d3c1cdbde8';STATE=ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED';LEDGER=ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+TX='314ff262fa18c842';BOOT='00000000-0000-4000-8000-000000000001'
+def need(x,s):
+ if not x:raise RuntimeError(s)
+def sha(x):return hashlib.sha256(x).hexdigest()
+def obj(p):return json.loads(p.read_bytes())
+def pin(p):return {'bytes':p.stat().st_size,'sha256':sha(p.read_bytes())}
+def bind(p):return {'path':str(p),'sha256':sha(p.read_bytes())}
+def load(n,p,raw=None):
+ m=types.ModuleType(n);m.__file__=str(p);sys.modules[n]=m;exec(compile(p.read_bytes() if raw is None else raw,str(p),'exec'),m.__dict__);return m
+
+def classified(parent,result,records,part,transport,native,err):
+ need(parent['mutating'] is True and parent['payload_bytes']==0 and parent['label']=='directory-helper' and parent['automatic_retry'] is False,'one payload-free helper only')
+ need(result['returncode']==0 and result['failure'] is None and result['host_child_reaped'] and result['stdin_bytes_sent']==0 and result['stderr_bytes']==0 and result['elapsed_seconds']<=8,'positive sync ACK transport')
+ need(records and records[-1]['event']=='RESULT' and records[-1]['ok'] is True and records[-1]['action']=='seal' and records[-1]['mutation_attempted'] is False and records[-1]['renamed'] is False and records[-1]['fsync_completed'] is True and records[-1]['files_fsynced']==8 and records[-1]['directories_fsynced']==1 and records[-1]['outcome']=='COMPLETED','sync only, no rename/data mutation')
+ need(part['label']=='occupancy' and part['payload_bytes']==0 and transport['returncode']==70 and transport['failure'] is None and transport['host_child_reaped'] and transport['stdin_bytes_sent']==0 and transport['stderr_bytes']==0 and not err and transport['elapsed_seconds']<=8,'known terminated readonly followup, not timeout or lost ACK')
+ last=native[-1];need(last['event']=='RESULT' and last['complete'] is False and last['reason']=='fd-table-scan-unknown' and last['detail']=='closed-fd-reappeared' and last['errno']==116 and last['cancel_signal']==0 and last['unknown']==['scan-not-complete'],'exact inconclusive scan, not a successful proof')
+ return True
+
+def build():
+ family=obj(Path(obj(RUN/'FAMILY.json')['result']['path']))
+ for x in family['files'].values():need(pin(Path(x['path']))=={k:x[k] for k in ('bytes','sha256')},'source drift')
+ base=RUN/'activate-execution';folders=sorted((base/'transport').glob('*/IN_FLIGHT.json'));need(len(folders)==704,'fixed full request set');op=folders[-1].parent;b=obj(folders[-1]);raw=(op/'stdout.bin').read_bytes();r=obj(op/'transport-result.json');parts=sorted(op.glob('part-*/IN_FLIGHT.json'));need(len(parts)==4,'fixed followup set');last=parts[-1].parent;pb=obj(parts[-1]);pr=obj(last/'transport-result.json');native=[json.loads(x) for x in (last/'stdout.bin').read_bytes().splitlines()];records=[json.loads(x) for x in raw.splitlines()]
+ classified(b,r,records,pb,pr,native,(last/'stderr.bin').read_bytes())
+ need(not (op/'COMPLETE.json').exists() and obj(STATE/'ACTIVE.json')==b,'exact unresolved seal active marker')
+ global_unc=obj(STATE/'UNCERTAIN.json');local_unc=obj(op/'UNCERTAIN.json')
+ need(global_unc=={'schema':'e5-bounded-transport-v1','status':'UNCERTAIN','serial':'DEVICE_SERIAL_REDACTED','boot_id':BOOT,'txid':TX,'reason':'TransportError: followup transport failed/uncertain','remote_completion_proven':False,'evidence_directory':str(base/'transport'),'automatic_retry':False},'exact outer poison marker')
+ need(all(local_unc.get(k)==v for k,v in b.items() if k!='status') and local_unc['status']=='UNCERTAIN' and local_unc['reason']=='TransportError: followup transport failed/uncertain','exact local operation refusal')
+ need(r['stdout_sha256']==sha(raw) and r['stdout_bytes']==len(raw) and not (op/'stderr.bin').read_bytes(),'seal raw binding')
+ sys.path.insert(0,str(CORE));a=load('_seal_case_adapter',CORE/'android_directory_adapter.py');d=a.AndroidDirectoryAdapter.__new__(a.AndroidDirectoryAdapter);d.txid=TX;d.boot_id=BOOT;d.lock='/data/local/tmp/e5-clean-directory.lock'
+ command=shlex.split(b['argv'][-1]);prefix=d._guard()+d._locked();need(len(command)==3 and command[:2]==[a.SU,'-c'] and command[2].startswith(prefix),'seal root guard');line=command[2][len(prefix):];t=shlex.split(line)
+ need(t==['/data/local/tmp/e5-clean-helper.'+TX,'seal',TX,BOOT,b['op_id'],str(records[-1]['deadline_ms']),'66367','3','66367','19785','stage'] and line.endswith('\n') and '\n' not in line[:-1],'exact sync-only seal argv')
+ for x in records:need(x['schema']=='e5-native-directory-v3' and x['action']=='seal' and x['opid']==b['op_id'] and x['txid']==TX and x['boot_id']==BOOT and x['renamed'] is False and x['mutation_attempted'] is False,'no hidden native move')
+ for i,p in enumerate(parts):
+  begin=obj(p);rr=obj(p.parent/'transport-result.json');out=(p.parent/'stdout.bin').read_bytes();need(rr['stdout_sha256']==sha(out) and rr['stdout_bytes']==len(out) and not (p.parent/'stderr.bin').read_bytes(),'part raw binding')
+  need(begin['part_index']==i+1 and begin['op_id']==b['op_id'] and begin['payload_bytes']==0 and begin['boot_id']==BOOT and begin['txid']==TX,'part identity')
+  if i<3:need(obj(p.parent/'PART_VERIFIED.json')=={'op_id':b['op_id'],'part_index':i+1,'validated':True} and rr['returncode']==0 and rr['failure'] is None and rr['host_child_reaped'],'completed initial followups')
+  else:need(not (p.parent/'PART_VERIFIED.json').exists(),'failed scan not passed')
+ for x in native:need(x['schema']=='e5-native-occupancy-v1' and x['txid']==TX and x['boot_id']==BOOT and x['opid']==pb['metadata']['op_id'],'native followup identity')
+ # Replay the unchanged exact parser on all 703 completed predecessors.
+ p=CORE/'phase_evidence.py';source=p.read_bytes();needle=b"for operation in sorted(p for p in folder.iterdir() if p.is_dir() and re.fullmatch(r'\\d{6}-.+', p.name)):";need(source.count(needle)==1,'one parser selector');m=load('_seal_prefix_proof',p,source.replace(needle,b'for operation in COMPLETED_ONLY:'));m.COMPLETED_ONLY=[p.parent for p in folders[:-1]];rows=m.transport_proof(base/'transport','DEVICE_SERIAL_REDACTED',TX,BOOT);need(len(rows)==703 and all(not x['begin']['mutating'] for x in rows),'all predecessors readonly')
+ need(all((x['folder']/'COMPLETE.json').read_bytes()==(STATE/'completed'/(x['begin']['op_id']+'.json')).read_bytes() for x in rows),'shared completions')
+ journal=(base/'directory-session/journal.jsonl').read_bytes();events=[json.loads(x)['event'] for x in journal.splitlines()];need(events==['SESSION_BOUND'] and not list((base/'directory-session').glob('MOVE-*')),'no directory move begun')
+ need(not (base/'COMPLETE.json').exists() and (base/'STOP.json').is_file() and (base/'directory-session/SESSION_UNCERTAIN.json').is_file(),'old stop retained')
+ need(pin(LEDGER)['sha256']=='0000000000000000000000000000000000000000000000000000000000000000','no block write')
+ files={str(p.relative_to(ROOT)):pin(p) for p in base.rglob('*') if p.is_file()}
+ for p in [RUN/'activate.log',RUN/'activate-inner.json',RUN/'STAGE_RAW_REVIEW.json',RUN/'resume-stage-execution/COMPLETE.json',RUN/'resume-stage-execution/stage.inventory.json']:files[str(p.relative_to(ROOT))]=pin(p)
+ return {'schema':'e5-ack-sync-only-followup-stop-v1','serial':'DEVICE_SERIAL_REDACTED','txid':TX,'boot_id':BOOT,'files':files,'active':pin(STATE/'ACTIVE.json'),'uncertainty':pin(STATE/'UNCERTAIN.json'),'ledger':pin(LEDGER),'archive_rel':'host-stage-checkpoints/'+TX+'/seal-followup-000704','original_stop':str(base/'STOP.json'),'all_content_mutations_absent':True,'sync_acknowledged':True,'readback_pending_not_successful':True,'no_directory_move_begun':True,'block_writes_dispatched':False,'failed_readonly_terminal':native[-1],'fresh_full_inspection_required':True,'acknowledged_payload_bytes':0}
+if __name__=='__main__':
+ value=build()
+ with (HERE/'CASE.json').open('x') as f:json.dump(value,f,sort_keys=True,indent=2);f.write('\n')
+ print(json.dumps({'case':bind(HERE/'CASE.json'),'content_mutations':0,'seal_readback_pending':True}))

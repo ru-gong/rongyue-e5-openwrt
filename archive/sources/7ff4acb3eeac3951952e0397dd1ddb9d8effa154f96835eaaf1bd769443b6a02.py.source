@@ -1,0 +1,178 @@
+"""Synthetic host evidence replay only; no real transport, process or sockets."""
+import sys
+
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('external operation forbidden')
+sys.addaudithook(audit)
+import copy,io,json,stat,tarfile,tempfile,unittest
+from pathlib import Path
+from types import SimpleNamespace
+import phase_evidence as p
+import directory_session as ds
+import android_directory_adapter as api
+TX='0123456789abcdef';B='00000000-0000-4000-8000-000000000001';B2='00000000-0000-4000-8000-000000000001'
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.r=Path(self.tmp.name).resolve()
+  self.m={'modules':{n:p.sha((p.BASE/(n+'.py')).read_bytes()) for n in ('directory_session','android_directory_adapter','bounded_transport','bounded_boot_control')},'artifacts':{},'_bound_manifest_sha256':'a'*64}
+  for n in ('scanner','io_helper','directory_helper','probe'):
+   f=self.r/(n+'.bin');f.write_bytes(n.encode());self.m['artifacts'][n]={'path':str(f),'bytes':len(n),'sha256':p.sha(f.read_bytes())}
+  self.state={k:self.stat(100+i) for i,k in enumerate(('data','local','tmp','old_lock','new_lock'))}
+  self.state.update(old_owner=self.stat(106,False),new_owner=self.stat(107,False),old_owner_hex=(p.OLD_TX+'\n').encode().hex())
+  self.db=self.deployment();self.pb=self.probe()
+ def tearDown(self):self.tmp.cleanup()
+ def stat(self,i,d=True):return dict(mode_bits=(stat.S_IFDIR|0o700) if d else (stat.S_IFREG|0o600),dev=7,inode=i,bytes=4096 if d else 17,mode='700' if d else '600',uid=0,gid=0,nlink=2 if d else 1,mtime='100',ctime='100',mtime_text='x',ctime_text='y',rdev_major=0,rdev_minor=0,type='d' if d else 'f')
+ def write(self,f,v):
+  f=Path(f);f.parent.mkdir(parents=True,exist_ok=True);f.write_bytes(p.canonical(v)+b'\n');return p.bind(f)
+ def change(self,f,fn):
+  f=Path(f);v=json.loads(f.read_bytes());fn(v);return self.write(f,v)
+ def trans(self,d,boot=B):
+  self.write(d/'binding.json',dict(serial=p.SERIAL,txid=TX,boot_id=boot,state_dir=str(p.ROOT/('evidence/e5-clean-v3-device-state-'+p.SERIAL)),reconciliation_only=False,recovery_context=None));return d
+ def raw(self,d,raw,sent):
+  (d/'stdout.bin').write_bytes(raw);(d/'stderr.bin').write_bytes(b'');self.write(d/'transport-result.json',dict(failure=None,returncode=0,stderr_bytes=0,stdout_bytes=len(raw),stdout_sha256=p.sha(raw),stdin_bytes_sent=sent,host_child_reaped=True,elapsed_seconds=.01))
+ def op(self,d,label,raw=b'',mut=False,payload=b'',boot=B):
+  i=len(list(d.glob('[0-9]*')))+1;op='%032x'%i;f=d/('%06d-%s-%s'%(i,label,op));f.mkdir()
+  b=dict(schema='e5-bounded-transport-v1',status='IN_FLIGHT',serial=p.SERIAL,txid=TX,boot_id=boot,op_id=op,label=label,mutating=mut,argv=['fixture'],argv_sha256=p.sha(p.canonical(['fixture'])),payload_bytes=len(payload),payload_sha256=p.sha(payload),deadline_seconds=8,output_limit=p.MAX_TRANSPORT_OUTPUT,evidence_directory=str(f),automatic_retry=False,reconciliation_only=False,recovery_context=None)
+  self.write(f/'IN_FLIGHT.json',b);self.write(f/'COMPLETE.json',dict(b,status='COMPLETE',stdout_sha256=p.sha(raw),validated=True));self.raw(f,raw,len(payload))
+  if mut:
+   s=f/'part-001-readback';s.mkdir();self.write(s/'IN_FLIGHT.json',dict(b,label='readback',part_index=1,payload_bytes=0,payload_sha256=p.sha(b'')));self.write(s/'PART_VERIFIED.json',dict(op_id=op,part_index=1,validated=True));self.raw(s,b'checked',0)
+  return f,b
+ def deployment(self):
+  d=self.r/'deploy/result';d.mkdir(parents=True);t=self.trans(d.parent/'transport')
+  src={'artifacts':{k:self.m['artifacts'][v] for k,v in [('scanner','scanner'),('io_helper','io_helper'),('helper','directory_helper')]}}
+  src['artifacts']['archiver']=self.m['artifacts']['probe']
+  self.m['deployment_manifest']=self.write(self.r/'deployment-manifest.json',src)
+  req=self.write(self.r/'drequest.json',dict(txid=TX,boot_id=B,manifest=self.m['deployment_manifest']));rev=self.write(self.r/'dreview.json',dict(request=req,manifest=self.m['deployment_manifest'],decision='FIXED_OLD_LOCK_ARCHIVE_NEW_HELPERS_SCANNER_ONLY'))
+  before={k:v for k,v in self.state.items() if k not in ('new_lock','new_owner')};self.write(d/'OLD_LOCK_BEFORE.json',before);(d/'old-owner.bin').write_bytes((p.OLD_TX+'\n').encode());self.write(d/'OLD_LOCK_ARCHIVED.json',dict(before=before,native=dict(event='RESULT',complete=True,renamed=True,fsync_completed=True,owner_unchanged=True)))
+  ops=[]
+  for label in ('stage2-upload-archiver','stage2-archive-old-lock','stage2-new-lock','stage2-upload-scanner','stage2-upload-io_helper','stage2-upload-helper'):
+   key=label.removeprefix('stage2-upload-');payload=Path(src['artifacts'][key]['path']).read_bytes() if label.startswith('stage2-upload-') else b''
+   raw=(p.canonical({'event':'BEGIN'})+b'\n'+p.canonical(dict(event='RESULT',complete=True,renamed=True,fsync_completed=True,owner_unchanged=True))+b'\n') if label=='stage2-archive-old-lock' else b''
+   _,b=self.op(t,label,raw,mut=True,payload=payload);ops.append(dict(label=label,opid=b['op_id']))
+  scan=dict(event='RESULT',complete=True,unknown=[],processes=1,namespaces=1);self.op(t,'occupancy',p.canonical(scan)+b'\n');uploads={}
+  for i,(key,stem) in enumerate((('scanner','scanner'),('io_helper','io'),('helper','helper'))):
+   a=src['artifacts'][key];meta=self.stat(120+i,False);meta.update(bytes=a['bytes'],mode='700',mode_bits=stat.S_IFREG|0o700);uploads[key]=dict(artifact=a,remote_path='/data/local/tmp/e5-clean-'+stem+'.'+TX,remote_metadata=meta)
+  uploads['archiver']={'artifact':src['artifacts']['archiver']}
+  v=dict(schema='e5-next-scanner-deployment-result-v1',serial=p.SERIAL,txid=TX,boot_id=B,manifest=self.m['deployment_manifest'],request=req,review=rev,scanner_real_full_scan_passed=True,no_partition_or_rootfs_write=True,no_reboot=True,automatic_cleanup_retry_or_resume=False,noreplace_probe_passed=False,approved_to_activate=False,archive=p.LOCK+'.archive.'+p.OLD_TX+'.'+TX,lock=self.state,operations=ops,scanner=scan,uploads=uploads)
+  rb=self.write(d/'RESULT.json',v);return self.write(d/'COMPLETE.json',dict(schema='e5-stage2-complete-v1',all_requests_completed=True,result=rb))
+ def workflow(self,phase,requirements,result,inputs=None,boot=B):
+  d=self.r/phase;d.mkdir(exist_ok=True);r=dict(phase=phase,txid=TX,boot_id=boot,manifest_sha256=self.m['_bound_manifest_sha256'],runner_sha256=p.sha((p.BASE/'workflow.py').read_bytes()),requirements=requirements,inputs=inputs or {})
+  r['technical_review']=self.write(d/'review.json',dict(schema='e5-nextphase-workflow-review-v1',decision='EXACT_ONE_PHASE_ONLY',request_binding_sha256=p.sha(p.canonical(r))))
+  rb=self.write(d/'REQUEST.json',r);return self.write(d/'COMPLETE.json',dict(schema='e5-nextphase-workflow-result-v1',phase=phase,serial=p.SERIAL,txid=TX,boot_id=boot,complete=True,reboot_performed=False,automatic_next_phase=False,automatic_retry=False,request_sha256=rb['sha256'],result=result))
+ def probe(self):
+  d=self.r/'probe';d.mkdir();t=self.trans(d/'transport',B2);a=self.m['artifacts']['probe'];self.op(t,'upload-noreplace-probe',mut=True,payload=Path(a['path']).read_bytes(),boot=B2)
+  phases=['open-bindings','create-source','create-destination','existing-destination-test','missing-destination-test','cleanup-destination','cleanup-renamed'];rows=[]
+  for i,e in enumerate(['BEGIN']+['PHASE']*7+['RESULT']):rows.append(dict(schema='e5-noreplace-probe-v1',event=e,phase='begin' if i==0 else 'complete' if i==8 else phases[i-1],txid=TX,boot_id=B2,opid='%032x'%2,cancel_signal=0,self_pid=100,self_starttime=50,deadline_ms=10000,checked_boottime_ms=100+i,data_dev=7,data_ino=100,lock_dev=7,lock_ino=104))
+  rows[-1].update(complete=True,outcome='COMPLETED',errno=0,power_loss_safety_proven=False,mutation_attempted=True,source_inode=201,destination_inode=202,existing_dest_eexist=True,existing_inodes_unchanged=True,missing_dest_rename=True,cleanup_completed=True,f2fs_confirmed=True)
+  self.op(t,'noreplace-probe',b''.join(p.canonical(x)+b'\n' for x in rows),mut=True,boot=B2)
+  after={k:self.state[k] for k in ('data','local','tmp')};after.update(lock=self.state['new_lock'],owner=self.state['new_owner'],owner_sha256=p.sha((TX+'\n').encode()))
+  v=dict(schema='e5-noreplace-probe-host-result-v1',serial=p.SERIAL,txid=TX,boot_id=B2,three_probe_paths_absent=True,approved_to_activate=False,device_rootfs_or_block_writes=False,power_loss_safety_proven=False,helper_sha256=a['sha256'],helper_bytes=a['bytes'],native_result=rows[-1],after=after)
+  self.write(t/'NOREPLACE_HOST_RESULT.json',v);return self.workflow('probe',{'deployment':self.db},v,boot=B2)
+ def activation(self):
+  d=self.r/'activate/directory-session';d.mkdir(parents=True);t=self.trans(d.parent/'transport')
+  def inv(role,raw,i):
+   rows=[dict(path='.',type='d',sha256='-',dev=7,inode=i,bytes=4096,mode='700',uid=0,gid=0),dict(path='./openwrt.ext4',type='f',sha256=p.sha(raw),dev=7,inode=i+1,bytes=len(raw),mode='600',uid=0,gid=0)]
+   return dict(schema='e5-device-directory-inventory-v1',txid=TX,boot_id=B,role=role,rows=rows,tree_sha256=api.tree_digest(rows))
+  old=inv('active',b'old',300);new=inv('stage',b'new',400);self.m['candidate']=self.write(self.r/'candidate.json',{'outer_file_set':{'openwrt.ext4':{'bytes':3,'sha256':p.sha(b'new')}}})
+  tar=self.r/'old.tar'
+  with tarfile.open(tar,'w') as archive:
+   q=tarfile.TarInfo('.');q.type=tarfile.DIRTYPE;q.mode=0o700;archive.addfile(q);q=tarfile.TarInfo('./openwrt.ext4');q.mode=0o600;q.size=3;archive.addfile(q,io.BytesIO(b'old'))
+  rb=self.write(self.r/'backup.json',{**api.verify_backup_tar(tar,old),'schema':'e5-full-directory-backup-v1','txid':TX,'boot_id':B,'role':'active','path':str(tar)})
+  backup=dict(path=str(tar),bytes=tar.stat().st_size,sha256=p.sha(tar.read_bytes()),receipt_path=rb['path'],receipt_sha256=rb['sha256'])
+  inner=dict(mode='activate',txid=TX,boot_id=B,candidate=self.m['candidate'],original_inventory=self.write(self.r/'old.json',old),stage_inventory=self.write(self.r/'new.json',new),original_backup=backup,cold_resume={'fixture':'historical'})
+  inner['technical_review']=self.write(self.r/'directory-review.json',dict(schema='e5-clean-directory-session-review-v1',bindings=ds.review_binding(inner),conclusion='exact_directory_transaction_reviewed'));ib=self.write(self.r/'directory-request.json',inner)
+  plan=dict(schema='e5-clean-directory-session-plan-v1',request_sha256=ib['sha256'],request=inner,device_execution_authorized_by_this_document=False);self.write(d/'plan.json',plan);prev='0'*64;raw=b''
+  for i,e in enumerate(['SESSION_BOUND','ARCHIVE_BEGIN','ARCHIVE_DONE','ACTIVATE_BEGIN','ACTIVATE_DONE','ACTIVATED'],1):
+   row=dict(seq=i,previous=prev,plan_hash=p.sha(p.canonical(plan)),event=e);row['record_hash']=p.sha(p.canonical(row));prev=row['record_hash'];raw+=p.canonical(row)+b'\n'
+  (d/'journal.jsonl').write_bytes(raw)
+  for e in ('ARCHIVE','ACTIVATE'):
+   begin=dict(request_sha256=ib['sha256']);self.write(d/('MOVE-'+e+'-IN_FLIGHT.json'),begin);self.write(d/('MOVE-'+e+'-COMPLETE.json'),dict(request_sha256=ib['sha256'],begin_sha256=p.sha(p.canonical(begin)),verified=True))
+  active=dict(new,role='active');ab=self.write(d/'active.inventory.json',active);versions={n+'.py':self.m['modules'][n] for n in ('directory_session','android_directory_adapter','bounded_transport','bounded_boot_control')};versions['native_io']=self.m['artifacts']['io_helper']['sha256']
+  ar=self.write(d/'ACTIVATION_COMPLETE.json',dict(schema='e5-clean-activation-v3',serial=p.SERIAL,status='ACTIVATED',txid=TX,boot_id=B,candidate_sha256=self.m['candidate']['sha256'],request_sha256=ib['sha256'],default_boot='android',original_B_misc_verified=True,flash_authorization=False,active_inventory=ab,tree_sha256=new['tree_sha256'],source_versions=versions))
+  for action in ('seal','move-active-to-archive','move-stage-to-active','seal'):self.op(t,'directory-helper',p.canonical(dict(action=action,ok=True,fsync_completed=True))+b'\n',mut=True)
+  return self.workflow('activate',{'deployment':self.db,'probe':self.pb},dict(state='ACTIVE',activation_receipt=ar),{'directory_request':ib})
+ def validate(self,phase='stage',extra=None):
+  r={'deployment':self.db}
+  if phase not in ('probe','inventory','backup'):r['probe']=self.pb
+  if extra:r.update(extra)
+  return p.validate_requirements(r,self.m,phase,TX)
+ def test_full_16mib_binary_plus_framing_allowed(self):
+  folder=self.trans(self.r/'binary');raw=b'X'*(16<<20)+b'frame'*20;self.op(folder,'read-chunk',raw)
+  self.assertEqual(len(p.transport_proof(folder,p.SERIAL,TX,B)[0]['raw']),len(raw))
+ def test_stdout_declared_limit_not_exceeded(self):
+  folder=self.trans(self.r/'binary');d,_=self.op(folder,'read-chunk',b'x'*100)
+  for n in ('IN_FLIGHT.json','COMPLETE.json'):self.change(d/n,lambda r:r.update(output_limit=99))
+  with self.assertRaises(p.Refusal):p.transport_proof(folder,p.SERIAL,TX,B)
+ def test_transport_output_hard_bound(self):
+  folder=self.trans(self.r/'binary');d,_=self.op(folder,'read-chunk',b'')
+  for n in ('IN_FLIGHT.json','COMPLETE.json'):self.change(d/n,lambda r:r.update(output_limit=p.MAX_TRANSPORT_OUTPUT+1))
+  with self.assertRaises(p.Refusal):p.transport_proof(folder,p.SERIAL,TX,B)
+ def test_upload_payload_different(self):
+  d=next((self.r/'deploy/transport').glob('000001-*'))
+  for n in ('IN_FLIGHT.json','COMPLETE.json'):self.change(d/n,lambda r:r.update(payload_sha256='f'*64))
+  with self.assertRaises(p.Refusal):self.validate('inventory')
+ def test_archive_raw_disconnected(self):
+  d=next((self.r/'deploy/transport').glob('000002-*'));raw=p.canonical({'event':'BEGIN'})+b'\n'+p.canonical({'event':'RESULT','complete':False})+b'\n'
+  self.raw(d,raw,0);self.change(d/'COMPLETE.json',lambda r:r.update(stdout_sha256=p.sha(raw)))
+  with self.assertRaises(p.Refusal):self.validate('inventory')
+ def test_deployment_completed(self):self.assertFalse(self.validate('inventory')['execution_authorized'])
+ def test_probe_crossboot(self):self.assertEqual(self.validate()['probe']['state'],self.validate()['deployment']['state'])
+ def test_activation_real_tar_journal(self):self.assertEqual(self.validate('install',{'activation':self.activation()})['activation']['txid'],TX)
+ def test_missing_probe(self):
+  with self.assertRaises(p.Refusal):p.validate_requirements({'deployment':self.db},self.m,'stage',TX)
+ def test_wrong_tx(self):
+  with self.assertRaises(p.Refusal):p.validate_requirements({'deployment':self.db},self.m,'inventory','f'*16)
+ def test_standalone_probe_result_rejected(self):
+  self.pb=p.bind(self.r/'probe/transport/NOREPLACE_HOST_RESULT.json')
+  with self.assertRaises((p.Refusal,KeyError)):self.validate()
+ def test_missing_complete(self):
+  next((self.r/'probe/transport').glob('000002-*/COMPLETE.json')).unlink()
+  with self.assertRaises(FileNotFoundError):self.validate()
+ def test_missing_followup(self):
+  next((self.r/'probe/transport').glob('000002-*/part-*/PART_VERIFIED.json')).unlink()
+  with self.assertRaises(FileNotFoundError):self.validate()
+ def test_uncertain(self):
+  self.write(self.r/'probe/transport/UNCERTAIN.json',{})
+  with self.assertRaises(p.Refusal):self.validate()
+ def test_raw_tamper(self):
+  next((self.r/'probe/transport').glob('000002-*/stdout.bin')).write_bytes(b'{}\n')
+  with self.assertRaises(p.Refusal):self.validate()
+ def test_timeout(self):
+  self.change(next((self.r/'probe/transport').glob('000002-*/transport-result.json')),lambda r:r.update(elapsed_seconds=8.1))
+  with self.assertRaises(p.Refusal):self.validate()
+ def test_backup_tamper(self):
+  ab=self.activation();(self.r/'old.tar').write_bytes(b'bad')
+  with self.assertRaises(Exception):self.validate('install',{'activation':ab})
+ def test_incomplete_journal(self):
+  ab=self.activation();f=self.r/'activate/directory-session/journal.jsonl';f.write_bytes(b'\n'.join(f.read_bytes().splitlines()[:-1])+b'\n')
+  with self.assertRaises(p.Refusal):self.validate('install',{'activation':ab})
+ def test_missing_move_complete(self):
+  ab=self.activation();(self.r/'activate/directory-session/MOVE-ACTIVATE-COMPLETE.json').unlink()
+  with self.assertRaises(FileNotFoundError):self.validate('install',{'activation':ab})
+ def test_source_pin(self):
+  ab=self.activation();self.m['modules']['directory_session']='f'*64
+  with self.assertRaises(p.Refusal):self.validate('install',{'activation':ab})
+ def current(self,drift=None):
+  v=self.validate();a=api.AndroidDirectoryAdapter.__new__(api.AndroidDirectoryAdapter);a.txid=TX;a.boot_id=B2;a._part=None
+  t=SimpleNamespace(recovery_context=None,reconciliation_only=False,poisoned=False,serial=p.SERIAL,txid=TX,boot_id=B2,state=p.ROOT/('evidence/e5-clean-v3-device-state-'+p.SERIAL));a._ensure_transport=lambda:t;a._locked=lambda:'SYNTHETIC LOCK\n'
+  rows={k:copy.deepcopy(self.state[k]) for k in ('data','local','tmp')};rows.update(lock=copy.deepcopy(self.state['new_lock']),owner=copy.deepcopy(self.state['new_owner']))
+  if drift:drift(rows,t)
+  def line(k,s):return (k+'\t'+'|'.join([format(s['mode_bits'],'x'),str(s['dev']),str(s['inode']),str(s['bytes']),s['mode'],str(s['uid']),str(s['gid']),str(s['nlink']),s['mtime'],s['ctime'],s['mtime_text'],s['ctime_text'],'0','0'])).encode()
+  data=[line(k,s) for k,s in rows.items()]+[('OWNER\t'+p.sha((TX+'\n').encode())+'  '+p.LOCK+'/owner').encode()];programs=dict(v['deployment']['programs']);q=v['probe']['program'];programs[q['path']]=q
+  for i,(path,item) in enumerate(sorted(programs.items())):
+   meta=copy.deepcopy(item.get('metadata',self.stat(500,False)));meta.update(bytes=item['bytes'],mode='700',mode_bits=stat.S_IFREG|0o700);data.extend([line('PROGRAM'+str(i),meta),(item['sha256']+'  '+path).encode(),line('AFTER'+str(i),meta)])
+  def request(label,script,**kw):
+   self.assertNotIn('mutating',kw);self.assertNotIn('payload',kw)
+   for bad in ('dd ','mkdir ','rm ','mv ','chmod ','reboot','mount '):self.assertNotIn(bad,script)
+   return kw['validator'](b'\n'.join(data)+b'\n')
+  a._request=request;return p.verify_current(a,v,self.m)
+ def test_current_realclass_readonly(self):self.assertFalse(self.current()['device_writes'])
+ def test_current_inode_drift(self):
+  with self.assertRaises(p.Refusal):self.current(lambda r,t:r['owner'].update(inode=999))
+ def test_current_parent_drift(self):
+  with self.assertRaises(p.Refusal):self.current(lambda r,t:r['data'].update(inode=999))
+ def test_current_recovery_refused(self):
+  with self.assertRaises(p.Refusal):self.current(lambda r,t:setattr(t,'reconciliation_only',True))
+ def test_current_state_bypass_refused(self):
+  with self.assertRaises(p.Refusal):self.current(lambda r,t:setattr(t,'state',self.r/'wrong'))
+if __name__=='__main__':unittest.main()

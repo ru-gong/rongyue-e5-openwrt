@@ -1,0 +1,57 @@
+"""Prefix continuation orchestration using real pinned host input, no device."""
+import hashlib,importlib.util,sys,tempfile,types,unittest
+from pathlib import Path
+import resume as r
+sys.path.insert(0,str(r.CORE))
+s=importlib.util.spec_from_file_location('_prefix_input_reader',r.CORE/'bounded_stage.py');fixed=importlib.util.module_from_spec(s);sys.modules[s.name]=fixed;s.loader.exec_module(fixed)
+C=4<<20
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(prefix='e5-prefix-resume-test-');self.addCleanup(self.tmp.cleanup)
+  self.p=Path(self.tmp.name).resolve()/'input';self.data=b'a'*C+b'b'*C;self.p.write_bytes(self.data)
+  self.item=types.SimpleNamespace(size=len(self.data),sha256=hashlib.sha256(self.data).hexdigest())
+ def run_stream(self,count,*,remote=None,meta_change=False,replace=False):
+  content=bytearray(self.data[:count] if remote is None else remote);calls=[];reads=[];meta={'inode':99,'bytes':count,'mode':'600'}
+  def read(path,offset,length,expected):
+   reads.append((offset,length));return bytes(content[offset:offset+length]),dict(meta,inode=100) if meta_change else meta
+  def write(name,item,offset,payload,inode):
+   self.assertEqual(offset,len(content));self.assertEqual(inode,99 if offset else 0);calls.append((offset,len(payload)))
+   content.extend(payload)
+   if replace:self.p.rename(self.p.with_name('retained'));self.p.write_bytes(self.data)
+   return {'inode':99,'size':len(content)}
+  a=types.SimpleNamespace(path=lambda role:'/data/e5linux.stage.'+'1'*16,_read_twice=read)
+  writer=types.SimpleNamespace(write=write);prefix={'bytes':count,'inode':99,'meta':meta} if count else None
+  with fixed.PinnedInput(self.p,self.item.size,self.item.sha256) as source:
+   result=r.stream_file(a,writer,source,self.item,'openwrt.ext4',prefix)
+  return result,calls,reads,bytes(content)
+ def test_default_gate_disabled(self):self.assertFalse(r.DEVICE_RESUME_ENABLED)
+ def test_existing_prefix_read_and_skipped_once(self):
+  result,calls,reads,data=self.run_stream(C);self.assertEqual(calls,[(C,C)]);self.assertEqual(reads,[(0,C)])
+  self.assertEqual(result['prefix_bytes_skipped'],C);self.assertEqual(data,self.data)
+ def test_complete_file_verified_without_rewrite(self):
+  result,calls,reads,data=self.run_stream(2*C);self.assertEqual(calls,[]);self.assertEqual(reads,[(0,2*C)])
+  self.assertEqual(result['new_bytes'],0)
+ def test_absent_file_uses_exclusive_first_chunk(self):
+  result,calls,reads,data=self.run_stream(0);self.assertEqual(calls,[(0,C),(C,C)]);self.assertEqual(reads,[]);self.assertEqual(data,self.data)
+ def test_bad_existing_prefix_rejected_before_append(self):
+  with self.assertRaises(RuntimeError):self.run_stream(C,remote=b'x'*C)
+ def test_prefix_inode_drift_rejected(self):
+  with self.assertRaises(RuntimeError):self.run_stream(C,meta_change=True)
+ def test_nonboundary_prefix_rejected(self):
+  with self.assertRaises(RuntimeError):self.run_stream(3)
+ def test_source_replacement_detected(self):
+  with self.assertRaises(fixed.InputChanged):self.run_stream(C,replace=True)
+ def test_exact_inventory(self):
+  meta={'type':'f','dev':1,'inode':3,'bytes':C,'mode':'600','uid':0,'gid':0,'nlink':1}
+  case={'stage_identity':[1,2],'prefix':{'openwrt.ext4':{'meta':meta,'bytes':C,'total':2*C}}}
+  rows=[{'path':'.','type':'d','dev':1,'inode':2,'mode':'700','uid':0,'gid':0},{'path':'./openwrt.ext4',**meta}]
+  self.assertTrue(r.prefix_inventory(case,rows))
+  for field,value in (('inode',4),('mode','644'),('bytes',C-1),('nlink',2)):
+   bad=[dict(x) for x in rows];bad[1][field]=value
+   with self.subTest(field=field),self.assertRaises(RuntimeError):r.prefix_inventory(case,bad)
+ def test_unexpected_or_missing_file_refused(self):
+  case={'stage_identity':[1,2],'prefix':{}}
+  root={'path':'.','type':'d','dev':1,'inode':2,'mode':'700','uid':0,'gid':0}
+  with self.assertRaises(RuntimeError):r.prefix_inventory(case,[root,dict(root,path='./extra')])
+
+if __name__=='__main__':unittest.main(verbosity=2)

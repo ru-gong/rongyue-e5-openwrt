@@ -1,0 +1,7 @@
+# 441f SIM 三gate纯主机启用
+
+已按主线程授权执行一次固定copy。原prepare与四族均未改；新SIM live仅observe/rearm/sim_nv三个gate变化，generic recovery仍禁用。现场首次install/NV/无卡整体及SIM冷观察材料未在本目录创建。
+
+activate.py默认plan，copy仅创建固定新目录且拒覆盖；本次已完成，不重复copy。host_smoke.py只导入和验证固定本机材料，在导入前禁止外部进程、socket与真实state/ledger访问。它不构造transport/backend，不执行任何入口。旧prepare的81项业务测试已独审，不在enabled副本重跑禁用gate测试。
+
+HOST_COPY.json与ENABLED_COPY.patch描述精确复制范围；HOST_SMOKE.json是本机材料/导入结果，不是现场准入。最终独审另行绑定，原历史README/SOURCE_BINDINGS仍是prepare来源说明，live目录LIVE_RUN_NOTES.md明确当前已启用。

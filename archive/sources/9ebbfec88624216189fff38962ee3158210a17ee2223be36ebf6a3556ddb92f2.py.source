@@ -1,0 +1,80 @@
+"""Memory-only final-family fixtures. Deny external IO and actual device state."""
+import sys
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2]
+FORBIDDEN=(ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED',ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED',ROOT/'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock')
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.fork','os.posix_spawn'):raise AssertionError('external operation')
+ if event=='open' and args and isinstance(args[0],str):
+  p=Path(args[0]).absolute()
+  if any(p==x or p.is_relative_to(x) for x in FORBIDDEN):raise AssertionError('real state access')
+sys.addaudithook(audit)
+import ast,copy,json,unittest
+from unittest.mock import patch
+import rebind as b
+BASE_RESULT=b.ROOT/'tools/e5_activation_bundle_b56c60a03de00603/RESULT.json'
+class Tests(unittest.TestCase):
+ @classmethod
+ def setUpClass(cls):
+  cls.base=b.sources();cls.r0=json.loads(b.read(BASE_RESULT));cls.raw0={k:b.read(v['path']) for k,v in cls.r0['files'].items()};cls.realread=staticmethod(b.read)
+ def setUp(self):
+  self.family='eeeeeeeeeeeeeeee';self.r=copy.deepcopy(self.r0);self.r['activation_id']=self.family
+  self.r['directories']={k:v.replace('b56c60a03de00603',self.family) for k,v in self.r['directories'].items()};self.data=copy.deepcopy(self.raw0)
+  for key in ('core/bounded_transport.py','core/bounded_boot_control.py','core/uncertainty_recovery.py','core/workflow.py','core/phase_evidence.py','recovery/common.py','scanner/stage2_deploy.py'):self.data[key]=b.read(b.CLOSURE/'overlay'/key)
+  pins={n:b.sha(self.data['core/'+n+'.py']) for n in b.RUNTIME};common=self.data['recovery/common.py'].decode();common=b.replace(common,'PINS','PINS='+repr(pins),ast.Assign);common=b.replace(common,'LIVE',"LIVE=ROOT/'tools/e5_nextphase_core_live_"+self.family+"'",ast.Assign);self.data['recovery/common.py']=common.encode()
+  core=json.loads(self.data['core/SOURCE_MANIFEST.json']);core['modules'].update(pins);core['closure']=b.pin(b.CLOSURE/'closure.py');core['closure_case']=b.pin(b.CLOSURE/'CASE.json');self.data['core/SOURCE_MANIFEST.json']=b.encoded(core)
+  rm=json.loads(self.data['recovery/MANIFEST.json'])
+  for n in b.FAMILY:rm['files'][n]={'bytes':len(self.data['recovery/'+n]),'sha256':b.sha(self.data['recovery/'+n])}
+  self.data['recovery/MANIFEST.json']=b.encoded(rm);self.map={};self.resultpath=b.ROOT/f'tools/e5_activation_bundle_{self.family}/RESULT.json';self.reseal()
+  self.v={'schema':'e5-sim-lifecycle-rebind-input-v1','result':{'path':str(self.resultpath),'sha256':b.sha(self.map[str(self.resultpath)])},'closure_manifest':{'path':str(b.CLOSURE/'MANIFEST.json'),'sha256':b.CLOSURE_MANIFEST_SHA},'output_name':f'e5_sim_rearm_{self.family}_prepare_20261016'}
+  self.p=patch.object(b,'read',side_effect=lambda p:self.map[str(p)] if str(p) in self.map else self.realread(p));self.p.start();self.addCleanup(self.p.stop)
+ def reseal(self):
+  for k,raw in self.data.items():
+   group,rel=k.split('/',1);p=str(Path(self.r['directories'][group])/rel);self.r['files'][k]={'path':p,'bytes':len(raw),'sha256':b.sha(raw)};self.map[p]=raw
+  self.map[str(self.resultpath)]=b.encoded(self.r)
+  if hasattr(self,'v'):self.v['result']['sha256']=b.sha(self.map[str(self.resultpath)])
+ def corrupt_common(self,change):
+  self.data['recovery/common.py']=change(self.data['recovery/common.py'].decode()).encode();rm=json.loads(self.data['recovery/MANIFEST.json']);rm['files']['common.py']={'bytes':len(self.data['recovery/common.py']),'sha256':b.sha(self.data['recovery/common.py'])};self.data['recovery/MANIFEST.json']=b.encoded(rm);self.reseal()
+ def reject(self):
+  with self.assertRaises(b.Refusal):b.validate_inputs(self.v)
+ def test_memory_family_validates_without_runtime_import(self):self.assertEqual(b.validate_inputs(self.v)['family'],self.family);self.assertFalse(any(k.startswith('_e5_') for k in sys.modules))
+ def test_real_b56c_rejected_not_new_closure(self):self.v['result']={'path':str(BASE_RESULT),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'};self.reject()
+ def test_third_permanent_omission_rejected(self):self.corrupt_common(lambda s:s.replace("'RECOVERY_REPAIR_TRANSITION.json',",''));self.reject()
+ def test_new_temporary_omission_rejected(self):self.corrupt_common(lambda s:s.replace(",'RECOVERY_LIFECYCLE_TRANSITION.json'",''));self.reject()
+ def test_state_function_change_rejected(self):self.corrupt_common(lambda s:s.replace('normal=True','normal=False',1));self.reject()
+ def test_old_closure_binding_rejected(self):
+  m=json.loads(self.data['core/SOURCE_MANIFEST.json']);m['closure']['sha256']='0'*64;self.data['core/SOURCE_MANIFEST.json']=b.encoded(m);self.reseal();self.reject()
+ def test_actual_source_hash_drift_rejected(self):self.map[self.r['files']['core/bounded_transport.py']['path']]+=b'\n# drift';self.reject()
+ def test_wrong_runtime_pin_rejected(self):self.corrupt_common(lambda s:s.replace(b.sha(self.data['core/bounded_transport.py']),'0'*64));self.reject()
+ def test_history_live_wrong_family_rejected(self):self.corrupt_common(lambda s:s.replace("e5_nextphase_core_live_"+self.family,"e5_nextphase_core_live_b56c60a03de00603"));self.reject()
+ def test_other_common_functions_unchanged(self):
+  out=b.render(b.validate_inputs(self.v));old=self.realread(b.BASE/'common.py').decode();new=out['common.py'].decode()
+  for n in ast.parse(old).body:
+   if isinstance(n,ast.FunctionDef) and n.name not in b.FUNCTIONS:self.assertEqual(ast.dump(n,include_attributes=False),ast.dump(b.node(new,n.name),include_attributes=False),n.name)
+ def test_wrong_bundle_path_rejected(self):self.v['result']['path']=str(BASE_RESULT);self.reject()
+ def test_wrong_output_name_rejected(self):self.v['output_name']='e5_sim_rearm_other_prepare';self.reject()
+ def test_old_policy_changed_rejected(self):self.data['recovery/evidence_contract.py']+=b'\n# drift';self.reseal();self.reject()
+ def test_missing_family_file_rejected(self):
+  del self.r['files']['recovery/common.py'];self.map[str(self.resultpath)]=b.encoded(self.r);self.v['result']['sha256']=b.sha(self.map[str(self.resultpath)]);self.reject()
+ def test_wrong_declared_size_rejected(self):
+  self.r['files']['recovery/common.py']['bytes']+=1;self.map[str(self.resultpath)]=b.encoded(self.r);self.v['result']['sha256']=b.sha(self.map[str(self.resultpath)]);self.reject()
+ def test_input_extra_field_rejected(self):self.v['trusted']=True;self.reject()
+ def test_missing_fixed_closure_refused(self):self.v['closure_manifest']['sha256']='0'*64;self.reject()
+ def test_render_eight_unchanged_and_four_state_functions(self):
+  x=b.validate_inputs(self.v);out=b.render(x)
+  for n in b.UNCHANGED:self.assertEqual(out[n],self.realread(b.BASE/n),n)
+  self.assertTrue(b.exact_functions(out['common.py'].decode(),x['common']));self.assertEqual(b.assign(out['common.py'].decode(),'MARKERS'),b.MARKERS)
+  for n,raw in out.items():
+   if n.endswith('.py'):compile(raw,n,'exec')
+ def test_output_three_permanent_and_new_temporary_manifest(self):
+  out=b.render(b.validate_inputs(self.v));m=json.loads(out['MANIFEST.json']);self.assertEqual(m['closure_state']['permanent'],list(b.MARKERS[3:6]));self.assertEqual(m['closure_state']['unfinished_new_recovery'],b.MARKERS[6]);self.assertEqual(m['write_scope_if_separately_enabled']['bytes'],32)
+ def test_copy_disabled_before_source_validation_or_mkdir(self):
+  with patch.object(b,'validate_inputs',side_effect=AssertionError('must not enter')):
+   with self.assertRaisesRegex(b.Refusal,'copy disabled'):b.build({})
+ def test_dependency_first_install_and_history_are_exact(self):
+  out=b.render(b.validate_inputs(self.v));d=json.loads(out['DEPENDENCIES.json']);self.assertEqual(d['activation_source'],self.v['result']);self.assertEqual(d['first_install_sources']['workflow_sha256'],b.sha(self.data['core/workflow.py']));self.assertEqual(set(d['no_sim_family']['files']),set(b.FAMILY));self.assertEqual(b.assign(out['common.py'].decode(),'DEPENDENCIES_SHA'),b.sha(out['DEPENDENCIES.json']))
+ def test_output_gates_disabled_and_old_three_test_files_preserved(self):
+  out=b.render(b.validate_inputs(self.v))
+  for n in ('test_regression.py','test_sim.py','test_origin.py'):self.assertEqual(out[n],self.realread(b.BASE/n))
+  for n,g,val in [('observe.py','DEVICE_IO_ENABLED',False),('rearm.py','REARM_IO_DISABLED',True),('recovery.py','RECOVERY_IO_DISABLED',True),('sim_nv.py','NV_IO_DISABLED',True)]:self.assertEqual(b.assign(out[n].decode(),g),val)
+if __name__=='__main__':unittest.main(verbosity=2)

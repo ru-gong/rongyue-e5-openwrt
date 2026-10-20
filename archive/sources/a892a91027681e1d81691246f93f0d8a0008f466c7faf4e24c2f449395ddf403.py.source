@@ -1,0 +1,161 @@
+"""Narrow overlay tests. All transports are fake; host/temp state only."""
+import ast
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import unittest
+from unittest.mock import patch
+import types
+import datetime as dt
+import closure as c
+from test_closure import Fixture  # Installs external process/network deny hook.
+
+HERE=Path(__file__).resolve().parent
+def load(name,path):
+    spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+def extract(path,names,ns):
+    tree=ast.parse(path.read_text());nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in names]
+    assert len(nodes)==len(names);exec(compile(ast.Module(body=nodes,type_ignores=[]),str(path),'exec'),ns);return ns
+
+class ConsumerTests(unittest.TestCase):
+    def setUp(self):
+        self.f=Fixture();self.addCleanup(self.f.tmp.cleanup);self.e=self.f.e;self.e.close()
+        self.boot='00000000-0000-4000-8000-000000000001';self.tx='b'*16
+        self.guard=patch.object(c,'validate_closed',side_effect=lambda state,ledger:self.e.closed());self.guard.start();self.addCleanup(self.guard.stop)
+        self.m=load('_test_closure_transport',HERE/'overlay/core/bounded_transport.py');self.m._closure_api=lambda:c
+    def transport(self):
+        return self.m.BoundedTransport(self.f.root/'new-transport',self.f.state,'TEST123',self.boot,self.tx)
+    def fake(self,t):
+        calls=[]
+        def run(*args):
+            calls.append(args);return {'stdout':b'OK','stderr':b'','returncode':0,'failure':None,'stdin_bytes_sent':0,'elapsed_seconds':.01,'host_child_reaped':True,'remote_completion_proven':False}
+        t._collect=run;return calls
+    def test_normal_read_preserves_pending_new_operation_completes(self):
+        t=self.transport();calls=self.fake(t);raw=(self.f.state/c.PENDING).read_bytes()
+        self.assertEqual(t.request('read-test',['fake'],output_limit=10,validator=lambda x:x),b'OK')
+        self.assertEqual(len(calls),1);self.assertEqual((self.f.state/c.PENDING).read_bytes(),raw);self.assertFalse((self.f.state/'ACTIVE.json').exists())
+    def test_new_validation_failure_is_not_closed_by_old_receipt(self):
+        t=self.transport();calls=self.fake(t)
+        def reject(raw):raise ValueError('new unknown')
+        with self.assertRaises(self.m.Uncertain):t.request('read-test',['fake'],output_limit=10,validator=reject)
+        with self.assertRaises(self.m.TransportError):t.request('read-again',['fake'],output_limit=10,validator=lambda x:x)
+        self.assertEqual(len(calls),1);self.assertTrue((self.f.state/'ACTIVE.json').exists());self.assertTrue((self.f.state/'UNCERTAIN.json').exists())
+    def test_transition_stops_before_dispatch(self):
+        t=self.transport();calls=self.fake(t);(self.f.state/c.TRANSITION).write_text('{}')
+        with self.assertRaises(c.Refusal):t.request('read-test',['fake'],output_limit=10,validator=lambda x:x)
+        self.assertEqual(calls,[])
+    def test_retired_boot_stops_before_dispatch(self):
+        self.boot=self.f.case['boot_id'];t=self.transport();calls=self.fake(t)
+        with self.assertRaises(c.Refusal):t.request('read-test',['fake'],output_limit=10,validator=lambda x:x)
+        self.assertFalse(calls)
+    def test_retired_tx_stops_before_dispatch(self):
+        self.tx=self.f.case['txid'];t=self.transport();calls=self.fake(t)
+        with self.assertRaises(c.Refusal):t.request('read-test',['fake'],output_limit=10,validator=lambda x:x)
+        self.assertFalse(calls)
+    def test_legacy_transport_still_rejects_permanent_pending(self):
+        old=c.ROOT/'tools/e5_nextphase_core_live_6c405cb2e5c4447e/bounded_transport.py'
+        m=load('_test_legacy_transport',old);t=m.BoundedTransport(self.f.root/'legacy-evidence',self.f.state,'TEST123',self.boot,self.tx)
+        t._collect=lambda *a:self.fail('legacy dispatched')
+        with self.assertRaisesRegex(m.TransportError,'unfinished'):t.request('read',['fake'],output_limit=10,validator=lambda x:x)
+    def snapshot(self):
+        v=self.e.closed();s=self.f.snapshot(v)
+        return c.augment_snapshot(s,self.f.state,self.e.ledger)
+    def test_common_normal_and_recovery_keep_retired_history(self):
+        ns={'_closure_api':lambda:c,'STATE':self.f.state,'LEDGER':self.e.ledger}
+        extract(HERE/'overlay/recovery/common.py',{'normal_state','recovery_state'},ns)
+        s=self.snapshot();ns['normal_state'](s);ns['recovery_state'](s)
+        self.assertIn(self.f.case['txid'],s['used_txids']);self.assertNotEqual(s['markers'][c.PENDING],'ABSENT')
+        s['markers']['ACTIVE.json']={'path':'new','sha256':'0'*64}
+        with self.assertRaises(c.Refusal):ns['normal_state'](s)
+        ns['recovery_state'](s)  # Only a future reviewed recovery can use it.
+    def test_historical_snapshot_is_not_relabelled_current(self):
+        s=self.snapshot();old=s['ledger_head'];self.f.grow('START')
+        c.snapshot_gate(s,self.f.state,self.e.ledger,normal=True)
+        self.assertEqual(s['ledger_head'],old)
+        with self.assertRaises(c.Refusal):c.normal_gate(self.f.state,self.e.ledger)
+    def test_transition_in_snapshot_always_rejected(self):
+        s=self.snapshot();s['markers'][c.TRANSITION]={'path':'incomplete','sha256':'0'*64}
+        with self.assertRaises(c.Refusal):c.snapshot_gate(s,self.f.state,self.e.ledger)
+    def test_missing_retired_history_rejected(self):
+        s=self.snapshot();s['used_txids']=[]
+        with self.assertRaises(c.Refusal):c.snapshot_gate(s,self.f.state,self.e.ledger)
+    def test_scanner_direct_check_not_generic_pending_absent(self):
+        ns={'_closure_api':lambda:c,'STATE':self.f.state,'SERIAL':'TEST123','Path':Path,'require':c.need,
+            'bind':lambda p:p,'obj':lambda p:json.loads(Path(p).read_bytes())}
+        extract(HERE/'overlay/scanner/stage2_deploy.py',{'check_shared_state'},ns);ns['check_shared_state']()
+        (self.f.state/'UNCERTAIN.json').write_text('{}')
+        with self.assertRaises(c.Refusal):ns['check_shared_state']()
+    def test_future_grant_uses_distinct_transition_never_moves_pending(self):
+        tree=ast.parse((HERE/'overlay/core/uncertainty_recovery.py').read_text())
+        strings=[n.value for n in ast.walk(tree) if isinstance(n,ast.Constant) and isinstance(n.value,str)]
+        self.assertNotIn('RECOVERY_PENDING.json',strings);self.assertNotIn('RECOVERY_TRANSITION.json',strings);self.assertNotIn('RECOVERY_REPAIR_TRANSITION.json',strings);self.assertNotIn('RECOVERY_LIFECYCLE_TRANSITION.json',strings);self.assertIn('RECOVERY_POSTDEPLOY_TRANSITION.json',strings)
+        # Mutation allowlist and independent recovery bundle schema stay identical.
+        self.assertIn('write-boot_b',strings);self.assertIn('write-misc32',strings)
+        self.assertIn('e5-uncertainty-recovery-bundle-v3',strings)
+    def future_module(self):
+        (self.f.root/'evidence').mkdir(exist_ok=True)
+        boot=types.SimpleNamespace(ROOT=self.f.root,SERIAL='TEST123',valid_sha=lambda s:isinstance(s,str) and len(s)==64)
+        with patch.dict(sys.modules,{'bounded_boot_control':boot}):m=load('_test_future_recovery',HERE/'overlay/core/uncertainty_recovery.py')
+        m.state_path=lambda:self.f.state;m.ledger_path=lambda:self.e.ledger;m._closure_api=lambda:c;m.RECOVERY_TRANSITION_DISABLED=False
+        context={'request_sha256':'1'*64,'txid':self.tx,'boot_id':self.boot}
+        self.f.save('state/ACTIVE.json',{'serial':'TEST123','txid':self.tx,'boot_id':self.boot,'status':'IN_FLIGHT'})
+        self.f.save('state/UNCERTAIN.json',{'serial':'TEST123','txid':self.tx,'boot_id':self.boot,'status':'UNCERTAIN'})
+        bundle={'context':context,'markers':m.observed_markers(self.f.state)};self.f.save('future-bundle.json',bundle)
+        m._validated_bundle=lambda b,state:(context,dt.datetime.now(dt.timezone.utc))
+        p=self.f.root/'future-bundle.json';return m,p,c.sha(p.read_bytes()),context
+    def test_future_recovery_stage_and_validate_preserve_closure(self):
+        raw=(self.f.state/c.PENDING).read_bytes();m,p,digest,context=self.future_module()
+        self.assertEqual(m.stage(p,digest),context)
+        self.assertEqual((self.f.state/c.PENDING).read_bytes(),raw);self.assertFalse((self.f.state/c.TRANSITION).exists())
+        grant=m.validate_context(self.f.state,'TEST123',context)
+        self.assertEqual(grant['allowed_mutations'],['write-boot_b','write-misc32']);self.assertFalse(grant['automatic_resume'])
+        with self.assertRaises(c.Refusal):c.normal_gate(self.f.state,self.e.ledger)
+    def test_future_grant_interruption_keeps_three_barriers(self):
+        raw=(self.f.state/c.PENDING).read_bytes();m,p,digest,context=self.future_module();old=m.save
+        def interrupted(path,value):
+            old(path,value)
+            if path.name==c.TRANSITION:raise OSError('interrupted after new recovery transition')
+        m.save=interrupted
+        with self.assertRaises(OSError):m.stage(p,digest)
+        self.assertEqual((self.f.state/c.PENDING).read_bytes(),raw);self.assertTrue((self.f.state/c.TRANSITION).exists())
+        with self.assertRaises(c.Refusal):c.transport_gate(self.f.state,self.e.ledger,'TEST123',self.boot,self.tx)
+    def test_no_local_stop_waiver_overlay(self):
+        original=ast.parse((c.ROOT/'tools/e5_nextphase_core_live_441f60bc8933be12/phase_evidence.py').read_text())
+        current=ast.parse((HERE/'overlay/core/phase_evidence.py').read_text())
+        def value(tree):
+            return ast.literal_eval(next(n.value for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='STOP_NAMES' for t in n.targets)))
+        self.assertEqual(value(original),value(current))
+    def test_overlay_writer_gates_stay_disabled(self):
+        pairs=[('core/bounded_boot_control.py','DEVICE_IO_DISABLED'),('core/uncertainty_recovery.py','RECOVERY_TRANSITION_DISABLED'),('core/workflow.py','WORKFLOW_IO_DISABLED'),('scanner/stage2_deploy.py','DEVICE_IO_DISABLED')]
+        for rel,name in pairs:
+            t=ast.parse((HERE/'overlay'/rel).read_text());v=[n.value.value for n in t.body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id==name for x in n.targets)]
+            self.assertEqual(v,[True])
+    def test_all_overlay_syntax_compiles_no_execution(self):
+        for p in (HERE/'overlay').rglob('*.py'):compile(p.read_bytes(),str(p),'exec')
+    def test_observer_and_contract_not_modified(self):
+        self.assertFalse((HERE/'overlay/recovery/observe.py').exists());self.assertFalse((HERE/'overlay/recovery/evidence_contract.py').exists())
+
+    def test_b56c_transport_rejects_new_permanent_transition(self):
+        previous=load('_original_closure',c.ROOT/'tools/e5_lifecycle_stop_recovery_prepare_20261016/closure.py')
+        prior=dict(self.e.closed()['prior_closure'],current_ledger_head='x',current_ledger_last_event='COMPLETE')
+        old=load('_b36a_previous_transport',c.ROOT/'tools/e5_nextphase_core_live_441f60bc8933be12/bounded_transport.py')
+        old._closure_api=lambda:previous
+        t=old.BoundedTransport(self.f.root/'b36a-evidence',self.f.state,'TEST123',self.boot,self.tx)
+        t._collect=lambda *a:self.fail('b36a dispatched')
+        with patch.object(previous,'validate_closed',return_value=prior):
+            with self.assertRaisesRegex(previous.Refusal,'unfinished new recovery'):t.request('read',['fake'],output_limit=10,validator=lambda x:x)
+
+    def test_legacy_snapshot_only_historical_delegate(self):
+        old={'schema':'e5-readonly-closure-view-v1'}
+        s={'readonly_abort_closure':old,'markers':{c.PENDING:'ABSENT'}}
+        calls=[];prior=types.SimpleNamespace(snapshot_gate=lambda *a,**k:calls.append((a,k)) or {'historical':True})
+        with patch.object(c,'prior_api',return_value=prior):
+            self.assertEqual(c.snapshot_gate(s,self.f.state,self.e.ledger,normal=True),{'historical':True})
+            self.assertEqual(s,{'readonly_abort_closure':old,'markers':{c.PENDING:'ABSENT'}})
+            s['markers'][c.PENDING]={'path':'new','sha256':'0'*64}
+            with self.assertRaises(c.Refusal):c.snapshot_gate(s,self.f.state,self.e.ledger)
+        self.assertEqual(len(calls),1)
+
+
+if __name__=="__main__":unittest.main(verbosity=2)

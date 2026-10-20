@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Fixed-input HOST-ONLY boot repacker. No device/ADB/VM/network API.
+
+Only the init member changes. Every other cpio record, kernel, command line,
+vbmeta bytes and both this-device BC templates must remain exact. Outputs are
+exclusive ordinary host files beneath one new materials directory.
+"""
+from __future__ import annotations
+import argparse
+import copy
+import ctypes
+import difflib
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import struct
+import subprocess
+import sys
+import zlib
+
+ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+OUT = ROOT / 'materials/openwrt-no-auto-fsck-20261015'
+BASE = ROOT / 'evidence/stage2-execution-20261013/final-install-bundle'
+OLD_CANDIDATE = ROOT / 'research/author-clean-reinstall-20261014/candidate.json'
+OLD_CANDIDATE_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+OLD_BOOT_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+OLD_INIT_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+RAW = ROOT / 'research/author-clean-reinstall-20261014/host-staging-v3/openwrt.ext4'
+LZ4 = Path('/opt/homebrew/bin/lz4')
+LZ4LIB = Path('/opt/homebrew/opt/lz4/lib/liblz4.dylib')
+BOOT_BYTES, PAGE, LOG_START, LOG_END = 64 << 20, 4096, 56 << 20, 60 << 20
+DEVICE_EXECUTION_SUPPORTED = False
+OLD_FUNCTION = b'''mount_userdata_root() {
+    mount -t f2fs -o noatime,nodiratime "$data" /data 2>>/run/datamount.err && return 0
+    # No fsck on the fast path, TF boot, boot-choice or firmware probes.
+    # Reload firmware from a clean boot after recovery: it may have failed
+    # earlier while userdata was corrupt. Only the fault path reboots.
+    . /etc/f2fs-repair.sh
+    if f2fs_repair_userdata "$data"; then
+        log "stage=f2fs-repaired reboot-for-clean-firmware-load"
+        write_misc_bc /etc/misc-bc-slot-b-trial.bin f2fs-repair-rearm
+        sync
+        persist
+        reboot -f
+    fi
+    log "stage=f2fs-recovery-incomplete retaining-rescue-fallback"
+    return 1
+}'''
+NEW_FUNCTION = b'''mount_userdata_root() {
+    mount -t f2fs -o noatime,nodiratime "$data" /data 2>>/run/datamount.err && return 0
+    # This trial permits no whole-userdata repair. Preserve the failure and
+    # use the unchanged rescue path: restore slot A, expose rescue USB, and
+    # retain its existing safety timer. Do not repair, re-arm B, or reboot here.
+    log "stage=data-mount-failed no-auto-fsck retaining-rescue-fallback"
+    return 1
+}'''
+
+class Rejected(ValueError): pass
+def need(ok, why):
+    if not ok: raise Rejected(why)
+def sha(data): return hashlib.sha256(data).hexdigest()
+def file_sha(path):
+    h = hashlib.sha256()
+    with Path(path).open('rb') as f:
+        for b in iter(lambda: f.read(8 << 20), b''): h.update(b)
+    return h.hexdigest()
+def input_file(path, expected=None, size=None):
+    path = Path(path)
+    need(path.is_absolute() and not path.is_symlink() and all(not p.is_symlink() for p in path.parents), 'unsafe host input')
+    st = path.stat(); need(stat.S_ISREG(st.st_mode), 'input not regular')
+    if size is not None: need(st.st_size == size, 'input length differs')
+    if expected is not None: need(file_sha(path) == expected, 'input SHA differs: ' + path.name)
+    return path
+def save(path, data):
+    path = Path(path)
+    need(path.is_relative_to(OUT) and not path.is_symlink() and all(not p.is_symlink() for p in path.parents), 'output outside fixed host directory')
+    with path.open('xb') as f:
+        f.write(data); f.flush(); os.fsync(f.fileno())
+def json_save(path, value): save(path, (json.dumps(value, ensure_ascii=False, indent=2) + '\n').encode())
+def align(n): return (n + 3) & ~3
+def align_page(n): return (n + PAGE - 1) & ~(PAGE - 1)
+
+def decompress_legacy(frame):
+    need(frame[:4] == bytes.fromhex('02214c18'), 'not legacy LZ4')
+    lib = ctypes.CDLL(str(LZ4LIB))
+    lib.LZ4_decompress_safe.argtypes = [ctypes.c_char_p, ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    lib.LZ4_decompress_safe.restype = ctypes.c_int
+    pos, result, chunks = 4, bytearray(), 0
+    while pos < len(frame):
+        need(pos + 4 <= len(frame), 'truncated LZ4 length')
+        n = struct.unpack_from('<I', frame, pos)[0]; pos += 4
+        need(0 < n <= (8 << 20) + (1 << 16) and pos + n <= len(frame), 'invalid LZ4 block')
+        buf = ctypes.create_string_buffer(8 << 20)
+        length = lib.LZ4_decompress_safe(frame[pos:pos+n], buf, n, 8 << 20)
+        need(0 < length <= 8 << 20, 'LZ4 decode failed')
+        result.extend(buf.raw[:length]); pos += n; chunks += 1
+        need(len(result) <= 32 << 20 and chunks <= 4, 'ramdisk cap')
+    return bytes(result)
+
+def parse_cpio(data):
+    pos, rows, names = 0, [], set()
+    while True:
+        start = pos; need(pos + 110 <= len(data) and data[pos:pos+6] == b'070701', 'invalid newc header')
+        header = data[pos:pos+110]
+        try: fields = [int(header[6+i*8:14+i*8], 16) for i in range(13)]
+        except ValueError as e: raise Rejected('bad cpio number') from e
+        size, ns = fields[6], fields[11]; pos += 110
+        need(0 < ns <= 4096 and pos + ns <= len(data), 'cpio name length')
+        nb = data[pos:pos+ns]; need(nb[-1:] == b'\0' and b'\0' not in nb[:-1], 'cpio name terminator')
+        name = nb[:-1].decode('ascii'); need(name not in names and name and not name.startswith('/') and '..' not in name.split('/'), 'cpio name unsafe/duplicate')
+        names.add(name); pos = align(pos + ns)
+        need(pos + size <= len(data), 'cpio payload overflow')
+        payload = data[pos:pos+size]; pos = align(pos + size)
+        need(pos <= len(data), 'cpio padding overflow')
+        rows.append(dict(name=name, header=header, fields=fields, data=payload, raw=data[start:pos]))
+        if name == 'TRAILER!!!':
+            need(size == 0 and not any(data[pos:]), 'trailing cpio garbage')
+            return rows, data[pos:]
+
+def patch_init(original):
+    need(sha(original) == OLD_INIT_SHA and original.count(OLD_FUNCTION) == 1, 'unexpected original init')
+    changed = original.replace(OLD_FUNCTION, NEW_FUNCTION)
+    need(b'. /etc/f2fs-repair.sh' not in changed and b'f2fs_repair_userdata' not in changed, 'automatic repair reference retained')
+    need(changed.replace(NEW_FUNCTION, OLD_FUNCTION) == original, 'change escaped one function')
+    return changed
+
+def replace_cpio_init(cpio, replacement):
+    rows, trailing = parse_cpio(cpio)
+    need(len(rows) == 76 and sum(r['name'] == 'init' for r in rows) == 1, 'unexpected original cpio inventory')
+    chunks = []
+    for row in rows:
+        if row['name'] != 'init': chunks.append(row['raw']); continue
+        need(row['fields'][1] == 0o100755, 'init mode')
+        h = bytearray(row['header']); h[54:62] = f'{len(replacement):08x}'.encode()
+        nb = b'init\0'; record = bytes(h) + nb
+        record += b'\0' * ((-len(record)) % 4)
+        record += replacement + b'\0' * ((-len(replacement)) % 4)
+        chunks.append(record)
+    return b''.join(chunks) + trailing
+
+def parse_boot(data):
+    need(len(data) == BOOT_BYTES and data[:8] == b'ANDROID!' and struct.unpack_from('<I', data, 40)[0] == 4, 'boot identity')
+    ks, rs = struct.unpack_from('<II', data, 8); ro = PAGE + align_page(ks)
+    need(0 < ks < LOG_START and 0 < rs and ro + rs < LOG_START, 'payload layout')
+    need(data[-64:-60] == b'AVBf', 'AVB footer absent')
+    original, vo, vs = struct.unpack_from('>QQQ', data, len(data)-64+12)
+    need(original == vo == align_page(ro+rs) and 0 < vs and vo+vs < LOG_START, 'AVB placement')
+    need(not any(data[PAGE+ks:ro]) and not any(data[ro+rs:vo]), 'nonzero payload padding')
+    need(not any(data[vo+vs:-64]), 'unexpected boot tail data')
+    return dict(kernel=data[PAGE:PAGE+ks], kernel_size=ks, ramdisk=data[ro:ro+rs], ramdisk_size=rs,
+                ramdisk_offset=ro, vbmeta=data[vo:vo+vs], vbmeta_offset=vo, vbmeta_size=vs,
+                header=data[:PAGE], footer=data[-64:])
+
+def repack(old, cpio):
+    info = parse_boot(old)
+    ram = subprocess.run([str(LZ4), '-l', '-12', '-c'], input=cpio, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         timeout=30, check=True).stdout
+    need(decompress_legacy(ram) == cpio, 'compressor round-trip failed')
+    header = bytearray(info['header']); struct.pack_into('<I', header, 12, len(ram))
+    body = bytes(header) + info['kernel'] + b'\0' * ((-info['kernel_size']) % PAGE) + ram
+    body += b'\0' * ((-len(body)) % PAGE); original = len(body)
+    body += info['vbmeta']; need(len(body) < LOG_START, 'payload overlaps diagnostic log')
+    body += b'\0' * (BOOT_BYTES-64-len(body))
+    footer = bytearray(info['footer']); struct.pack_into('>QQQ', footer, 12, original, original, info['vbmeta_size'])
+    return body + bytes(footer)
+
+def compare(old, new):
+    a, b = parse_boot(old), parse_boot(new)
+    ar, _ = parse_cpio(decompress_legacy(a['ramdisk'])); br, _ = parse_cpio(decompress_legacy(b['ramdisk']))
+    need([r['name'] for r in ar] == [r['name'] for r in br], 'member set/order changed')
+    changes = []
+    members = {}
+    for x, y in zip(ar, br):
+        if x['raw'] != y['raw']: changes.append(x['name'])
+        members[y['name']] = dict(bytes=len(y['data']), sha256=sha(y['data']), mode=oct(y['fields'][1]))
+        if x['name'] == 'init':
+            need(y['data'] == patch_init(x['data']), 'unexpected patched init')
+            xf, yf = x['fields'][:], y['fields'][:]; xf[6] = yf[6]
+            need(xf == yf, 'init cpio metadata changed')
+    need(changes == ['init'], 'other cpio member changed')
+    need(a['kernel'] == b['kernel'] and a['vbmeta'] == b['vbmeta'], 'kernel/vbmeta changed')
+    ah, bh = bytearray(a['header']), bytearray(b['header']); ah[12:16] = bh[12:16]
+    need(ah == bh, 'header changed outside ramdisk size')
+    af, bf = bytearray(a['footer']), bytearray(b['footer']); af[12:28] = bf[12:28]
+    need(af == bf, 'footer changed outside payload/vbmeta offsets')
+    for name in ('etc/misc-bc-slot-a.bin', 'etc/misc-bc-slot-b-trial.bin'):
+        row = next(r for r in br if r['name'] == name); value = row['data']
+        need(len(value) == 32 and value[4:8] == b'BCAB' and zlib.crc32(value[:28]) == struct.unpack('<I',value[28:])[0], 'BC template CRC')
+    init = next(r['data'] for r in br if r['name'] == 'init')
+    need(b'bs=4096 seek=$PERSIST_SEEK_BLOCKS count=1024 conv=notrunc' in init and b'PERSIST_SEEK_BLOCKS=14336' in init, 'diagnostic bound lost')
+    return dict(changed_members=changes, member_count_excluding_trailer=len(br)-1, members=members,
+                kernel_sha256=sha(b['kernel']), kernel_size=b['kernel_size'], ramdisk_offset=b['ramdisk_offset'], ramdisk_bytes=b['ramdisk_size'],
+                vbmeta_offset=b['vbmeta_offset'], vbmeta_bytes=b['vbmeta_size'], payload_end_before_56mib=True,
+                kernel_unchanged=True, commandline_unchanged=True, vbmeta_blob_unchanged=True,
+                avb_resigned=False, non_init_records_byte_identical=True, templates_exact_unchanged=True,
+                diagnostic_window_initially_zero=True, init_sha256=sha(init),
+                boot_sha256=sha(new), sha256_head56m=sha(new[:LOG_START]), sha256_tail4m=sha(new[LOG_END:]),
+                whole_userdata_automatic_repair=False, repair_tools_retained_but_not_automatically_called=True,
+                existing_android_fallback_timer_preserved=True, hardware_validated=False)
+
+def build():
+    need(not OUT.exists() and not OUT.is_symlink(), 'output already exists; no overwrite/replay')
+    c = json.loads(input_file(OLD_CANDIDATE, OLD_CANDIDATE_SHA).read_text())
+    old = input_file(BASE/'boot.img', OLD_BOOT_SHA, BOOT_BYTES).read_bytes()
+    info = parse_boot(old); cpio = decompress_legacy(info['ramdisk']); rows, _ = parse_cpio(cpio)
+    original = next(r['data'] for r in rows if r['name'] == 'init'); new_init = patch_init(original)
+    new_cpio = replace_cpio_init(cpio, new_init); new = repack(old, new_cpio); audit = compare(old,new)
+    OUT.mkdir(mode=0o700); (OUT/'files').mkdir(mode=0o700); (OUT/'source').mkdir(mode=0o700)
+    save(OUT/'source/init.original', original); save(OUT/'source/init', new_init)
+    diff = ''.join(difflib.unified_diff(original.decode().splitlines(True),new_init.decode().splitlines(True),fromfile='a/boot/init',tofile='b/boot/init'))
+    save(OUT/'source/no-auto-fsck.patch',diff.encode()); save(OUT/'files/boot.img',new)
+    for name, record in c['outer_file_set'].items():
+        if name == 'boot.img': continue
+        target = OUT/'files'/name
+        if record['kind'] == 'literal': save(target,record['text'].encode())
+        else:
+            source = RAW if name == 'openwrt.ext4' else Path(c['artifacts'][record['artifact']]['path'])
+            input_file(source,record['sha256'],record['bytes'])
+            with source.open('rb') as src, target.open('xb') as dest:
+                for chunk in iter(lambda:src.read(8<<20),b''): dest.write(chunk)
+                dest.flush(); os.fsync(dest.fileno())
+        input_file(target,record['sha256'],record['bytes'])
+    newc = copy.deepcopy(c)
+    newc['status'] = 'HOST_BUILT_PENDING_INDEPENDENT_REVIEW_AND_HARDWARE_GATES'
+    newc['source_disclosure']['variant'] = 'fixed 569 author source local build + existing diagnostic cap + no-auto-fsck init-only patch'
+    newc['source_disclosure']['source_hashes']['boot/init'] = audit['init_sha256']
+    newc['source_disclosure']['no_auto_fsck_patch'] = dict(path=str(OUT/'source/no-auto-fsck.patch'),sha256=sha(diff.encode()))
+    newc['parent_candidate'] = dict(path=str(OLD_CANDIDATE),sha256=OLD_CANDIDATE_SHA)
+    newc['independent_review_pending'] = True
+    for key, name in [('boot','boot.img'),('rootfs_gz','openwrt.ext4.gz'),('device_files_tar','device-files.tar'),('install_conf','openwrt-install.conf'),('fscrypt_probe','fscrypt-probe')]:
+        newc['artifacts'][key]['path'] = str(OUT/'files'/name)
+    newc['artifacts']['boot']['sha256'] = audit['boot_sha256']
+    newc['outer_file_set']['boot.img']['sha256'] = audit['boot_sha256']
+    newc['runtime_policy'] = dict(automatic_whole_userdata_fsck=False, old_fallback_android_timer=True, dormant_repair_tools_retained=True,
+        source_change_scope='init mount_userdata_root failure branch only', partitions_directly_written=['boot_b diagnostic [56,60)MiB','misc [2048,2080)'],
+        limits='Does not prevent normal F2FS mount/checkpoint/recovery or ext4 journal writes; no guarantee against kernel/proprietary effects.')
+    old_audit = json.loads(input_file(BASE/'runtime-audit.json',c['artifacts']['runtime_audit']['sha256']).read_text())
+    runtime = copy.deepcopy(old_audit)
+    runtime.update(status='STATIC_CANDIDATE_BUILDER_CHECKS_PASSED_INDEPENDENT_REVIEW_PENDING',boot_sha256=audit['boot_sha256'],
+        independent_review_pending=True,approved_to_flash=False,hardware_pass=False,device_io_performed=False,
+        whole_userdata_automatic_repair=False, dormant_fsck_tools_retained=True,
+        parent_runtime_audit={'path':str(BASE/'runtime-audit.json'),'sha256':c['artifacts']['runtime_audit']['sha256']})
+    runtime['reviewed_at'] = None
+    runtime['installer_contract'] = {'status':'new candidate pins and v3 runtime adapter integration pending; old installer not authorized'}
+    runtime['runtime_changed_objects'][-1] = {'partition':'userdata','purpose':'normal rw F2FS/ext4 mount/checkpoint and new rootfs/config/private NV; no automatic fsck invocation on mount failure'}
+    runtime['evidence'] = {'actual_boot_comparison':{'path':str(OUT/'boot-content-audit.json')}}
+    runtime['limitations'] += ['Builder checks are not independent review or device approval.','Existing rescue fallback still writes A BC32 and may automatically reboot after 600s; only immediate repair/rearm-B/reboot failure branch was removed.','Dormant original fsck tool/script remain; manual repair outside this policy is not authorized.']
+    json_save(OUT/'boot-content-audit.json', audit)
+    runtime['evidence']['actual_boot_comparison']['sha256'] = file_sha(OUT/'boot-content-audit.json')
+    json_save(OUT/'runtime-audit.json',runtime)
+    newc['artifacts']['runtime_audit'] = dict(path=str(OUT/'runtime-audit.json'),bytes=(OUT/'runtime-audit.json').stat().st_size,sha256=file_sha(OUT/'runtime-audit.json'))
+    json_save(OUT/'candidate.json',newc)
+    provenance = dict(schema='e5-host-init-only-repack-v1',device_io=False,network_io=False,vm_operations=False,
+        input_boot={'path':str(BASE/'boot.img'),'sha256':OLD_BOOT_SHA},input_candidate={'path':str(OLD_CANDIDATE),'sha256':OLD_CANDIDATE_SHA},
+        tool={'path':str(Path(__file__)),'sha256':file_sha(__file__)},python=sys.version,platform=sys.platform,
+        compression={'argv':[str(LZ4),'-l','-12','-c'],'binary_realpath':str(LZ4.resolve()),'binary_sha256':file_sha(LZ4.resolve()),'library_realpath':str(LZ4LIB.resolve()),'library_sha256':file_sha(LZ4LIB.resolve())},
+        output_boot={k:audit[k] for k in ('boot_sha256','sha256_head56m','sha256_tail4m','init_sha256')},
+        candidate_sha256=file_sha(OUT/'candidate.json'),runtime_audit_sha256=file_sha(OUT/'runtime-audit.json'),
+        modified_member='init',other_member_records_identical=75,non_boot_outer_files_unchanged=7,independent_review_pending=True)
+    json_save(OUT/'build-provenance.json',provenance)
+    print(json.dumps(provenance,ensure_ascii=False,indent=2))
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',choices=('plan','build'),nargs='?',default='plan');a=p.parse_args()
+    if a.mode=='plan': print(json.dumps({'mode':'HOST_ONLY','fixed_output':str(OUT),'device_execution_supported':False,'build_requires_new_output':True}));return
+    build()
+if __name__=='__main__':main()

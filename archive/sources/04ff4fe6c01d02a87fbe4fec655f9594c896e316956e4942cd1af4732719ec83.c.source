@@ -1,0 +1,55 @@
+/* Linux VM fixture only; never linked into a production scanner. */
+#define _GNU_SOURCE 1
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/mman.h>
+#include <sys/eventfd.h>
+#include <sys/epoll.h>
+#include <sys/vfs.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+static unsigned sequence;
+static const char *protected,*dir;
+static int replace(char kind){
+    int fd=-1,p[2];char name[4096];snprintf(name,sizeof name,"%s/item-%u",dir,++sequence);
+    if(kind=='p'){if(pipe2(p,O_CLOEXEC))return -1;fd=p[0];close(p[1]);}
+    else if(kind=='s'){if(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,p))return -1;fd=p[0];close(p[1]);}
+    else if(kind=='b'||kind=='u'){
+        struct sockaddr_un addr={.sun_family=AF_UNIX};if(strlen(name)>=sizeof addr.sun_path){errno=E2BIG;return -1;}strcpy(addr.sun_path,name);
+        fd=socket(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0);if(fd<0||bind(fd,(struct sockaddr*)&addr,sizeof addr))return -1;
+        if(kind=='u'){int op=open(name,O_PATH|O_CLOEXEC);close(fd);fd=op;}
+    }else if(kind=='f'){if(mkfifo(name,0600))return -1;fd=open(name,O_PATH|O_CLOEXEC);}
+    else if(kind=='r'){fd=open(name,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0600);}
+    else if(kind=='m')fd=memfd_create("e5-test-memfd",MFD_CLOEXEC);
+    else if(kind=='e')fd=epoll_create1(EPOLL_CLOEXEC);
+    else if(kind=='v')fd=eventfd(0,EFD_CLOEXEC);
+    else if(kind=='P')fd=open(protected,O_PATH|O_CLOEXEC);
+    else if(kind=='d'){return close(400);}
+    else if(kind=='D'){if(close(401))return -1;puts("{\"closed_new\":true}");fflush(stdout);return 0;}
+    else if(kind=='n'||kind=='q'||kind=='R'){
+        if(kind=='n')fd=open(protected,O_PATH|O_CLOEXEC);
+        else if(kind=='R')fd=open(name,O_RDWR|O_CREAT|O_EXCL|O_CLOEXEC,0600);
+        else {if(pipe2(p,O_CLOEXEC))return -1;fd=p[0];close(p[1]);}
+        if(fd<0)return -1;
+        if(dup3(fd,401,O_CLOEXEC)<0)return -1;
+        close(fd);puts("{\"new_fd\":401}");fflush(stdout);return 0;
+    }
+    else {errno=EINVAL;return -1;}
+    if(fd<0)return -1;
+    if(dup3(fd,400,O_CLOEXEC)<0){int e=errno;close(fd);errno=e;return -1;}close(fd);
+    struct stat st;struct statfs fs;if(fstat(400,&st)||fstatfs(400,&fs))return -1;
+    printf("{\"fd\":400,\"mode\":%u,\"dev\":%llu,\"ino\":%llu,\"fs\":%lu,\"kind\":\"%c\"}\n",(unsigned)st.st_mode,(unsigned long long)st.st_dev,(unsigned long long)st.st_ino,(unsigned long)fs.f_type,kind);fflush(stdout);return 0;
+}
+int main(int argc,char **argv){
+    if(argc!=4||strlen(argv[1])!=1)return 60;
+    protected=argv[2];dir=argv[3];
+    if(replace(argv[1][0])){perror("initial");return 61;}
+    char c;while(read(0,&c,1)==1){if(c=='x')return 0;if(replace(c)){perror("replace");return 62;}if(c=='d'){puts("{\"closed\":true}");fflush(stdout);}}
+    return 0;
+}

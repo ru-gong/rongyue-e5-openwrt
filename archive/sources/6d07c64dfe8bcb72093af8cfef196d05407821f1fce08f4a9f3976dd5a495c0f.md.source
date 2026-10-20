@@ -1,0 +1,47 @@
+# 四包启用副本：只复制与重封，不执行
+
+默认 `python3 -B activation.py` 只打印计划，不读取设备或创建文件。工具不包含 ADB/USB/SSH、网络、外部进程或执行副本功能；也不导入生成的源码。**本次没有创建任何生产启用副本。** 主机临时夹具中的实际 import/验证只用于测试，设备方法从未调用。
+
+固定来源为 core 的 `ACTIVATION_RECIPE.json`（`0000000000000000000000000000000000000000000000000000000000000000`）和 `SOURCE_MANIFEST.json`（`0000000000000000000000000000000000000000000000000000000000000000`），以及本目录固定 `SOURCE_CATALOG.json`。46份来源文件和14项外部材料须全量SHA、长度、常规单链接/无symlink检查通过；大镜像以1MiB流式哈希，不载入整镜像、不修改材料。
+
+四包必须一次生成、一次重封后保持稳定。不能在阶段2 probe完成后为阶段3再改gate或manifest，否则历史phase证据会失效。全套enabled并不授予执行权限：每阶段仍须真实新鲜证据、明确的该阶段确认、独立技术review和请求绑定。本工具不会生成这些通过材料。
+
+## 可用命令
+
+- `python3 -B activation.py plan`：无输出文件的计划。
+- `python3 -B activation.py verify-sources`：纯主机重验固定来源和外部材料。
+- `python3 -B activation.py copy /absolute/confirmation.json SHA256`：仅在输入下述精确确认文件后，创建四个全新的同级目录和控制目录，不调用副本。
+
+确认文件必须实际由本次明确确认形成，不能把模板当批准。必需字段：
+
+```json
+{
+  "schema": "e5-host-activation-copy-confirmation-v1",
+  "activation_id": "<16个小写hex>",
+  "action": "CREATE_STABLE_FOUR_PACKAGE_HOST_COPY_ONLY",
+  "source_catalog_sha256": "<本工具固定SOURCE_CATALOG SHA>",
+  "source_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "recipe_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "confirmed_by": "<实际确认记录来源>",
+  "confirmed_at": "<带时区且不在未来的真实ISO时间>",
+  "phase_execution_authorized": false
+}
+```
+
+以上含无效占位符，不是通过的确认文件。姓名/时间/SHA只绑定记录，不构成身份认证。创建副本授权与设备阶段执行授权明确分开。
+
+固定输出在本工作区 `tools/` 下，后缀均为同一activation_id：`e5_nextphase_core_live_…`、`e5_next_recovery_live_…`、`e5_scanner_deploy_next_live_…`、`e5_next_acceptance_live_…`、`e5_activation_bundle_…`。不存在自由目标路径参数。任一目录已经存在、链接、漂移或重复调用立即拒绝，不能复用上次残缺副本。
+
+## 重封与成功判据
+
+只输出28份运行所需文件。14个指定布尔gate各验证原值/唯一赋值后改变；路径修改只指向这四个新工具目录，不改candidate、镜像、原件、证据、手机路径或真实共享状态。按adapter→recovery pins/manifest→cold_bridge→scanner artifact manifest→core source manifest→workflow自身pin顺序重封；acceptance shell中的Python同步且完全相同。scanner和archiver二进制逐字节保持，原IO/helper/probe仍引用固定未改字节。
+
+旧测试日志/DELIVERY/SHA256SUMS不复制。新清单中旧独审仅作为`preparation_*`来源引用，不宣称已审过新副本。输出控制目录含来源目录清单、确认原文、精确diff、逐项修改记录、新文件哈希和 `RESULT.json`、`COMPLETE.json`。
+
+仅当 **无STOP、COMPLETE绑定RESULT正确、全部新文件与RESULT哈希一致**，才可认为本次主机复制完成；随后仍必须对新副本独立审查，才生成实际阶段请求。没有设备验收或自动运行步骤。
+
+预检失败不创建输出。输出期间任何捕获到的异常保留新目录并尽力写STOP，不删除、不覆盖、不自动重试；若主机断电/强制终止未能写STOP，没有可信完整COMPLETE仍视为未完成。即使RESULT/COMPLETE已写、后续fsync失败而出现STOP，也必须拒用。所有新文件0600、新目录0700；只写新副本，不触碰原prepare与真实marker/ledger。
+
+## 本轮测试边界
+
+`python3 -B test_activation.py` 使用临时主机目录、小型合成材料和导入前process/socket哨兵。覆盖全重封、源不变、原字节native、真实临时core/cold/common/observe/scanner/acceptance模块导入与材料pin验证、默认无读取/输出、重复/源漂移/错误pin/链接/路径逃逸拒绝、中断留STOP且不续传。临时fixture不等于现场证据，也不证明手机执行成功。启用副本中的可执行设备方法从未调用。

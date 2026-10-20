@@ -1,0 +1,179 @@
+"""Host/fake boot-lineage regression; test_next installs deny-all I/O first."""
+import test_next as t
+import copy,datetime as dt,json,time,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+c,e,o,r=t.c,t.e,t.o,t.r
+MARKER='00000000-0000-4000-8000-000000000001'
+FRESH='00000000-0000-4000-8000-000000000001'
+
+class LineageTests(t.Tests):
+ # Reuse fixture helpers; suppress inherited tests from the independent 42 suite.
+ pass
+for _name in list(t.Tests.__dict__):
+ if _name.startswith('test_'):setattr(LineageTests,_name,None)
+
+def add(fn):setattr(LineageTests,fn.__name__,fn);return fn
+
+@add
+def test_actual_anchor_differs_from_old_marker(self):
+ value=c.validate_boot_observation(c.ANCHOR,self.clock)
+ self.assertEqual(value['boot_id'],'00000000-0000-4000-8000-000000000001')
+ self.assertFalse(value['freshness_or_execution_granted']);self.assertIn(MARKER,value['observed_boots'])
+ self.state['previous_boots']=[MARKER]
+ self.state['markers']['ACTIVE.json']=self.write('old-active.json',{'serial':c.SERIAL,'boot_id':MARKER})
+ self.state['markers']['UNCERTAIN.json']=self.write('old-uncertain.json',{'serial':c.SERIAL,'boot_id':MARKER})
+ self.statebind=self.write('state.json',self.state)
+ env,_=self.cold_fixture();request=c.obj(c.obj(env)['cold_request'])
+ self.assertEqual(o.validate_request(c.obj(env)['cold_request'])[0]['previous_boot_id'],c.ANCHOR_BOOT)
+ blocked=c.excluded_boots(request,self.state);self.assertEqual(blocked,{MARKER,c.ANCHOR_BOOT})
+ self.assertFalse(o.eligible_new_boot({'boot_id':MARKER,'boot_complete':'1'},blocked))
+ self.assertFalse(o.eligible_new_boot({'boot_id':c.ANCHOR_BOOT,'boot_complete':'1'},blocked))
+ self.assertTrue(o.eligible_new_boot({'boot_id':FRESH,'boot_complete':'1'},blocked))
+
+@add
+def test_union_empty_same_and_multiple_state_boots(self):
+ request={'previous_boot_id':c.ANCHOR_BOOT,'previous_observation':c.ANCHOR}
+ for boots in ([],[c.ANCHOR_BOOT],[MARKER],[MARKER,c.ANCHOR_BOOT,FRESH]):
+  state={**self.state,'previous_boots':boots};before=copy.deepcopy(state)
+  self.assertEqual(c.excluded_boots(request,state),set(boots)|{MARKER,c.ANCHOR_BOOT});self.assertEqual(state,before)
+
+@add
+def test_request_cannot_use_arbitrary_previous_uuid(self):
+ env,_=self.cold_fixture();request=c.obj(c.obj(env)['cold_request']);request['previous_boot_id']=MARKER
+ with self.assertRaisesRegex(RuntimeError,'previous UUID'):o.validate_request(self.write('bad-request.json',request))
+
+@add
+def test_legacy_request_without_evidence_refused(self):
+ env,_=self.cold_fixture();request=c.obj(c.obj(env)['cold_request']);request.pop('previous_observation');request['schema']='e5-next-cold-request-v1'
+ with self.assertRaisesRegex(RuntimeError,'fields'):o.validate_request(self.write('old-request.json',request))
+
+@add
+def test_fake_approval_and_copied_anchor_refused(self):
+ for value in ({'boot_id':FRESH,'approved':True},c.obj(c.ANCHOR)):
+  with self.assertRaises(RuntimeError):c.validate_boot_observation(self.write('not-anchor.json',value))
+
+@add
+def test_anchor_changed_digest_and_cross_serial_refused(self):
+ with self.assertRaises(RuntimeError):c.validate_boot_observation({**c.ANCHOR,'sha256':'0'*64})
+ original=c.obj(c.ANCHOR)
+ def replaced(b):
+  return {**original,'serial':'OTHER'} if b==c.ANCHOR else saved(b)
+ saved=c.obj
+ with patch.object(c,'obj',side_effect=replaced):
+  with self.assertRaisesRegex(RuntimeError,'device/boot'):c.validate_boot_observation(c.ANCHOR)
+
+@add
+def test_complete_raw_history_survives_state_change_and_expiry(self):
+ env,folder=self.cold_fixture();bound=c.obj(env)['cold_complete']
+ self.state['previous_boots']=[MARKER,FRESH];self.state['ledger_head']='f'*64
+ value=c.validate_boot_observation(bound,self.clock+dt.timedelta(days=1))
+ self.assertEqual(value['boot_id'],t.NEW);self.assertFalse(value['freshness_or_execution_granted'])
+ self.assertEqual(set(value['observed_boots']),{MARKER,c.ANCHOR_BOOT,t.NEW})
+ # A normal reboot may produce the same raw observations; no cold review is
+ # manufactured and no physical-cold Boolean is consumed by historical lookup.
+ (self.root/'cold-review.json').unlink()
+ self.assertEqual(c.validate_boot_observation(bound,self.clock+dt.timedelta(days=1))['boot_id'],t.NEW)
+
+@add
+def test_complete_missing_or_changed_raw_refused(self):
+ env,folder=self.cold_fixture();bound=c.obj(env)['cold_complete'];p=next(folder.glob('*-health-00.stdout'));p.write_bytes(b'changed')
+ with self.assertRaisesRegex(RuntimeError,'raw/result'):c.validate_boot_observation(bound,self.clock)
+
+@add
+def test_stopped_historical_capture_refused(self):
+ env,folder=self.cold_fixture();(folder/'STOP.json').write_text('{}')
+ with self.assertRaisesRegex(RuntimeError,'stopped'):c.validate_boot_observation(c.obj(env)['cold_complete'],self.clock)
+
+@add
+def test_refresh_or_incomplete_is_not_new_observed_boot(self):
+ env,_=self.cold_fixture();value=c.obj(c.obj(env)['cold_complete'])
+ for schema in ('e5-next-sameboot-refresh-v1','e5-next-cold-observation-v1'):
+  changed={**value,'schema':schema,'diagnostics_completed':False}
+  folder=self.root/('incomplete-'+schema);folder.mkdir();bad=self.write(str(folder/'COMPLETE.json'),changed)
+  with self.assertRaises(RuntimeError):c.validate_boot_observation(bad,self.clock)
+
+@add
+def test_gate_enabled_producer_hash_can_be_replayed_without_execution(self):
+ env,folder=self.cold_fixture();p=folder/'SOURCE_BINDING.json';value=json.loads(p.read_text())
+ source=Path(o.__file__).read_bytes();value['script_sha256']=c.sha(source.replace(b'DEVICE_IO_ENABLED = False',b'DEVICE_IO_ENABLED = True'))
+ p.write_bytes(c.canonical(value)+b'\n')
+ self.assertEqual(c.validate_boot_observation(c.obj(env)['cold_complete'],self.clock)['boot_id'],t.NEW)
+
+@add
+def test_readonly_history_bindings_without_reusing_old_preimage(self):
+ env,rb,out=self.raw_fixture();self.state['ledger_head']='f'*64
+ value=c.validate_boot_observation(rb,self.clock+dt.timedelta(days=1))
+ self.assertEqual(value['boot_id'],t.NEW);self.assertEqual(value['kind'],'readonly-with-raw-cold-lineage')
+ self.assertFalse(value['freshness_or_execution_granted'])
+ raw=c.obj(rb);raw['boot_id']=FRESH;rb=self.write('evidence/raw-capture/READONLY_RESULT.json',raw)
+ with self.assertRaisesRegex(RuntimeError,'cold linkage'):c.validate_boot_observation(rb,self.clock)
+
+@add
+def test_descendant_source_and_rec_mismatch_refused(self):
+ _,rb,out=self.raw_fixture();value=c.obj(rb);value['producer_source_sha256']='0'*64
+ bad=self.write('evidence/raw-capture/READONLY_RESULT.json',value)
+ with self.assertRaisesRegex(RuntimeError,'producer'):c.validate_boot_observation(bad,self.clock)
+
+@add
+def test_readonly_reconciliation_boot_must_match_raw_cold(self):
+ _,rb,out=self.raw_fixture();value=c.obj(rb);rec=c.obj(value['reconciliation']);rec['boot_id']=FRESH
+ value['reconciliation']=self.write('evidence/raw-capture/raw/reconciliation.json',rec)
+ bad=self.write('evidence/raw-capture/READONLY_RESULT.json',value)
+ with self.assertRaisesRegex(RuntimeError,'incomplete'):c.validate_boot_observation(bad,self.clock)
+
+@add
+def test_new_request_derived_from_completed_previous_observation(self):
+ env,_=self.cold_fixture();bound=c.obj(env)['cold_complete'];self.state['previous_boots']=[MARKER]
+ rb=r.state_request(bound,'recovery',self.root/'evidence/next-request')
+ request=c.obj(rb);self.assertEqual(request['previous_boot_id'],t.NEW);self.assertEqual(request['previous_observation'],bound)
+ excluded=c.excluded_boots(request,self.state)
+ self.assertEqual(excluded,{MARKER,c.ANCHOR_BOOT,t.NEW});self.assertNotIn(FRESH,excluded)
+
+@add
+def test_lineage_depth_and_cycle_fail_closed(self):
+ key=(c.ANCHOR['path'],c.ANCHOR['sha256'])
+ with patch.object(c,'_boot_lineage_stack',[key]):
+  with self.assertRaisesRegex(RuntimeError,'cyclic'):c.validate_boot_observation(c.ANCHOR,self.clock)
+ with patch.object(c,'_boot_lineage_stack',[('x',str(i)) for i in range(c.BOOT_LINEAGE_MAX_DEPTH)]):
+  with self.assertRaisesRegex(RuntimeError,'deep'):c.validate_boot_observation(c.ANCHOR,self.clock)
+ self.assertEqual(c._boot_lineage_stack,[])
+
+def startup(boot,up='20.0 40.0'):
+ return ('\n'.join(k+'\t'+v for k,v in {'boot_id':boot,'uptime':up,'boot_complete':'1','serial':c.SERIAL,'slot':'_a','boot_id_end':boot}.items())+'\n').encode()
+
+@add
+def test_actual_listener_branch_skips_both_old_boots_before_root(self):
+ obs=o.Observer.__new__(o.Observer);obs.boot=None;obs.c=SimpleNamespace(ADB=Path('/fixed/fake-adb'))
+ obs.excluded_boot_ids={MARKER,c.ANCHOR_BOOT};obs.out=self.root/'listener';obs.out.mkdir()
+ obs.progress=lambda *a,**k:None;obs.wait_until=lambda x:None
+ obs.query=lambda *a,**k:((f'List of devices attached\n{c.SERIAL}\tdevice\n').encode(),{})
+ pending=[MARKER,c.ANCHOR_BOOT,FRESH];calls=[]
+ def shell(label,*a,**kw):
+  calls.append(label)
+  if label=='root-exit-calibration':raise o.Stop('fixture reached first root calibration')
+  return startup(pending.pop(0)),{}
+ obs.shell=shell
+ with self.assertRaisesRegex(o.Stop,'fixture reached'):obs.run()
+ self.assertEqual(obs.boot,FRESH);self.assertEqual(calls,['nonroot-startup']*3+['root-exit-calibration'])
+ self.assertEqual(json.loads((obs.out/'NEW_BOOT.json').read_text())['boot_id'],FRESH)
+
+@add
+def test_actual_listener_new_boot_after120_refused_before_root(self):
+ obs=o.Observer.__new__(o.Observer);obs.boot=None;obs.c=SimpleNamespace(ADB=Path('/fixed/fake-adb'));obs.excluded_boot_ids={MARKER,c.ANCHOR_BOOT}
+ obs.out=self.root/'listener';obs.out.mkdir();obs.progress=lambda *a,**k:None;obs.wait_until=lambda x:None
+ obs.query=lambda *a,**k:((f'List of devices attached\n{c.SERIAL}\tdevice\n').encode(),{})
+ obs.shell=lambda *a,**k:(startup(FRESH,'121.0 200.0'),{})
+ with self.assertRaisesRegex(o.Stop,'exceeds120'):obs.run()
+ self.assertIsNone(obs.boot)
+
+@add
+def test_rc255_still_stops_and_retains_raw(self):
+ obs=o.Observer.__new__(o.Observer);obs.index=0;obs.until=time.monotonic()+20;obs.out=self.root/'query';obs.out.mkdir();obs.check=lambda:None
+ obs.c=SimpleNamespace(collect_process=lambda *a:{'failure':None,'returncode':255,'elapsed_seconds':.1,'stdout':b'','stderr':b'disconnected'})
+ with self.assertRaisesRegex(o.Stop,'unexpected command exit'):obs.query('nonroot-startup',['fake'],4096,allow_disconnect=True)
+ self.assertEqual(json.loads((obs.out/'00001-nonroot-startup.result.json').read_text())['returncode'],255)
+ self.assertEqual((obs.out/'00001-nonroot-startup.stderr').read_bytes(),b'disconnected')
+
+if __name__=='__main__':unittest.main()

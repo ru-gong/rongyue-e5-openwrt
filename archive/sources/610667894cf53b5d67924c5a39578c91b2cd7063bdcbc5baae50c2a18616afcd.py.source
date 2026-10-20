@@ -1,0 +1,264 @@
+"""Host filesystem fault tests only; never import an ADB/SSH backend."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+import tempfile
+import unittest
+from unittest import mock
+import uuid
+
+import directory_transaction as d
+
+
+# Prohibit process/network activity even if a future edit accidentally adds it.
+def audit(event, arguments):
+    if event.startswith(("subprocess.", "socket.")) or event in ("os.system", "os.exec", "os.posix_spawn"):
+        raise AssertionError("host-only test prohibits " + event)
+sys.addaudithook(audit)
+
+
+class Crash(BaseException):
+    pass
+
+
+class TransactionTests(unittest.TestCase):
+    def setUp(self):
+        self.sb = d.HostSandbox.create()
+        self.txid = uuid.uuid4().hex[:16]
+        self.sb.active.mkdir(mode=0o700)
+        (self.sb.active / "openwrt.ext4").write_bytes(b"old runtime including modified private NV\0")
+        (self.sb.active / "old.log").write_bytes(b"preserve me")
+        stage = self.sb.stage(self.txid); stage.mkdir(mode=0o700)
+        for name, data in {"openwrt.ext4": b"synthetic pristine image\0",
+                           "boot-os": b"openwrt\n", "openwrt-default-boot": b"android\n",
+                           "openwrt-install.conf": b"E5_DEFAULT_BOOT='android'\n"}.items():
+            (stage / name).write_bytes(data)
+        self.old = self.sb.snapshot(self.sb.active)
+        self.new = self.sb.snapshot(stage)
+        self.attest = {"rootfs_checked_sha256": hashlib.sha256((stage / "openwrt.ext4").read_bytes()).hexdigest(),
+                       "image_selection": "openwrt", "default_boot": "android", "reviewer": "synthetic-test",
+                       "inner_default_android": True, "no_private_nv": True,
+                       "no_previous_origin": True, "no_pending_update": True}
+
+    def tearDown(self):
+        # Test fixtures only; the production module never deletes trees.
+        shutil.rmtree(self.sb.root)
+
+    def prepare(self, fault=None):
+        return d.DirectoryTransaction.prepare(self.sb, self.txid, self.old, self.new, self.attest, fault=fault)
+
+    def reload(self, fault=None):
+        sb = d.HostSandbox.open(self.sb.root)
+        return d.DirectoryTransaction.load(sb, self.txid, fault)
+
+    def crash_at(self, label):
+        def hit(value):
+            if value == label: raise Crash(label)
+        return hit
+
+    def test_complete_activate_rollback_preserves_both(self):
+        tx = self.prepare()
+        self.assertEqual(tx.activate()["state"], "ACTIVE")
+        self.assertEqual(tx.activate()["state"], "ACTIVE")
+        self.assertEqual(tx.rollback()["state"], "ROLLED_BACK")
+        self.assertEqual(tx.rollback()["state"], "ROLLED_BACK")
+        self.assertEqual(self.sb.snapshot(self.sb.active), self.old)
+        self.assertEqual(self.sb.snapshot(self.sb.failed(self.txid)), self.new)
+        with self.assertRaises(d.Refused): tx.activate()
+
+    def test_prepared_rollback_no_switch(self):
+        tx = self.prepare()
+        self.assertEqual(tx.rollback()["state"], "NO_SWITCH_OCCURRED")
+        self.assertEqual(self.sb.snapshot(self.sb.active), self.old)
+
+    def test_each_activation_boundary_can_resume(self):
+        labels = ["after_journal_ARCHIVE_BEGIN", "after_archive_rename", "after_archive_dir_fsync",
+                  "after_journal_ARCHIVED", "after_journal_ACTIVATE_BEGIN", "after_activate_rename",
+                  "after_activate_dir_fsync", "after_journal_ACTIVATED"]
+        for label in labels:
+            with self.subTest(label=label):
+                # Independent filesystem fixtures for each interruption.
+                case = TransactionTests(); case.setUp()
+                try:
+                    tx = case.prepare(case.crash_at(label))
+                    with self.assertRaises(Crash): tx.activate()
+                    resumed = case.reload()
+                    self.assertEqual(resumed.activate()["state"], "ACTIVE")
+                    self.assertEqual(resumed.rollback()["state"], "ROLLED_BACK")
+                finally: case.tearDown()
+
+    def test_each_rollback_boundary_can_resume(self):
+        labels = ["after_journal_PRESERVE_FAILED_BEGIN", "after_preserve_failed_rename",
+                  "after_preserve_failed_dir_fsync", "after_journal_FAILED_PRESERVED",
+                  "after_journal_RESTORE_BEGIN", "after_restore_rename", "after_restore_dir_fsync",
+                  "after_journal_ROLLED_BACK"]
+        for label in labels:
+            with self.subTest(label=label):
+                case = TransactionTests(); case.setUp()
+                try:
+                    tx = case.prepare(); tx.activate(); tx.fault = case.crash_at(label)
+                    with self.assertRaises(Crash): tx.rollback()
+                    self.assertEqual(case.reload().rollback()["state"], "ROLLED_BACK")
+                    self.assertEqual(case.sb.snapshot(case.sb.failed(case.txid)), case.new)
+                finally: case.tearDown()
+
+    def test_rollback_between_activation_renames(self):
+        tx = self.prepare(self.crash_at("after_archive_rename"))
+        with self.assertRaises(Crash): tx.activate()
+        self.assertEqual(self.reload().rollback()["state"], "ROLLED_BACK")
+
+    def test_changed_live_candidate_requires_explicit_binding(self):
+        tx = self.prepare(); tx.activate()
+        (self.sb.active / "runtime.log").write_bytes(b"new failure evidence")
+        self.assertEqual(tx.inspect()["state"], "ACTIVE_MODIFIED_REQUIRES_BINDING")
+        with self.assertRaises(d.Refused): tx.rollback()
+        changed = self.sb.snapshot(self.sb.active)
+        self.assertEqual(tx.rollback(changed)["state"], "ROLLED_BACK")
+        self.assertEqual(self.sb.snapshot(self.sb.failed(self.txid)), changed)
+
+    def test_crash_after_changed_candidate_binding(self):
+        tx = self.prepare(); tx.activate(); (self.sb.active / "new").write_bytes(b"log")
+        changed = self.sb.snapshot(self.sb.active); tx.fault = self.crash_at("after_journal_FAILED_CANDIDATE_BOUND")
+        with self.assertRaises(Crash): tx.rollback(changed)
+        self.assertEqual(self.reload().rollback()["state"], "ROLLED_BACK")
+
+    def test_candidate_drift_after_binding_rejected(self):
+        tx = self.prepare(); tx.activate(); (self.sb.active / "new").write_bytes(b"one")
+        changed = self.sb.snapshot(self.sb.active); tx.fault = self.crash_at("after_journal_FAILED_CANDIDATE_BOUND")
+        with self.assertRaises(Crash): tx.rollback(changed)
+        (self.sb.active / "new").write_bytes(b"two")
+        with self.assertRaises(d.Refused): self.reload().rollback(self.sb.snapshot(self.sb.active))
+
+    def test_archive_tamper_stops_restore(self):
+        tx = self.prepare(); tx.activate()
+        (self.sb.archive(self.txid) / "old.log").write_bytes(b"tampered")
+        with self.assertRaises(d.Refused): tx.rollback()
+        self.assertTrue(self.sb.active.exists())
+
+    def test_candidate_changed_before_prepare(self):
+        (self.sb.stage(self.txid) / "openwrt.ext4").write_bytes(b"changed")
+        with self.assertRaises(d.Refused): self.prepare()
+
+    def test_candidate_changed_after_prepare(self):
+        tx = self.prepare(); (self.sb.stage(self.txid) / "openwrt.ext4").write_bytes(b"changed")
+        with self.assertRaises(d.Refused): tx.activate()
+        self.assertEqual(self.sb.snapshot(self.sb.active), self.old)
+
+    def test_original_changed_after_begin(self):
+        def change(label):
+            if label == "after_journal_ARCHIVE_BEGIN": (self.sb.active / "old.log").write_bytes(b"changed")
+        tx = self.prepare(change)
+        with self.assertRaises(d.Refused): tx.activate()
+        self.assertFalse(self.sb.archive(self.txid).exists())
+
+    def test_duplicate_prepare_refused(self):
+        self.prepare()
+        with self.assertRaises(d.Refused): self.prepare()
+
+    def test_mixed_transaction_directory_refused(self):
+        tx = self.prepare(); self.sb.archive("b" * 16).mkdir()
+        with self.assertRaises(d.Refused): tx.activate()
+
+    def test_wrong_plan_or_journal_identity_refused(self):
+        tx = self.prepare(); p = tx.meta / "plan.json"
+        data = json.loads(p.read_text()); data["txid"] = "b" * 16; p.write_text(json.dumps(data))
+        with self.assertRaises(d.Refused): tx.inspect()
+        with self.assertRaises(d.Refused): self.reload()
+
+    def test_torn_journal_stops_without_guessing(self):
+        tx = self.prepare()
+        with (tx.meta / "journal.jsonl").open("ab") as f: f.write(b'{"partial":')
+        with self.assertRaises(d.Refused): tx.activate()
+        self.assertEqual(self.sb.snapshot(self.sb.active), self.old)
+
+    def test_default_linux_refused(self):
+        (self.sb.stage(self.txid) / "openwrt-default-boot").write_bytes(b"linux\n")
+        self.new = self.sb.snapshot(self.sb.stage(self.txid))
+        with self.assertRaises(d.Refused): self.prepare()
+
+    def test_boot_os_is_image_selection_not_android_default(self):
+        (self.sb.stage(self.txid) / "boot-os").write_bytes(b"android\n")
+        self.new = self.sb.snapshot(self.sb.stage(self.txid))
+        with self.assertRaises(d.Refused): self.prepare()
+
+    def test_outer_pending_marker_refused(self):
+        (self.sb.stage(self.txid) / "boot-os-next").write_bytes(b"debian\n")
+        self.new = self.sb.snapshot(self.sb.stage(self.txid))
+        with self.assertRaises(d.Refused): self.prepare()
+
+    def test_config_cannot_override_android_with_shell_syntax(self):
+        (self.sb.stage(self.txid) / "openwrt-install.conf").write_bytes(
+            b"E5_DEFAULT_BOOT='android'\nexport E5_DEFAULT_BOOT=linux\n")
+        self.new = self.sb.snapshot(self.sb.stage(self.txid))
+        with self.assertRaises(d.Refused): self.prepare()
+
+    def test_attestation_unknown_or_wrong_hash_refused(self):
+        for key, value in [("no_private_nv", "pending"), ("rootfs_checked_sha256", "0" * 64), ("reviewer", " ")]:
+            with self.subTest(key=key):
+                saved = self.attest[key]; self.attest[key] = value
+                with self.assertRaises(d.Refused): self.prepare()
+                self.attest[key] = saved
+
+    def test_nonsandbox_and_escape_refused(self):
+        with self.assertRaises(d.Refused): d.HostSandbox.open(Path(tempfile.gettempdir()).resolve())
+        with self.assertRaises(d.Refused): self.sb.snapshot(self.sb.root / "data/../sandbox.json")
+        with self.assertRaises(d.Refused): self.sb.stage("../escape")
+
+    def test_symlink_and_fifo_and_hardlink_refused(self):
+        p = self.sb.stage(self.txid) / "unsafe"
+        p.symlink_to(self.sb.active / "old.log")
+        with self.assertRaises(d.Refused): self.sb.snapshot(self.sb.stage(self.txid))
+        p.unlink(); os.mkfifo(p)
+        with self.assertRaises(d.Refused): self.sb.snapshot(self.sb.stage(self.txid))
+        p.unlink(); os.link(self.sb.active / "old.log", p)
+        with self.assertRaises(d.Refused): self.sb.snapshot(self.sb.stage(self.txid))
+
+    def test_mount_refused(self):
+        original = os.path.ismount
+        with mock.patch.object(d.os.path, "ismount", side_effect=lambda p: Path(p) == self.sb.active or original(p)):
+            with self.assertRaises(d.Refused): self.prepare()
+
+    def test_space_exhaustion_before_any_rename(self):
+        with mock.patch.object(d.os, "statvfs", return_value=type("FS", (), {"f_bavail": 0, "f_frsize": 4096})()):
+            with self.assertRaises(d.Refused): self.prepare()
+        tx = self.prepare()
+        with mock.patch.object(d.os, "statvfs", return_value=type("FS", (), {"f_bavail": 0, "f_frsize": 4096})()):
+            with self.assertRaises(d.Refused): tx.activate()
+        self.assertEqual(self.sb.snapshot(self.sb.active), self.old)
+
+    def test_journal_fsync_failure_prevents_first_rename(self):
+        tx = self.prepare()
+        with mock.patch.object(d.os, "fsync", side_effect=OSError("fsync failed")):
+            with self.assertRaises(OSError): tx.activate()
+        self.assertTrue(self.sb.active.exists()); self.assertFalse(self.sb.archive(self.txid).exists())
+
+    def test_resume_does_not_call_undurable_rename_complete(self):
+        tx = self.prepare(self.crash_at("after_activate_rename"))
+        with self.assertRaises(Crash): tx.activate()
+        resumed = self.reload()
+        with mock.patch.object(d, "_fsync_dir", side_effect=OSError("directory flush failed")):
+            with self.assertRaises(OSError): resumed.activate()
+        self.assertNotIn("ACTIVATED", resumed.inspect()["journal_events"])
+        self.assertEqual(resumed.activate()["state"], "ACTIVE")
+
+    def test_destination_race_cannot_replace_unknown_empty_directory(self):
+        tx = self.prepare()
+        original = d._rename_noreplace
+        def race(source, destination):
+            destination.mkdir()
+            return original(source, destination)
+        with mock.patch.object(d, "_rename_noreplace", side_effect=race):
+            with self.assertRaises(d.Refused): tx.activate()
+        self.assertEqual(self.sb.snapshot(self.sb.active), self.old)
+
+    def test_no_device_authorization_output(self):
+        tx = self.prepare()
+        self.assertFalse(tx.inspect()["device_execution_authorized"])
+        self.assertFalse(d.ANDROID_ADAPTER_CONTRACT["implemented"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

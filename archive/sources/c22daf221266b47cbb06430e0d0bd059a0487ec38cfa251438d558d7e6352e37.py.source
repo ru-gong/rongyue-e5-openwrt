@@ -1,0 +1,117 @@
+"""Isolated Linux real-proc close/reuse regression. No ADB/device code.
+Old control inserts exactly the test-only pre-acquisition hook, no semantic fix.
+Every case asserts its expected result; a STOP never counts as successful closure.
+"""
+import errno, hashlib, json, os, shutil, signal, subprocess, sys, tempfile, time
+from pathlib import Path
+HERE=Path(__file__).resolve().parent
+TX='0123456789abcdef';OP='f'*32
+CASES=('entry-repeat-pipe','entry-repeat-socket','entry-repeat-regular','many-closed-tables',
+ 'held-close','final-close','coverage-reused-pipe','coverage-reused-protected','coverage-new-protected-slot',
+ 'witness-eacces','witness-eio','witness-esrch','task-exit','entry-cancel','entry-deadline','old-control-repeat')
+
+def inside(case,scanner,workload):
+ if os.getpid()!=1 or os.geteuid()!=0:raise RuntimeError('private root PID1 only')
+ td=Path(tempfile.mkdtemp(prefix='e5-native-test-closed-',dir='/tmp'));root=td/'sandbox'
+ for p in ('proc','sys/block','data/e5linux','objects'):(root/p).mkdir(parents=True,exist_ok=True)
+ protected=root/'data/e5linux/boot-os';protected.write_text('openwrt\n')
+ subprocess.run(['mount','--bind','/proc',str(root/'proc')],check=True)
+ first={'entry-repeat-socket':'s','entry-repeat-regular':'r'}.get(case,'p')
+ workers={};observations=[]
+ def worker():
+  w=subprocess.Popen([workload,first,str(protected),str(root/'objects')],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+  observations.append(json.loads(w.stdout.readline()));workers[w.pid]=w;return w
+ w=worker()
+ if case=='many-closed-tables':
+  for _ in range(11):worker()
+ def command(actor,c):
+  actor.stdin.write(c.encode());actor.stdin.flush();observations.append(json.loads(actor.stdout.readline()))
+ env=dict(os.environ);env['E5_SCANNER_TEST_SYNC']='fd-tables'
+ env['E5_SCANNER_TEST_FD_SYNC']='*' if case=='many-closed-tables' else str(w.pid)
+ if case in ('held-close','final-close'):env['E5_SCANNER_TEST_OBJECT_SYNC']=f'{w.pid}:400:'+case.split('-')[0]
+ else:env['E5_SCANNER_TEST_CLOSE_ENTRY']=f'{0 if case=="many-closed-tables" else w.pid}:400'
+ if case.startswith('coverage-'):env['E5_SCANNER_TEST_OBJECT_SYNC']=f'{w.pid}:400:coverage'
+ if case.startswith('witness-'):env['E5_SCANNER_TEST_WITNESS_ERROR']=f'{w.pid}:400:'+str({'witness-eacces':13,'witness-eio':5,'witness-esrch':3}[case])
+ boot=Path('/proc/sys/kernel/random/boot_id').read_text().strip();deadline=int(time.clock_gettime(time.CLOCK_BOOTTIME)*1000)+5000
+ start=time.monotonic();p=subprocess.Popen([scanner,'--test-root',str(root),'scan',TX,boot,OP,str(deadline)],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+ rows=[];barriers=0
+ for line in p.stdout:
+  r=json.loads(line);rows.append(r);sp=r['subphase'];actor=workers.get(r['pid'])
+  if sp=='fd-entry-close-test-barrier':
+   barriers+=1
+   if case=='task-exit':actor.stdin.write(b'x');actor.stdin.flush();actor.wait(timeout=1)
+   else:command(actor,'d')
+   if case=='entry-cancel':p.send_signal(signal.SIGTERM);continue
+   if case=='entry-deadline':continue
+   p.stdin.write(b'.');p.stdin.flush()
+  elif sp=='fd-object-test-barrier':
+   barriers+=1
+   if case in ('held-close','final-close'):command(actor,'d')
+   elif case=='coverage-reused-pipe':command(actor,'p')
+   elif case=='coverage-reused-protected':command(actor,'P')
+   elif case=='coverage-new-protected-slot':command(actor,'n')
+   p.stdin.write(b'.');p.stdin.flush()
+  elif sp=='fd-discard-test-barrier':
+   command(w,first);p.stdin.write(b'.');p.stdin.flush()
+  elif sp=='fd-snapshot-test-barrier':
+   if case.startswith('entry-repeat-') or case=='many-closed-tables':
+    if actor:command(actor,first)
+   p.stdin.write(b'.');p.stdin.flush()
+  elif r['event']=='PHASE' and r['phase']=='fd-tables':p.stdin.write(b'.');p.stdin.flush()
+ rc=p.wait(timeout=8);elapsed=time.monotonic()-start;r=rows[-1]
+ positive=case.startswith('entry-repeat-') or case in ('many-closed-tables','held-close','final-close','witness-esrch','task-exit')
+ checks={'result_expected':rc==(0 if positive else 70),'complete_expected':r['complete']==positive,
+ 'bound_time':elapsed<(6 if case=='entry-deadline' else 5),
+ 'bound_fds':r['fds']<=131073,'bound_reads':r['read_bytes']<=32*1024*1024+8192,
+ 'bound_output':sum(len(json.dumps(x)) for x in rows)<256*1024}
+ if positive and case not in ('witness-esrch','task-exit'):
+  wanted=24 if case=='many-closed-tables' else (2 if case.startswith('entry-repeat-') else 1)
+  checks.update(closure_exact=r['fd_closed_observed']==wanted and r['fd_closed_confirmed']==wanted and r['fd_closed_rejected']==0,
+    no_discard=r['fd_snapshots_discarded']==0,two_complete_per_table=r['fd_snapshots_complete']==2*r['fd_tables'],
+    no_unknown=r['unknown']==[],final_enumeration_exercised=r['fd_final_names']>0)
+  if case=='many-closed-tables':checks.update(diagnostic_cap=len(r['fd_closed_records'])==8 and r['fd_closed_records_omitted']==16,workers_seen=r['fd_tables']==14)
+ elif case.startswith('coverage-'):
+  checks['coverage_refusal']=r['errno']==116 and r['fd_closed_confirmed']==0 and r['detail']==('fd-final-coverage-new-slot' if case=='coverage-new-protected-slot' else 'closed-fd-reappeared')
+ elif case.startswith('witness-'):
+  checks['witness_not_treated_closed']=r['fd_closed_confirmed']==0 and r['fd_closed_rejected']>0
+  checks['witness_error']=r['fd_last_acquire_errno']=={'witness-eacces':13,'witness-eio':5,'witness-esrch':3}[case]
+ elif case=='task-exit':checks['dead_task_not_closed_witness']=r['fd_closed_confirmed']==0
+ elif case=='entry-cancel':checks['cancellation']=r['errno']==errno.ECANCELED
+ elif case=='entry-deadline':checks['deadline']=r['errno']==errno.ETIMEDOUT
+ elif case=='old-control-repeat':checks['old_failure_reproduced']=r['fd_snapshots_discarded']==3 and r['fd_last_acquire_errno']==2 and barriers==3
+ print(json.dumps({'case':case,'rc':rc,'elapsed':elapsed,'barriers':barriers,'checks':checks,'result':r,'objects':observations,'kernel':os.uname().release,'stderr':p.stderr.read().decode()}),flush=True)
+ return 0 if all(checks.values()) else 1
+
+def run():
+ if sys.platform!='linux' or os.geteuid()!=0:raise RuntimeError('isolated Linux VM only')
+ build=Path(tempfile.mkdtemp(prefix='e5-closed-build-',dir='/tmp'))
+ scanner=build/'scanner';workload=build/'workload';old=build/'old-scanner'
+ flags=['gcc','-std=c11','-Wall','-Wextra','-Werror','-O2']
+ subprocess.run([*flags,'-DE5_SCANNER_HOST_TEST','-DE5_SCANNER_LINUX_INTEGRATION',str(HERE/'native_occupancy_scanner.c'),'-o',str(scanner)],check=True)
+ subprocess.run([*flags,str(HERE/'fd_object_workload.c'),'-o',str(workload)],check=True)
+ # Fixed prior source is copied as an input alongside this harness, never edited.
+ raw=(HERE/'prior_scanner.c').read_bytes();assert hashlib.sha256(raw).hexdigest()=='0000000000000000000000000000000000000000000000000000000000000000'
+ s=raw.decode();new=(HERE/'native_occupancy_scanner.c').read_text()
+ begin=new.index('#if defined(E5_SCANNER_HOST_TEST) && defined(E5_SCANNER_LINUX_INTEGRATION)\n        const char *sync_close=')
+ end=new.index('#endif',begin)+len('#endif');hook=new[begin:end]
+ target='        detail="fd-link-check";';assert s.count(target)==1;s=s.replace(target,target+'\n'+hook+'\n')
+ # Test-only reopening between failed attempts ensures all three old attempts
+ # hit the same race. No result/error/snapshot branch is replaced.
+ target='            if(e==ENOENT||e==ESRCH){if(identity_matches(id))return -1;continue;}'
+ inject='''            if(getenv("E5_SCANNER_TEST_CLOSE_ENTRY")&&id->pid==(unsigned)strtoul(getenv("E5_SCANNER_TEST_CLOSE_ENTRY"),NULL,10)){
+                const char *oldsp=subphase;subphase="fd-discard-test-barrier";if(emit("PHASE",0,""))return -1;
+                for(;;){if(control())return -1;struct pollfd f={STDIN_FILENO,POLLIN,0};int r=poll(&f,1,1);if(r<0&&errno!=EINTR)return -1;if(r>0){char c;if(read(STDIN_FILENO,&c,1)!=1||c!='.'){errno=EPROTO;return -1;}break;}}
+                subphase=oldsp;
+            }
+'''
+ assert s.count(target)==1;s=s.replace(target,inject+target)
+ (build/'old-instrumented.c').write_text(s)
+ subprocess.run([*flags,'-DE5_SCANNER_HOST_TEST','-DE5_SCANNER_LINUX_INTEGRATION',str(build/'old-instrumented.c'),'-o',str(old)],check=True)
+ failed=0
+ for case in sys.argv[1:] or CASES:
+  p=subprocess.run(['unshare','--mount','--pid','--fork','--mount-proc',sys.executable,'-B',str(Path(__file__).resolve()),'--inside',case,str(old if case=='old-control-repeat' else scanner),str(workload)],capture_output=True,timeout=15)
+  print(p.stdout.decode(),end='',flush=True)
+  if p.stderr:print(json.dumps({'case':case,'harness_stderr':p.stderr.decode()}),flush=True)
+  failed+=p.returncode!=0
+ shutil.rmtree(build);return int(bool(failed))
+if __name__=='__main__':raise SystemExit(inside(*sys.argv[2:]) if len(sys.argv)>1 and sys.argv[1]=='--inside' else run())

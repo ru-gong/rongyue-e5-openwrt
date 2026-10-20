@@ -1,0 +1,33 @@
+# KCMP 文件表去重扫描器（主机准备）
+
+默认源码 `native_occupancy_scanner.c` 保持 `DEVICE_EXECUTION_ENABLED=0`。`build/scanner.ENABLED.aarch64` 是经明确授权仅构建的独立单门材料；未运行、上传或部署。生产 ELF 均为 0644。此包没有现场通过记录，不授予设备操作。
+
+## 修复与边界
+
+原实现逐 TID 扫描 FD，相同 CLONE_FILES 表会被重复累计，131073 表示遍历计数，不代表 131073 个不同文件。新实现保留全任务集合、每任务 starttime/TGID、cwd/root、mount namespace 及全局 loop 检查：
+
+1. 按任务检查身份与占用。TGID 仅缩小候选比较范围，只有真实 `kcmp(..., KCMP_FILES, ...) == 0` 才合并表。
+2. 对每个代表逐项扫描 FD；同 TGID 独立表仍全部扫描，跨 TGID 共享表宁可重复扫描。
+3. 重新枚举任务集合，重验身份/namespace，并重做全部共享成员与代表的 KCMP 关系；消失、PID 重用、关系改变、权限、未知返回或期限都失败停止。
+
+MAX_FDS=131072、MAX_PIDS=4096、MAX_READ=32MiB、既有原生绝对期限上限 7000ms 未扩大；外层远端 6s/主机 8s 未变。新增 KCMP 次数上限 131072。JSON schema 仍为 `e5-native-occupancy-v1`，增加 fd_tables/shared_tasks/kcmp_calls 等诊断字段。不是原子快照；无法证明扫描之后不再发生占用变化，也不承诺不可中断内核调用能被强制杀掉。
+
+本机原 Android 内核离线 IKCONFIG 确认 CONFIG_KCMP=y（5.15.119-android13-8-00018-ga78ea39db117-ab10710420）。这只证明编译支持，SELinux/seccomp/ptrace 权限与实机耗时仍未知。任何 EPERM/EACCES/ENOSYS/EINVAL/SIGSYS 均失败，不回退到按 TGID 跳过。
+
+## 固定接口
+
+`scan TXID16 BOOT_UUID OPID32 DEADLINE_BOOTTIME_MS` 保持原调用。只有完整 RESULT complete=true、rc0、绑定身份与期限全部吻合才可能接受；本包不生成这种现场凭据。
+
+独立 `capability` 使用相同参数格式，只创建两个私有内存子进程（一个 CLONE_FILES、一个独立表），比对后仅终止/reap 自己子进程，无设备文件写入。该模式未执行于 E5，也不证明跨 Android 安全域权限；它不是安装必需的额外轮次。完整 scan 自身会对真实任务关系 failclosed。scan 模式不 fork、不执行外部命令、不向被观察任务发信号。
+
+## 已执行测试与构建
+
+Mac：89 项，85 通过、4 项真实 Linux syscall 测试跳过。Linux VM：89/89 通过，包含真实私有子进程 KCMP 同表/异表、取消、超时与 SIGSYS 清理。原 57 个 test 方法 AST 未改；新增 32 项含同 TGID 独立表的保护 FD、共享关系变化、代表消失/复用、1025 任务共享 128 FD 只扫描 128 项、真实遍历超限仍在131073失败。
+
+测试命令：在本目录运行 `python3 -B -m unittest discover -p 'test_*.py' -v`。HOST_TEST 只读专用 `/tmp/e5-native-test-*/sandbox` 模拟树；不能把其成功称为 Android 现场验收。
+
+同一既有 Colima `e5-openwrt-prep`（Ubuntu GCC13.3）构建四件静态 ARM ELF；本包两件 scanner，另包两件 archive。`build/BUILD.json`、ELF_INSPECTION.json 和 readelf 证明 ELF64 little-endian AArch64、无 PT_INTERP/DT_NEEDED；未执行任何生产 ELF。VM 起始/结束均 Stopped，配置 SHA 不变。早期失败日志保留，最终 Linux 日志绑定当前源码。注释修订前后的 scanner gate0 二进制相同，最终构建已重新绑定当前源码。
+
+## 消费要求
+
+不得在原冻结包直接替换；新整合必须同时绑定 source、gate-only patch、ELF 长度/SHA、适配器/清单来源，保留现有 STOP 与共享屏障，按本次部分部署实际 owner `7d125fa2bd1c4e63` 处理。当前包不清任何 marker/ledger、不调用 ADB/USB/手机 SSH、不修改 rootfs/分区。独审报告独立于此清单，避免回写循环。

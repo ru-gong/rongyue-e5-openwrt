@@ -1,0 +1,119 @@
+"""Text-only source overlay producer, no device imports or execution."""
+from pathlib import Path
+import hashlib,json,difflib
+H=Path(__file__).resolve().parent;R=H.parents[1]
+BASE={'core':R/'tools/e5_nextphase_core_live_b36a719a15cd4241','recovery':R/'tools/e5_next_recovery_live_b36a719a15cd4241','scanner':R/'tools/e5_scanner_deploy_next_live_b36a719a15cd4241'}
+def sha(p):return hashlib.sha256(p.read_bytes()).hexdigest()
+def pin(p):return {'path':str(p),'sha256':sha(p),'bytes':p.stat().st_size}
+OLD_SOURCE=R/'tools/e5_readonly_closure_prepare_20261016/closure.py';OLD_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+NEW_SOURCE=H/'closure.py';NEW_SHA=sha(NEW_SOURCE)
+retained='''
+    def _preserved_partial(self,before=None):
+        # Exact artifacts from the completed six-mutation attempt. Read only.
+        closure=_closure_api();case=closure._load().c;known=case['retained_device_state']
+        if before is not None:
+            for key,oldkey in (('old_lock','new_lock'),('old_owner','new_owner')):
+                old=known['current_lock'][oldkey];row=before[key]
+                for field in ('dev','inode','uid','gid','bytes','nlink'):
+                    require(row[field]==int(old[field]),'retained current lock identity: '+key+'/'+field)
+                require(row['mode_bits']==int(old['mode_bits'],16) and row['mode']==old['mode'],'retained current lock mode')
+                for field in ('mtime','ctime','mtime_text','ctime_text'):
+                    require(row[field]==old[field],'retained current owner/time: '+key+'/'+field)
+        archive=LOCK+'.archive.fad8a60f84aa4268.'+OLD_TX
+        rows=known['archived_old_lock']['after'];records={}
+        # Per request bounded read; no whole-proc shell scan and no state writes.
+        for key,path in (('old_lock',archive),('old_owner',archive+'/owner')):
+            expected=rows[key];kind='d' if key=='old_lock' else 'f'
+            body=f'test ! -L {path}; test -{kind} {path}; test "$(readlink -f {path})" = {path}\\nstat -c \\'{STAT}\\' {path}\\n'
+            if key=='old_owner':body+=f'cat {path}\\n'
+            else:body+=f'{BB} find {path} -mindepth 1 -maxdepth 1 -print\\n'
+            def parse(raw,key=key,path=path,expected=expected):
+                lines=raw.splitlines();require(len(lines)==2,'retained archive framing')
+                got=parse_stat(lines[0]);require(got==expected,'retained archive metadata changed')
+                require(lines[1]==(b'fad8a60f84aa4268' if key=='old_owner' else (path+'/owner').encode()),'retained archive owner/children')
+                return got
+            records[key]=self._request('stage2-retained-archive-'+key,body,limit=8192,validator=parse)
+        for key,item in sorted(known['programs'].items()):
+            path=item['remote_path'];expected=item['metadata'];digest=item['artifact']['sha256']
+            require(path.startswith('/data/local/tmp/e5-clean-') and path.endswith('.'+OLD_TX),'fixed old program scope')
+            body=f'test ! -L {path}; test -f {path}; test "$(readlink -f {path})" = {path}\\nstat -c \\'{STAT}\\' {path}\\n{BB} sha256sum {path}\\nstat -c \\'{STAT}\\' {path}\\n'
+            def parse_program(raw,path=path,expected=expected,digest=digest):
+                require(raw.splitlines()==[expected.encode(),(digest+'  '+path).encode(),expected.encode()],'retained program SHA/identity changed')
+                return {'path':path,'sha256':digest,'metadata':expected}
+            records[key]=self._request('stage2-retained-program-'+key,body,limit=8192,validator=parse_program)
+        return records
+
+'''
+phase_helper='''
+RETAINED_LABELS = ('stage2-retained-archive-old_lock', 'stage2-retained-archive-old_owner',
+                   'stage2-retained-program-archiver', 'stage2-retained-program-helper',
+                   'stage2-retained-program-io_helper', 'stage2-retained-program-scanner')
+
+def partial_retained_proof(rows, result, before, manifest):
+    # Fixed historical retained files, not arbitrary label-prefix permission.
+    binding = manifest['closure_case']
+    need(set(binding) == {'path','sha256','bytes'} and binding['path'] == CASE_PATH and
+         binding['sha256'] == CASE_SHA, 'partial closure case source binding')
+    raw = read(binding['path'], binding['sha256']); need(len(raw) == binding['bytes'], 'case length')
+    case = json.loads(raw); need(case['schema'] == 'e5-fixed-partial-deployment-case-v1' and
+         case['txid'] == OLD_TX, 'fixed previous deployment case')
+    known = case['retained_device_state']
+    for key, oldkey in (('old_lock','new_lock'),('old_owner','new_owner')):
+        expected = known['current_lock'][oldkey]; got = before[key]
+        for field in ('dev','inode','uid','gid','bytes','nlink'):
+            need(got[field] == int(expected[field]), 'previous current lock identity')
+        need(got['mode_bits'] == int(expected['mode_bits'],16) and got['mode'] == expected['mode'], 'previous current lock mode')
+        for field in ('mtime','ctime','mtime_text','ctime_text'):
+            need(got[field] == expected[field], 'previous current lock time identity')
+    selected = [(i,r) for i,r in enumerate(rows) if r['begin']['label'] in RETAINED_LABELS]
+    need([r['begin']['label'] for _,r in selected] == list(RETAINED_LABELS) * 2, 'two exact ordered retained read groups')
+    writes = [i for i,r in enumerate(rows) if r['begin']['mutating']]
+    scans = [i for i,r in enumerate(rows) if r['begin']['label'] == 'occupancy']
+    need(writes and len(scans) == 1 and selected[5][0] < min(writes) <= max(writes) < scans[0] < selected[6][0], 'retained reads do not bracket mutations and scan')
+    records = {}
+    statfields = ('mode_bits','dev','inode','bytes','mode','uid','gid','nlink','mtime','ctime','mtime_text','ctime_text','rdev_major','rdev_minor')
+    for _,r in selected:
+        b=r['begin'];need(b['mutating'] is False and b['payload_bytes']==0 and b['payload_sha256']==sha(b''), 'retained read has mutation/payload')
+        label=b['label'];lines=r['raw'].splitlines()
+        if label.startswith('stage2-retained-archive-'):
+            key=label[len('stage2-retained-archive-'):];expected=known['archived_old_lock']['after'][key]
+            statline='|'.join(format(expected[k],'x') if k in ('mode_bits','rdev_major','rdev_minor') else str(expected[k]) for k in statfields).encode()
+            tail=b'fad8a60f84aa4268' if key=='old_owner' else (LOCK+'.archive.fad8a60f84aa4268.'+OLD_TX+'/owner').encode()
+            need(lines==[statline,tail], 'retained archive raw differs');records[key]=expected
+        else:
+            key=label[len('stage2-retained-program-'):];item=known['programs'][key];path=item['remote_path'];digest=item['artifact']['sha256'];meta=item['metadata']
+            need(lines==[meta.encode(),(digest+'  '+path).encode(),meta.encode()], 'retained program raw SHA/identity differs')
+            records[key]={'path':path,'sha256':digest,'metadata':meta}
+    need(result.get('partial_deployment_preserved')==records, 'retained summary disconnected from raw')
+    return records
+
+'''
+phase_helper=phase_helper.replace('CASE_PATH',repr(str(H/'CASE.json'))).replace('CASE_SHA',repr(sha(H/'CASE.json')))
+out=H/'overlay';out.mkdir(exist_ok=True);files={};diff=[]
+names={'core':['bounded_transport.py','bounded_boot_control.py','uncertainty_recovery.py','workflow.py','phase_evidence.py'],'recovery':['common.py'],'scanner':['stage2_deploy.py']}
+for group,groupnames in names.items():
+ for name in groupnames:
+  p=BASE[group]/name;old=p.read_text();s=old.replace(str(OLD_SOURCE),str(NEW_SOURCE)).replace(OLD_SHA,NEW_SHA)
+  assert s!=old or name=='phase_evidence.py',(group,name)
+  if name=='bounded_boot_control.py':s=s.replace('DEVICE_IO_DISABLED = False','DEVICE_IO_DISABLED = True')
+  elif name=='workflow.py':s=s.replace('WORKFLOW_IO_DISABLED = False','WORKFLOW_IO_DISABLED = True')
+  elif name=='uncertainty_recovery.py':
+   s=s.replace('RECOVERY_TRANSITION_DISABLED = False','RECOVERY_TRANSITION_DISABLED = True').replace('RECOVERY_TRANSITION.json','RECOVERY_REPAIR_TRANSITION.json')
+   s=s.replace("old_boots.add(closure['excluded_boot_id'])","old_boots.update(closure['excluded_boot_ids'])")
+  elif name=='common.py':s=s.replace("'RECOVERY_TRANSITION.json')","'RECOVERY_TRANSITION.json','RECOVERY_REPAIR_TRANSITION.json')")
+  elif name=='phase_evidence.py':
+   s=s.replace("OLD_TX = 'fad8a60f84aa4268'","OLD_TX = '7d125fa2bd1c4e63'")
+   s=s.replace('def deployment(binding, manifest, txid):',phase_helper+'def deployment(binding, manifest, txid):')
+   s=s.replace("need({r['begin']['label'] for r in rows} <= expected | {'hash-chunk'", "partial_retained_proof(rows,result,before,manifest)\n    need({r['begin']['label'] for r in rows} <= expected | set(RETAINED_LABELS) | {'hash-chunk'")
+  elif name=='stage2_deploy.py':
+   s=s.replace('DEVICE_IO_DISABLED=False','DEVICE_IO_DISABLED=True').replace("OLD_TX='fad8a60f84aa4268'","OLD_TX='7d125fa2bd1c4e63'").replace("OLD_BOOT='00000000-0000-4000-8000-000000000001'","OLD_BOOT='00000000-0000-4000-8000-000000000001'")
+   s=s.replace('    def run(self):',retained+'    def run(self):')
+   s=s.replace("baseline=self._baseline();before=self._snapshot('old',programs_absent=True)","baseline=self._baseline();before=self._snapshot('old',programs_absent=True)\n                retained=self._preserved_partial(before)")
+   s=s.replace("final_baseline=self._baseline();require(final_baseline==baseline,'protected baseline changed')","require(self._preserved_partial()==retained,'retained partial deployment changed')\n                final_baseline=self._baseline();require(final_baseline==baseline,'protected baseline changed')")
+   s=s.replace("'uploads':uploads,'lock':after,'scanner':scan,","'uploads':uploads,'lock':after,'scanner':scan,'partial_deployment_preserved':retained,")
+  dest=out/group/name;dest.parent.mkdir(exist_ok=True);compile(s,str(dest),'exec');dest.write_text(s)
+  files[group+'/'+name]={**pin(dest),'base_path':str(p),'base_sha256':sha(p)}
+  diff.extend(difflib.unified_diff(old.splitlines(True),s.splitlines(True),fromfile=str(p),tofile=str(dest)))
+(H/'consumer-overlay.patch').write_text(''.join(diff))
+m={'schema':'e5-partial-deployment-consumer-overlay-v1','status':'DISABLED_PREPARATION_ONLY','files':files,'closure':pin(NEW_SOURCE),'case':pin(H/'CASE.json'),'prior_closure':pin(OLD_SOURCE),'patch':pin(H/'consumer-overlay.patch'),'device_io_performed':False,'actual_state_modified':False,'additional_literal_deltas_required':{'native_archiver':{'OLD_TX':['fad8a60f84aa4268','7d125fa2bd1c4e63'],'tmp_owner':[2000,2000,'0771']}},'requires_bundle_source_resealing':True}
+(H/'OVERLAY_MANIFEST.json').write_text(json.dumps(m,indent=2,sort_keys=True)+'\n');print(json.dumps({'files':len(files),'manifest':pin(H/'OVERLAY_MANIFEST.json')}))

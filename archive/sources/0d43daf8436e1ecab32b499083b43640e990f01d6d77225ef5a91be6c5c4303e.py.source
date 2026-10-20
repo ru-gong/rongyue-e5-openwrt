@@ -1,0 +1,98 @@
+"""Host-only bridge to the new evidence contract; no device capability.
+
+The evidence contract replays observation and raw block receipts.  This bridge
+never translates old resume labels or grants execution authority.
+"""
+from datetime import datetime, timezone
+import hashlib
+import importlib.util
+from pathlib import Path
+import re
+import stat
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+SOURCE = ROOT / "tools/e5_lock_lineage_recovery_prepare_20261020/evidence_contract.py"
+# Filled only after the actual reviewed implementation is complete.
+SOURCE_SHA256 = '0000000000000000000000000000000000000000000000000000000000000000'
+DEPENDENCIES = {'common.py': '0000000000000000000000000000000000000000000000000000000000000000', 'observe.py': '0000000000000000000000000000000000000000000000000000000000000000'}
+SERIAL = "DEVICE_SERIAL_REDACTED"
+ORIGINAL_B = "0000000000000000000000000000000000000000000000000000000000000000"
+ORIGINAL_MISC = "0000000000000000000000000000000000000000000000000000000000000000"
+
+
+class Refusal(RuntimeError):
+    pass
+
+
+def require(ok, why):
+    if not ok:
+        raise Refusal(why)
+
+
+def _local(path):
+    path = Path(path)
+    require(path.is_absolute() and not path.is_symlink() and
+            all(not item.is_symlink() for item in path.parents), "unsafe source path")
+    info = path.stat()
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "source type or hardlink")
+    return path
+
+
+def _module():
+    require(SOURCE_SHA256 != "0" * 64, "evidence verifier not yet frozen")
+    raw = _local(SOURCE).read_bytes()
+    require(hashlib.sha256(raw).hexdigest() == SOURCE_SHA256, "evidence verifier changed")
+    require(set(DEPENDENCIES) == {"common.py", "observe.py"}, "verifier dependency set")
+    for filename, digest in DEPENDENCIES.items():
+        path = SOURCE.with_name(filename)
+        require(digest != "0" * 64 and hashlib.sha256(_local(path).read_bytes()).hexdigest() == digest,
+                "evidence verifier dependency changed: " + filename)
+        cached = sys.modules.get("_e5_next_" + Path(filename).stem)
+        if cached is not None:
+            require(Path(cached.__file__).resolve() == path.resolve(), "foreign verifier dependency loaded")
+    name = "_e5_next_evidence_contract_pinned"
+    old = sys.modules.get(name)
+    if old is not None:
+        require(Path(old.__file__).resolve() == SOURCE.resolve(), "foreign evidence verifier loaded")
+        return old
+    spec = importlib.util.spec_from_file_location(name, SOURCE)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+def validate_directory_ready(binding, boot_id, now=None):
+    require(isinstance(binding, dict) and set(binding) == {"path", "sha256"},
+            "new raw-evidence binding required; old resume schema is refused")
+    require(isinstance(binding["sha256"], str) and
+            re.fullmatch("[0-9a-f]{64}", binding["sha256"]), "bad evidence hash")
+    require(isinstance(boot_id, str) and
+            re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", boot_id),
+            "bad boot ID")
+    now = now or datetime.now(timezone.utc)
+    require(isinstance(now, datetime) and now.tzinfo is not None, "aware clock required")
+    result = _module().validate_directory_ready(binding, boot_id=boot_id, now=now)
+    require(isinstance(result, dict) and
+            result.get("schema") == "e5-next-directory-ready-v1" and
+            result.get("status") == "ORIGINALS_VERIFIED" and
+            result.get("serial") == SERIAL and result.get("boot_id") == boot_id,
+            "wrong evidence identity/status")
+    require(result.get("current_boot_b_sha256") == ORIGINAL_B and
+            result.get("current_misc_sha256") == ORIGINAL_MISC,
+            "original B and full misc are required")
+    require(result.get("device_execution_allowed") is False and
+            result.get("approved_to_flash") is False, "evidence cannot grant execution")
+    expiry = datetime.fromisoformat(result["expires_at"])
+    require(expiry.tzinfo is not None and 0 < (expiry - now).total_seconds() <= 10800,
+            "expired or extended evidence lease")
+    return result
+
+
+if __name__ == "__main__":
+    raise SystemExit("Host evidence library only; no execution or approval command.")

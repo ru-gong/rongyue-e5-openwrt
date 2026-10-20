@@ -1,0 +1,82 @@
+"""SIM binding to the reviewed seventh closure on disposable host fixtures."""
+import test_regression as t
+import ast,datetime as dt,hashlib,importlib.util,json,sys,unittest
+from pathlib import Path
+from unittest.mock import patch
+c=t.c
+ROOT=Path(__file__).resolve().parents[2]
+SOURCE=ROOT/'tools/e5_lock_lineage_stop_prepare_20261020'
+
+def load(name,path):
+ s=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(s);sys.modules[name]=m;s.loader.exec_module(m);return m
+
+class ClosureBindingTests(unittest.TestCase):
+ @classmethod
+ def setUpClass(cls):
+  cls.api=c._closure_api();old=sys.modules.get('closure');sys.modules['closure']=cls.api
+  try:cls.fixture_module=load('_sim_seventh_closure_fixture',SOURCE/'test_closure.py')
+  finally:
+   if old is None:sys.modules.pop('closure',None)
+   else:sys.modules['closure']=old
+ def setUp(self):
+  ctx=self.fixture_module.fixture();self.actor,self.op=ctx.__enter__();self.addCleanup(ctx.__exit__,None,None,None)
+  a=self.actor;(a.state/'PRIOR.json').unlink()
+  permanent=('RECOVERY_PENDING.json','RECOVERY_TRANSITION.json','RECOVERY_REPAIR_TRANSITION.json',
+             'RECOVERY_LIFECYCLE_TRANSITION.json','RECOVERY_POSTDEPLOY_TRANSITION.json','RECOVERY_CLOSED_FD_TRANSITION.json')
+  parent=None;barriers={};retired=[]
+  for i,name in enumerate(permanent,1):
+   tx=format(i,'016x');value={'serial':a.c['serial'],'boot_id':a.s['boot_id'],'txid':tx};raw=c.canonical(value)+b'\n';(a.state/name).write_bytes(raw)
+   barriers[name]=raw.decode();retired.append(tx)
+   layer={'schema':'fixture-prior','serial':a.c['serial'],'retired_txids':retired[:],'excluded_boot_ids':[],
+          'barrier':{'path':str(a.state/name),'sha256':hashlib.sha256(raw).hexdigest()}}
+   if parent is not None:layer['prior_closure']=parent
+   parent=layer
+  a.s['fixture_barriers']=barriers;a.prior_view=parent;a.close()
+  for p in (patch.object(self.api,'validate_closed',side_effect=lambda state,ledger:a.closed()),
+            patch.object(c,'_closure_api',return_value=self.api),patch.object(c,'STATE',a.state),
+            patch.object(c,'LEDGER',a.ledger),patch.object(c,'SERIAL',a.c['serial'])):
+   p.start();self.addCleanup(p.stop)
+ def marker(self,name):
+  (self.actor.state/name).write_bytes(c.canonical({'serial':c.SERIAL,'boot_id':self.actor.s['boot_id'],'txid':'b'*16})+b'\n')
+ def test_closed_snapshot_retains_all_seven_barriers(self):
+  s=c.state_snapshot();c.normal_state(s);c.recovery_state(s)
+  for name in c.MARKERS[3:-1]:self.assertNotEqual(s['markers'][name],'ABSENT')
+  self.assertEqual(s['markers'][c.MARKERS[-1]],'ABSENT');self.assertIn(self.actor.s['txid'],s['used_txids'])
+  self.assertFalse(s['readonly_abort_closure']['freshness_or_execution_authority'])
+ def test_new_unknown_is_not_waived(self):
+  self.marker('UNCERTAIN.json');s=c.state_snapshot()
+  with self.assertRaises(RuntimeError):c.normal_state(s)
+  c.recovery_state(s)
+ def test_new_temporary_transition_blocks_both_modes(self):
+  self.marker('RECOVERY_LOCK_LINEAGE_REPAIR_TRANSITION.json');s=c.state_snapshot()
+  for fn in (c.normal_state,c.recovery_state):
+   with self.assertRaises(RuntimeError):fn(s)
+ def test_receipt_tamper_refused(self):
+  (self.actor.archive/self.api.RECEIPT).write_bytes(b'{}')
+  with self.assertRaises(RuntimeError):c.state_snapshot()
+ def test_missing_seventh_barrier_refused(self):
+  (self.actor.state/self.api.PENDING).rename(self.actor.state/'retained.fixture')
+  with self.assertRaises(OSError):c.state_snapshot()
+ def test_retired_identity_omission_refused(self):
+  s=c.state_snapshot();s['used_txids']=[]
+  with self.assertRaises(RuntimeError):c.normal_state(s)
+ def test_marker_hash_contract_unchanged(self):
+  self.assertEqual(set(c.marker_hashes(c.state_snapshot())),{'ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','boot_ledger'})
+
+class MechanicalBindingTests(unittest.TestCase):
+ def test_exact_reviewed_functions(self):
+  old=(Path(c.dependencies()['no_sim_family']['path'])/'common.py').read_text();new=Path(c.__file__).read_text()
+  def node(source,name):return ast.dump(next(n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name==name),include_attributes=False)
+  for n in ('state_snapshot','normal_state','recovery_state','_closure_api'):self.assertEqual(node(old,n),node(new,n))
+ def test_dependencies_bind_real_family(self):
+  d=c.dependencies();self.assertEqual(d['core_path'],str(c.LIVE));self.assertEqual(d['core_pins'],c.PINS)
+ def test_eight_runtime_algorithms_unchanged(self):
+  old=ROOT/'tools/e5_sim_rearm_prepare_20261015'
+  for name in ('observe.py','evidence_contract.py','recovery.py','rearm.py','sim_nv.py','nv_origin.py','nv_geometry.json','acceptance-contract.json'):
+   self.assertEqual((old/name).read_bytes(),(c.HERE/name).read_bytes())
+ def test_budgets_and_four_device_gates_unchanged(self):
+  self.assertFalse(t.o.DEVICE_IO_ENABLED);self.assertTrue(t.arm.REARM_IO_DISABLED)
+  self.assertTrue(c.sibling('sim_nv').NV_IO_DISABLED);self.assertTrue(c.sibling('recovery').RECOVERY_IO_DISABLED)
+  with self.assertRaises(RuntimeError):c.remaining({'captured_at':(c.now()-dt.timedelta(seconds=901)).isoformat()})
+
+if __name__=='__main__':unittest.main(verbosity=2)

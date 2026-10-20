@@ -1,0 +1,173 @@
+"""Fixed source-bound continuation of an all-ACK, fully checked prefix.
+
+Uses the unchanged4MiB native writer. No create-stage, block writer, rename,
+helper upload, cleanup, reboot, or old request replay is present.
+"""
+import argparse
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import signal
+import sys
+import threading
+import time
+import types
+
+DEVICE_RESUME_ENABLED=True
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+RUN=ROOT/'evidence/author-fd-convergence-continuation-20261020'
+HISTORY=ROOT/'evidence/author-lock-lineage-install-20261020'
+CORE=ROOT/'tools/e5_nextphase_core_live_265962d3c1cdbde8'
+BINDINGS_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CHUNK=4<<20
+
+def need(ok,why):
+    if not ok:raise RuntimeError(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def bind(p):return {'path':str(p),'sha256':sha(p.read_bytes())}
+def bound(b):
+    p=Path(b['path']);need(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'safe input')
+    raw=p.read_bytes();need(sha(raw)==b['sha256'],'source/input digest');return json.loads(raw)
+def load(name,p,digest=None):
+    need(not p.is_symlink(),'module symlink');raw=p.read_bytes();need(digest is None or sha(raw)==digest,'module source')
+    m=types.ModuleType(name);m.__file__=str(p);sys.modules[name]=m;exec(compile(raw,str(p),'exec'),m.__dict__);return m
+def save(p,value):
+    with p.open('x') as out:json.dump(value,out,sort_keys=True,indent=2);out.write('\n');out.flush();os.fsync(out.fileno())
+    fd=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+    return bind(p)
+
+
+def prefix_inventory(case,rows):
+    expected=case['prefix'];seen=set();root=None
+    need(len(rows)==len(expected)+1,'prefix exact file set')
+    for row in rows:
+        if row['path']=='.':
+            need(root is None,'duplicate root');root=row
+            need(row['type']=='d' and (row['dev'],row['inode'])==tuple(case['stage_identity']) and
+                 row['uid']==row['gid']==0 and row['mode']=='700','prefix root identity/permissions')
+        else:
+            name=row['path'][2:] if row['path'].startswith('./') else None
+            need(name in expected and name not in seen,'unexpected/duplicate staged path');seen.add(name)
+            item=expected[name];actual={k:v for k,v in row.items() if k!='path'}
+            need(actual==item['meta'],'prefix inode/metadata/length drift: '+name)
+            need(item['bytes']<=item['total'] and (item['bytes']==item['total'] or item['bytes']%CHUNK==0),
+                 'prefix not at checked chunk boundary')
+    need(root is not None and seen==set(expected),'prefix incomplete tree')
+    return True
+
+
+def stream_file(adapter,writer,source,item,name,prefix):
+    count=prefix['bytes'] if prefix else 0;inode=prefix['inode'] if prefix else 0
+    need(0<=count<=item.size and (count==item.size or count%CHUNK==0),'file prefix boundary')
+    # Retain the same pinned source FD across fresh prefix comparison and append.
+    for offset in range(0,count,16<<20):
+        length=min(16<<20,count-offset);data=source.read(length);need(len(data)==length,'short prefix input')
+        got,meta=adapter._read_twice(adapter.path('stage')+'/'+name,offset,length,prefix['meta'])
+        need(got==data and meta==prefix['meta'],'fresh prefix content/metadata drift: '+name)
+    for offset in range(count,item.size,CHUNK):
+        data=source.read(min(CHUNK,item.size-offset));need(len(data)==min(CHUNK,item.size-offset),'short remaining input')
+        ack=writer.write(name,item,offset,data,inode);inode=ack['inode']
+    source.finish()
+    return {'prefix_bytes_skipped':count,'new_bytes':item.size-count,'inode':inode}
+
+
+def materials():
+    raw=(HERE/'BINDINGS.json').read_bytes();need(sha(raw)==BINDINGS_SHA,'fixed producer dependencies')
+    deps=json.loads(raw)
+    for name,b in deps['modules'].items():
+        p=Path(b['path']);need(sha(p.read_bytes())==b['sha256'],'append dependency drift '+name)
+    family=bound(deps['family']);need(family['activation_id']=='265962d3c1cdbde8','fixed runtime family')
+    for item in family['files'].values():
+        p=Path(item['path']);need(not p.is_symlink() and p.stat().st_size==item['bytes'] and sha(p.read_bytes())==item['sha256'],'runtime source drift')
+    sys.path.insert(0,str(CORE))
+    workflow=load('_prefix_resume_workflow',CORE/'workflow.py',family['files']['core/workflow.py']['sha256'])
+    manifest=workflow.verify_materials();manifest['_bound_manifest_sha256']=workflow.MANIFEST_SHA
+    workflow.verify_support_bindings(manifest);mods=workflow.load_modules(manifest)
+    combined=load('_prefix_combined_append',Path(deps['modules']['combined']['path']),deps['modules']['combined']['sha256'])
+    settlement=load('_prefix_settlement',Path(deps['modules']['settlement']['path']),deps['modules']['settlement']['sha256'])
+    case=bound(deps['case']);settlement.validate_settled()
+    return deps,workflow,manifest,mods,combined,case
+
+
+def execute(request_binding,*,preflight_only=False):
+    need(DEVICE_RESUME_ENABLED,'DEVICE_RESUME_DISABLED')
+    deps,w,m,mods,combined,case=materials();request=bound(request_binding)
+    need(request['schema']=='e5-verified-prefix-stage-request-v1' and request['txid']==case['txid'] and
+         request['boot_id']==case['boot_id'] and request['case']==deps['case'] and
+         request['producer_sha256']==sha(Path(__file__).read_bytes()) and request['dependencies_sha256']==BINDINGS_SHA,
+         'fixed resume request/source')
+    need(type(request['total_seconds'])is int and 30<=request['total_seconds']<=7200,'bounded resume budget')
+    ready=mods['cold_bridge'].validate_directory_ready(request['cold_ready'],case['boot_id'])
+    need((dt.datetime.fromisoformat(ready['expires_at'])-dt.datetime.now(dt.timezone.utc)).total_seconds()>request['total_seconds']+5,
+         'whole continuation must fit current evidence lease')
+    requirements={'deployment':bind(HISTORY/'scanner-execution/result/COMPLETE.json'),
+                  'probe':bind(HISTORY/'probe-execution/COMPLETE.json')}
+    checked=mods['phase_evidence'].validate_requirements(requirements,m,'stage',case['txid'])
+    out=RUN/('append-preflight-only' if preflight_only else 'resume-stage-execution')
+    need(not out.exists() and not out.is_symlink(),'fresh output, never replay')
+    out.mkdir(mode=0o700);cancel=threading.Event();old={}
+    def stop(signum,frame):cancel.set()
+    for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):old[sig]=signal.signal(sig,stop)
+    adapter=None
+    try:
+        save(out/'REQUEST.json',request);save(out/'SOURCE_BINDING.json',{'request':request_binding,'dependencies':bind(HERE/'BINDINGS.json'),
+             'case':deps['case'],'source_family':deps['family'],'preflight_only':preflight_only,'prior_STOP_retained':True})
+        deadline=time.monotonic()+request['total_seconds']
+        with mods['directory_session']._device_lock():
+            adapter=w.make_adapter(mods,m,{'txid':case['txid'],'boot_id':case['boot_id']},out,cancel,deadline)
+            adapter.fresh_gate({'request_sha256':request_binding['sha256'],'txid':case['txid'],
+                               'boot_id':case['boot_id'],'expires_at':ready['expires_at']})
+            mods['phase_evidence'].verify_current(adapter,checked,m)
+            writer=combined.CombinedAppend(adapter,case['stage_identity'])
+            # First actual combined guard is a separate read-only validation,
+            # with its own receipt. No append is performed in preflight mode.
+            guard=writer.preflight();save(out/'COMBINED_GUARD_REAL.json',guard)
+            if preflight_only:
+                result={'complete':True,'read_only':True,'source_guard_passed':True,'mutations':0}
+                save(out/'COMPLETE.json',result);return result
+            current=adapter._inventory('stage');prefix_inventory(case,current)
+            api=mods['android_directory_adapter'];fixed=mods['bounded_stage']
+            make=lambda n:api.Artifact(Path(m['stage_inputs'][n]['path']),m['stage_inputs'][n]['bytes'],m['stage_inputs'][n]['sha256'])
+            fixed.BoundedStage(adapter)._contract({n:make(n) for n in api.STAGE_INPUTS},make('openwrt.ext4'))
+            results={}
+            for name in sorted(m['stage_inputs']):
+                item=make(name);item.verify()
+                with fixed.PinnedInput(item.path,item.size,item.sha256) as source:
+                    results[name]=stream_file(adapter,writer,source,item,name,case['prefix'].get(name))
+                save(out/('FILE-'+name+'.json'),results[name])
+            probe=adapter.path('stage')+'/fscrypt-probe'
+            for name in ('',*sorted(m['stage_inputs'])):
+                target=adapter.path('stage')+('/'+name if name else '')
+                def unencrypted(raw):need(raw==b'UNENCRYPTED\n','fscrypt policy');return True
+                adapter._request('fscrypt-check',f'test "$({probe} {target})" = unencrypted\nprintf "UNENCRYPTED\\n"\n',limit=128,validator=unencrypted)
+            inventory=adapter.inspect('stage');mods['directory_session']._stage_matches(inventory,w.json_binding(m['candidate']))
+            need(time.monotonic()<deadline and not cancel.is_set() and not adapter.transport.poisoned,'continuation expired/uncertain')
+            mods['bounded_transport']._closure_api().normal_gate(adapter.transport.state,ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl',case['boot_id'],case['txid'])
+            stage=save(out/'stage.inventory.json',inventory)
+            result={'schema':'e5-verified-prefix-stage-complete-v1','complete':True,'serial':w.SERIAL,
+                    'txid':case['txid'],'boot_id':case['boot_id'],'producer_sha256':sha(Path(__file__).read_bytes()),
+                    'dependencies_sha256':BINDINGS_SHA,'prefix_case':deps['case'],'stage_inventory':stage,
+                    'verified_prefix_bytes_skipped':case['acknowledged_payload_bytes'],'files':results,
+                    'no_old_command_replay':True,'native_writer_unchanged_4MiB':True,'block_writes':False,
+                    'old_directory_not_moved':True,'reboot_performed':False,'default_boot':'android'}
+            save(out/'COMPLETE.json',result);return result
+    except BaseException as error:
+        if adapter is not None and adapter.transport is not None:
+            try:adapter.transport.mark_uncertain('prefix stage: '+type(error).__name__+': '+str(error))
+            except BaseException:pass
+        if not (out/'STOP.json').exists():save(out/'STOP.json',{'reason':type(error).__name__+': '+str(error),'no_automatic_retry_or_cleanup':True,'block_write_entry_not_called':True})
+        raise
+    finally:
+        for sig,handler in old.items():signal.signal(sig,handler)
+
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser();p.add_argument('mode',choices=('plan','preflight','continue'),nargs='?',default='plan');p.add_argument('--request');p.add_argument('--sha256');args=p.parse_args()
+    if args.mode=='plan':print(json.dumps({'device_execution_enabled':DEVICE_RESUME_ENABLED,'mode':'PLAN_ONLY','native_write_chunk_bytes':CHUNK,'block_writes':False}))
+    else:print(json.dumps(execute({'path':args.request,'sha256':args.sha256},preflight_only=args.mode=='preflight'),ensure_ascii=False))

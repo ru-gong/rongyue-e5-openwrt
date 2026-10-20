@@ -1,0 +1,234 @@
+"""Fake transport plus host pipes only. No process/network/device operations."""
+import contextlib
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import capture as c
+
+
+def audit(event,args):
+    if event.startswith(("subprocess.","socket.")) or event in ("os.system","os.exec","os.posix_spawn"):
+        raise AssertionError("external operation forbidden: "+event)
+sys.addaudithook(audit)
+
+
+def stats(typ="f",size=7,inode=123,links=1):
+    bits={"f":"8180","d":"41c0","b":"61b0"}[typ]
+    return f"{bits}|1|{inode}|{size}|600|0|0|{links}|100|100|mtime-ns|ctime-ns|0|0".encode()
+
+
+def envelope(payload,kind="file",name="./file",metadata=None,offset=0,requested_length=None):
+    meta=metadata or stats(size=len(payload));p=c.allowed_path(kind,name if kind=="file" else None).encode()
+    length=len(payload) if requested_length is None else requested_length
+    tail=c.BOOT_ID.encode()+b"\t"+p+b"\t"+str(offset).encode()+b"\t"+str(length).encode()+b"\t"+meta
+    return b"META\t"+tail+b"\n"+payload+b"\nEND\t"+tail+b"\n"
+
+
+class FakeProcess:
+    def __init__(self,out=b"",err=b"",leave_open=False):
+        self.writers=[];self.returncode=None;self.killed=0;self.waits=0
+        for label,data in (("stdout",out),("stderr",err)):
+            r,w=os.pipe();os.write(w,data);setattr(self,label,os.fdopen(r,"rb",buffering=0))
+            if leave_open:self.writers.append(w)
+            else:os.close(w)
+    def kill(self):self.killed+=1;self.returncode=-9
+    def wait(self,timeout):
+        self.waits+=1
+        if self.returncode is None:self.returncode=0
+    def poll(self):return self.returncode
+    def close(self):
+        for w in self.writers:os.close(w)
+
+
+class Tests(unittest.TestCase):
+    def test_default_plan_never_calls_transport(self):
+        with patch.object(c.subprocess,"Popen",side_effect=AssertionError("not allowed")),contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(c.main([]),0)
+        self.assertEqual(json.loads(out.getvalue())["writes_on_device"],[])
+
+    def test_binary_nul_newline_nonutf8_roundtrip(self):
+        payload=b"\x00\xff\r\nEND\t\x00"
+        self.assertEqual(c.decode_read(envelope(payload),"file",len(payload),"./file",offset=0,requested_length=len(payload))[0],payload)
+
+    def test_framing_rejects_crlf_translation_short_extra_and_missing(self):
+        raw=envelope(b"a\nb")
+        for bad in (raw.replace(b"\n",b"\r\n"),raw[:-1],raw+b"x",raw.replace(b"END\t",b"NOT\t")):
+            with self.subTest(bad=bad):
+                with self.assertRaises(c.Stop):c.decode_read(bad,"file",3,"./file",offset=0,requested_length=3)
+
+    def test_changed_boot_and_stat_rejected(self):
+        raw=envelope(b"x")
+        for bad in (raw.replace(b"\nEND\t"+c.BOOT_ID.encode(),b"\nEND\totherboot"),raw[:-2]+b"1\n"):
+            with self.assertRaises(c.Stop):c.decode_read(bad,"file",1,"./file",offset=0,requested_length=1)
+
+    def test_read_bounds_and_unknown_paths(self):
+        for args in (("boot_b",0,c.MAX_CHUNK+1),("misc",1048576,4096),("misc",1,4096),("unknown",0,4096)):
+            with self.assertRaises(c.Stop):c.read_script(*args)
+        for name in ("../x","./a/../x","./a b","./a;reboot","./a\nb","/data/file"):
+            with self.assertRaises(c.Stop):c.read_script("file",0,4096,name)
+
+    def test_fixed_readonly_command_grammar(self):
+        script=c.read_script("file",c.MAX_CHUNK,123,"./openwrt.ext4",hash_only=True)
+        self.assertIn("skip=4096 count=123 iflag=count_bytes",script)
+        self.assertIn("set -o pipefail",script)
+        self.assertNotIn(" of=",script)
+        for word in ("reboot","mkdir","chmod","rm -","mv ","mount -","AT+"):
+            self.assertNotIn(word,script)
+        self.assertNotIn("/proc/[0-9]*/mountinfo",script)
+        self.assertNotIn("/proc/[0-9]*/mountinfo",c.read_script("file",0,123,"./openwrt.ext4"))
+        self.assertIn("/proc/self/mountinfo",c.read_script("file",0,123,"./openwrt.ext4"))
+        self.assertIn("/proc/1/mountinfo",c.read_script("file",0,123,"./openwrt.ext4"))
+
+    def inv(self,rows):
+        return b"BOOT\0"+c.BOOT_ID.encode()+b"\0"+b"".join(n+b"\0"+s+b"\0" for n,s in rows)+b"END\0"+c.BOOT_ID.encode()+b"\0"
+
+    def test_inventory_records_metadata_without_device_hash(self):
+        rows=c.parse_inventory(self.inv([(b".",stats("d")),(b"./file",stats())]))
+        self.assertEqual(rows[1]["uid"],0);self.assertEqual(rows[1]["mtime_text"],"mtime-ns")
+        self.assertNotIn("sha256sum",c.inventory_script())
+
+    def test_inventory_rejects_links_crossfs_duplicates_missing_end(self):
+        root=(b".",stats("d"))
+        cases=[self.inv([root,(b"./x",stats(links=2))]),self.inv([root,(b"./x",stats().replace(b"|1|123|",b"|2|123|"))]),
+               self.inv([root,(b"./x",stats()),(b"./x",stats())]),self.inv([root])[:-2]]
+        for raw in cases:
+            with self.assertRaises(c.Stop):c.parse_inventory(raw)
+
+    def test_bounded_pipe_stdout_limit_kills_no_retry(self):
+        proc=FakeProcess(b"abcdefgh")
+        calls=[]
+        def spawn(*a,**kw):calls.append(a);return proc
+        result=c.collect_process(["fake"],4,popen=spawn)
+        self.assertEqual(result["stdout"],b"abcd");self.assertEqual(result["failure"],"output_limit")
+        self.assertEqual(proc.killed,1);self.assertEqual(len(calls),1)
+
+    def test_bounded_pipe_deadline_kills_no_retry(self):
+        proc=FakeProcess(leave_open=True);ticks=iter([0,9,9,9])
+        try:result=c.collect_process(["fake"],4,popen=lambda *a,**k:proc,clock=lambda:next(ticks))
+        finally:proc.close()
+        self.assertEqual(result["failure"],"deadline");self.assertEqual(proc.killed,1)
+
+    def test_pipe_stderr_and_exact_binary_retained(self):
+        proc=FakeProcess(b"\x00\xff",b"error")
+        result=c.collect_process(["fake"],2,popen=lambda *a,**k:proc)
+        self.assertEqual(result["stdout"],b"\x00\xff");self.assertEqual(result["stderr"],b"error")
+
+    def test_query_stderr_preserved_and_failure_stops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obj=object.__new__(c.Capture);obj.output=Path(tmp);obj.index=0
+            calls=[]
+            def runner(argv,limit):
+                calls.append(argv);return {"stdout":b"partial","stderr":b"bad","returncode":0,"failure":None,"elapsed_seconds":1}
+            obj.runner=runner
+            with self.assertRaises(c.Stop):obj.query("fake",c.guard(),100)
+            self.assertEqual((obj.output/"00001-fake.stderr").read_bytes(),b"bad")
+            self.assertEqual(calls[0][3:5],["shell","-T"])
+            self.assertTrue(calls[0][5].startswith(c.SU+" -c '"));self.assertEqual(len(calls),1)
+
+    def test_query_spawn_failure_recorded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obj=object.__new__(c.Capture);obj.output=Path(tmp);obj.index=0
+            def fail(*a):raise OSError("fake spawn failure")
+            obj.runner=fail
+            with self.assertRaises(c.Stop):obj.query("fake",c.guard(),100)
+            self.assertIn("spawn_failure",json.dumps(json.loads((obj.output/"00001-fake.json").read_text())).replace(" ","_"))
+
+    def test_chunk_second_read_hash_mismatch_does_not_mark_complete(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obj=object.__new__(c.Capture);obj.output=Path(tmp);obj.chunk_bytes=c.CHUNK
+            meta=c.parse_stat(stats(size=1));obj.read=lambda *a:(b"x",meta)
+            obj.query=lambda *a:envelope(b"0"*64+b"  -\n",metadata=stats(size=1),requested_length=1)
+            with self.assertRaisesRegex(c.Stop,"chunk hash mismatch"):
+                obj.capture_object("file",1,"file.bin","./file",meta)
+            self.assertEqual((obj.output/"file.bin").stat().st_size,0)
+            self.assertFalse((obj.output/"COMPLETE.json").exists())
+
+    def test_existing_output_never_overwritten(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(c,"hash_file",return_value=c.ADB_SHA):
+            with self.assertRaises(FileExistsError):c.Capture(Path(tmp).resolve(),runner=lambda *a:None)
+
+    def test_offset_length_replay_rejected_in_data_and_hash_frames(self):
+        for payload in (b"data",b"0"*64+b"  -\n"):
+            raw=envelope(payload,offset=0,requested_length=4)
+            for offset,length in ((4096,4),(0,8)):
+                with self.assertRaises(c.Stop):
+                    c.decode_read(raw,"file",len(payload),"./file",offset=offset,requested_length=length)
+
+    def test_exact_status_calibration_passes_and_swallowed_error_rejected(self):
+        for rc,stderr,passed in ((37,b"E5_STDERR_PROBE\n",True),(0,b"",False)):
+            with tempfile.TemporaryDirectory() as tmp:
+                obj=object.__new__(c.Capture);obj.output=Path(tmp);obj.index=0
+                obj.runner=lambda *a:{"stdout":b"E5_STDOUT_PROBE\n","stderr":stderr,"returncode":rc,"failure":None,"elapsed_seconds":0}
+                if passed:obj.query("transport-status-probe",c.status_probe_script(),256,calibration=True)
+                else:
+                    with self.assertRaises(c.Stop):obj.query("transport-status-probe",c.status_probe_script(),256,calibration=True)
+
+    def test_calibration_not_general_exitcode_override(self):
+        obj=object.__new__(c.Capture);obj.index=0
+        with self.assertRaisesRegex(c.Stop,"invalid special"):
+            obj.query("unknown","exit 37",256,calibration=True)
+
+    def test_capture_file_independent_hash_and_host_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obj=object.__new__(c.Capture);obj.output=Path(tmp);obj.chunk_bytes=c.CHUNK
+            payload=b"\x00\xff\n";meta=c.parse_stat(stats(size=3));obj.read=lambda *a:(payload,meta)
+            obj.query=lambda *a:envelope(c.sha(payload).encode()+b"  -\n",metadata=stats(size=3),requested_length=3)
+            got=obj.capture_object("file",3,"file.bin","./file",meta)
+            self.assertEqual((obj.output/"file.bin").read_bytes(),payload)
+            self.assertEqual(got["sha256"],c.sha(payload))
+
+    def test_all_explicit_run_phases_fake_only(self):
+        for phase in ("probe","blocks","metadata","directory","all"):
+            with self.subTest(phase=phase),tempfile.TemporaryDirectory() as tmp:
+                obj=object.__new__(c.Capture);obj.output=Path(tmp);obj.chunk_bytes=c.CHUNK;obj.index=0;obj.profile=c.profile()
+                obj.geometry=lambda:None;obj.transport_probe=lambda:None;calls=[]
+                def capture(kind,length,destination,name=None,expected_stat=None):
+                    calls.append(kind)
+                    return {"kind":kind,"sha256":obj.profile["gpt_prefix_sha256"] if kind=="gpt-prefix" else obj.profile["protected_hashes"].get(kind,"0"*64)}
+                obj.capture_object=capture
+                obj.query=lambda label,*a: b"SCOPE_BEGIN\nSELF_MOUNTS_OK\nINIT_MOUNTS_OK\nGLOBAL_LOOPS_OK\nSCOPE_END\n" if label=="scope-check" else self.inv([(b".",stats("d")),(b"./file",stats())])
+                obj.run(phase);result=json.loads((obj.output/"COMPLETE.json").read_text())
+                self.assertEqual(result["full_directory"],phase in ("directory","all"))
+                self.assertEqual(set(c.PROTECTED).issubset(calls),phase in ("blocks","all"))
+
+    def test_scope_restricted_to_two_namespaces_and_bounded_global_loops(self):
+        script=c.scope_probe_script()
+        self.assertNotIn("/proc/[0-9]",script)
+        self.assertNotIn("/fd/",script)
+        self.assertIn("/proc/self/mountinfo",script)
+        self.assertIn("/proc/1/mountinfo",script)
+        self.assertIn('test "$loop_count" -le 128',script)
+        self.assertNotIn("SCOPE_BEGIN",c.inactive())
+        self.assertEqual(c.plan()["read_consistency"]["satisfies_directory_mutation_gate"],False)
+        self.assertEqual(c.plan()["default_chunk_bytes"],16<<20)
+
+    def test_metadata_stage_never_reads_directory_content(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            obj=object.__new__(c.Capture);obj.output=Path(tmp);obj.chunk_bytes=c.CHUNK;obj.index=0;obj.profile=c.profile()
+            obj.geometry=lambda:None;obj.transport_probe=lambda:None;calls=[]
+            def read(kind,*args):
+                calls.append(kind)
+                return {"kind":kind,"sha256":obj.profile["gpt_prefix_sha256"]}
+            obj.capture_object=read
+            obj.query=lambda label,*a:b"SCOPE_BEGIN\nSELF_MOUNTS_OK\nINIT_MOUNTS_OK\nGLOBAL_LOOPS_OK\nSCOPE_END\n" if label=="scope-check" else self.inv([(b".",stats("d")),(b"./file",stats())])
+            obj.run("metadata")
+            result=json.loads((obj.output/"COMPLETE.json").read_text())
+            self.assertEqual(calls,["gpt-prefix"])
+            self.assertFalse(result["full_directory"])
+            self.assertFalse(result["read_consistency"]["satisfies_directory_mutation_gate"])
+
+    def test_operator_stop_during_transport_kills_and_retains_failure(self):
+        proc=FakeProcess(leave_open=True)
+        class InterruptedSelector(c.selectors.DefaultSelector):
+            def select(self,timeout):raise c.Stop("operator signal 15")
+        try:result=c.collect_process(["fake"],4,popen=lambda *a,**k:proc,selector=InterruptedSelector)
+        finally:proc.close()
+        self.assertIn("operator signal 15",result["failure"]);self.assertEqual(proc.killed,1)
+
+
+if __name__=="__main__":unittest.main(verbosity=2)

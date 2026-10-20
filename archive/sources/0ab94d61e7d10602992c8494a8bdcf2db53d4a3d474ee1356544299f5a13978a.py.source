@@ -1,0 +1,53 @@
+import sys
+sys.addaudithook(lambda e,a: (_ for _ in ()).throw(AssertionError('external IO')) if e.startswith(('subprocess.','socket.')) else None)
+from pathlib import Path
+from unittest.mock import patch
+import json,tempfile,unittest
+from types import SimpleNamespace
+import nv_baseline as n
+class Tests(unittest.TestCase):
+ def test_disabled(self):
+  with self.assertRaisesRegex(n.Refusal,'DISABLED'):n.capture(None,'/never')
+ def test_geometry(self):
+  r=n.geometry();self.assertEqual(r[0]['dev'],'259:6');self.assertEqual(sum(x['bytes'] for x in r),342884352)
+ def test_readonly_guard(self):
+  for r in n.geometry():self.assertIn('blockdev --getsize64',n.guard(r));self.assertNotIn(' of=',n.guard(r))
+ def test_ranges(self):
+  with patch.object(n,'NV_IO_DISABLED',False):
+   for off,size in [(1,4096),(0,4097),(0,5<<20),(52<<20,4096)]:
+    with self.assertRaises(n.Refusal):n.chunk(None,n.geometry()[0],off,size)
+   with self.assertRaises(n.Refusal):n.chunk(None,{'number':36},0,4096)
+ def framed(self,mode=None,hash_only=False):
+  a=SimpleNamespace(boot_id='00000000-0000-4000-8000-000000000001')
+  row=n.geometry()[0];size=4096
+  def request(label,script,limit,validator,op_id):
+   self.assertNotIn(' of=',script);self.assertIn('259:6',script)
+   head=f'NV\t{op_id}\t{a.boot_id}\t{row["node"]}\t0\t{size}\t17 42'.encode()
+   data=(n.sha(b'x'*size)+'  -\n').encode() if hash_only else b'x'*size
+   tail=head if mode!='identity' else head.replace(b'17 42',b'18 42')
+   raw=head+b'\n'+data+b'\n'+tail+b'\n'
+   if mode=='short':raw=raw[:-1]
+   if mode=='extra':raw+=b'!'
+   return validator(raw)
+  a._request=request
+  with patch.object(n,'NV_IO_DISABLED',False):return n.chunk(a,row,0,size,hash_only)
+ def test_real_binary_parser(self):self.assertEqual(self.framed()[0],b'x'*4096)
+ def test_real_hash_parser(self):self.assertEqual(self.framed(hash_only=True)[0][:64].decode(),n.sha(b'x'*4096))
+ def test_binary_envelope_corruption(self):
+  for mode in ['identity','short','extra']:
+   with self.assertRaises(n.Refusal):self.framed(mode)
+ def run_capture(self,mode=None):
+  with tempfile.TemporaryDirectory() as t:
+   row={**n.geometry()[0],'bytes':8192}
+   def read(a,r,o,z,hash_only=False):
+    data=b'x'*z;meta=(18 if mode=='inode' and hash_only else 17,42)
+    return ((('0'*64 if mode=='digest' else n.sha(data))+'  -\n').encode() if hash_only else data),meta
+   with patch.object(n,'NV_IO_DISABLED',False),patch.object(n,'geometry',return_value=[row]),patch.object(n,'chunk',side_effect=read):
+    p=Path(t).resolve()/'out';a=SimpleNamespace(boot_id='b',txid='t');v=n.capture(a,p);self.assertEqual(json.loads(Path(v['path']).read_text())['device_mutations'],0);self.assertEqual((p/'nr_fixnv1_a.bin').read_bytes(),b'x'*8192)
+    with self.assertRaises(n.Refusal):n.capture(a,p)
+ def test_complete(self):self.run_capture()
+ def test_bytes_drift(self):
+  with self.assertRaisesRegex(n.Refusal,'two full'):self.run_capture('digest')
+ def test_inode_drift(self):
+  with self.assertRaisesRegex(n.Refusal,'two full'):self.run_capture('inode')
+if __name__=='__main__':unittest.main()

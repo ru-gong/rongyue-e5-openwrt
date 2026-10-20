@@ -1,0 +1,16 @@
+# LIVE Python copy and runtime sequence review
+
+Seven Python runtime modules were copied from the frozen v3 preparation directory. Only four literal gates changed from True to False. The other three modules remain byte-identical. All copied modules parsed successfully without importing or executing them. No device, ADB, USB, SSH or VM operation and no real write request was created. Python enablement is not a substitute for the separate native build and exact runtime request review.
+
+The intended sequence is: construct the fixed adapter with an explicit unset cancellation event and a finite phase deadline; acquire the fixed remote lock once; upload and independently verify the three fixed helpers once; measure the native read-only occupancy gate; obtain full fresh evidence. B/misc original restoration must precede the cold NO_WRITE_NEEDED evidence required by directory fresh_gate and session. Stage and backup are separately bounded phases; activation uses fresh current-boot evidence, exact full inventories/Mac tar and its reviewed request. The final boot backend requires the exact real directory adapter and shares its cancellation object and a deadline within its boot budget.
+
+Runtime conditions that must be handled explicitly:
+
+- occupancy, inspect, fresh_gate and stage depend on the scanner already existing and passing its full SHA check. Calling them before helper provisioning fails closed.
+- acquire and helper provisioning are exclusive creation operations, with no retry or automatic release. If a lock/helper already exists, do not call creation again. A separately reviewed continuation must verify the existing same-transaction owner and full helper hashes. A different owner is a stop condition.
+- Any interrupted transport or unreadable acknowledgement persists UNKNOWN across new instances. A new folder or process does not clear it. The recovery-only grant permits original B/misc writes, not helper uploads or directory moves. If the pinned old native helper is missing after a reboot, that grant alone cannot bootstrap it; stop for separate review.
+- Native occupancy may return UNKNOWN because a process naturally exits; this is not proof of a device hang. It is also not permission to retry automatically. Its actual latency/process churn acceptance remains a root-only read-only calibration gate.
+- There are 512 raw-rootfs 4 MiB chunks plus other stage files; the per-phase budget must account for scan/readback overhead. No source change here claims the target can complete within its budget. Cold evidence must still be valid at actual rename and boot admission.
+- Only gates changed. Some inherited __main__/exception strings still describe preparation or disabled operation. They are not execution-state evidence; the exact source manifest and actual gate values govern. There is no new command-line execution interface.
+
+No source logic was changed in response to this sequence review. All unresolved conditions must be checked by the root operator and the independent reviewer before invoking the applicable API.

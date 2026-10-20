@@ -1,0 +1,67 @@
+"""Synthetic temp evidence through the REAL frozen cold-evidence validator.
+
+No device activity. Fixture records expressly say SYNTHETIC; all are removed.
+This validates schema integration, not device health or authorization.
+"""
+from datetime import timedelta
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import unittest
+from unittest.mock import patch
+import directory_session as s
+
+old_dir = Path(__file__).resolve().parent.parent / "e5_resume_prepare_20261013"
+sys.path.insert(0, str(old_dir))
+spec = importlib.util.spec_from_file_location("_synthetic_cold_fixtures", old_dir / "test_plan.py")
+fixture_module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture_module)
+
+class ColdBridgeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls): fixture_module.PlanTests.setUpClass()
+
+    def setUp(self):
+        self.fixture = fixture_module.PlanTests()
+        self.fixture.setUp()
+        self.fixture.folder = self.fixture.folder.resolve()
+        self.fixture.b = fixture_module.p.ORIGINAL_B.read_bytes()
+
+    def tearDown(self): self.fixture.tearDown()
+
+    def binding(self):
+        f = self.fixture
+        evidence, review = f.bind()
+        plan = fixture_module.p.validate_future(f.folder, evidence, review, now=f.now)
+        p = f.folder / "plan.json"
+        raw = (json.dumps(plan) + "\n").encode(); p.write_bytes(raw)
+        return dict(evidence_directory=str(f.folder), evidence_sha256=evidence, review_sha256=review,
+                    plan_path=str(p), plan_sha256=hashlib.sha256(raw).hexdigest())
+
+    def test_real_cold_schema_replays_without_device_authority(self):
+        f = self.fixture
+        result = s._cold_validate(self.binding(), f.boot, f.now)
+        self.assertEqual(result["status"], "NO_WRITE_NEEDED")
+        self.assertFalse(result["device_execution_allowed"])
+        self.assertFalse(result["approved_to_flash"])
+        self.assertEqual(result["restore_ranges"], [])
+
+    def test_real_pending_original_restore_is_refused(self):
+        f = self.fixture; f.b = f.linux
+        with self.assertRaisesRegex(s.Refusal, "original B/misc"):
+            s._cold_validate(self.binding(), f.boot, f.now)
+
+    def test_real_stale_evidence_refused(self):
+        f = self.fixture; bound = self.binding()
+        with self.assertRaises(ValueError):
+            s._cold_validate(bound, f.boot, f.now + timedelta(minutes=30))
+
+    def test_cold_source_pin_refused(self):
+        f = self.fixture; bound = self.binding()
+        with patch.object(s, "COLD_SOURCE_SHA", "0"*64):
+            with self.assertRaisesRegex(s.Refusal, "validator changed"):
+                s._cold_validate(bound, f.boot, f.now)
+
+if __name__ == "__main__": unittest.main()

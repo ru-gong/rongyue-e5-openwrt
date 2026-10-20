@@ -1,0 +1,37 @@
+"""Host-only reseal of these exact UNFROZEN preparation directories, never runtime."""
+import sys
+def deny(event,args):
+ if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':raise RuntimeError('external operation forbidden')
+sys.addaudithook(deny)
+import ast,difflib,hashlib,importlib.util,json,os
+from pathlib import Path
+HERE=Path(__file__).resolve().parent;ROOT=HERE.parents[1]
+require=lambda cond,msg:None if cond else (_ for _ in ()).throw(RuntimeError(msg))
+require(not (HERE/'DELIVERY.json').exists(),'preparation frozen')
+spec=importlib.util.spec_from_file_location('_budget_build',HERE/'build_prepare.py');x=importlib.util.module_from_spec(spec);spec.loader.exec_module(x)
+a=x.a;base=json.loads(a.read(x.BASE,x.BASE_SHA));original={k:a.read(v['path'],v['sha256'],v['bytes']) for k,v in base['files'].items()}
+files={k:a.read(x.DEST[k.split('/')[0]]/k.split('/',1)[1]) for k in original};b=a.Builder(files,x.DEST)
+def setv(key,name,value):b.set(key,name,a.assignment(b.files[key],name)[0],value)
+for key in ('core/bounded_stage.py','core/probe_host.py'):setv(key,'ADAPTER_SHA',b.digest('core/android_directory_adapter.py'))
+pins={name:b.digest('core/'+name+'.py') for name in a.assignment(b.files['recovery/common.py'],'PINS')[0]};setv('recovery/common.py','PINS',pins)
+rm=b.files_manifest('recovery/MANIFEST.json','recovery');rm.update(runtime_pins=pins,purpose='finite-directory-budget-preparation',directory_policy_contract_sha256=b.digest('recovery/evidence_contract.py'),preparation_tests={'external_processes_and_sockets_denied':True,'result':'see delivery test log; historical test record not carried forward'});b.put('recovery/MANIFEST.json',rm)
+setv('core/cold_bridge.py','SOURCE_SHA256',b.digest('recovery/evidence_contract.py'));setv('core/cold_bridge.py','DEPENDENCIES',{n:b.digest('recovery/'+n) for n in ('common.py','observe.py')})
+sm=b.obj('scanner/ARTIFACT_MANIFEST.json');sm.update(host_execution_disabled=True,host_source_sha256=b.digest('scanner/stage2_deploy.py'),runner_source_sha256=b.digest('scanner/runner.py'))
+sm['core']={n:b.binding('core/'+n) for n in sm['core']};sm['cold_contract']=b.binding('recovery/evidence_contract.py');sm['cold_dependencies']={n:b.binding('recovery/'+n) for n in sm['cold_dependencies']};b.put('scanner/ARTIFACT_MANIFEST.json',sm)
+am=b.files_manifest('acceptance/MANIFEST.json','acceptance');b.put('acceptance/MANIFEST.json',am)
+cm=b.obj('core/SOURCE_MANIFEST.json');cm['modules']={n:b.digest('core/'+n+'.py') for n in cm['modules']};cm['deployment_manifest']=b.binding('scanner/ARTIFACT_MANIFEST.json');cm['recovery_manifest']=b.binding('recovery/MANIFEST.json');cm['nv_geometry']=b.binding('core/nv_geometry.json');b.put('core/SOURCE_MANIFEST.json',cm);setv('core/workflow.py','MANIFEST_SHA',b.digest('core/SOURCE_MANIFEST.json'))
+for key,raw in b.files.items():
+ if key.endswith('.py'):ast.parse(raw.decode())
+ if key.endswith('.ENABLED') or key in ('core/bounded_transport.py','recovery/observe.py'):require(raw==original[key],'frozen byte invariant')
+for key,raw in b.files.items():
+ p=Path(b.path(key));require(p.resolve()==p and not p.is_symlink(),'path changed')
+ if raw!=p.read_bytes():
+  with p.open('wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+for k,v in base['files'].items():a.read(v['path'],v['sha256'],v['bytes'])
+patch=''.join(''.join(difflib.unified_diff(original[k].decode().splitlines(True),v.decode().splitlines(True),fromfile='frozen/'+k,tofile='budget-prepare/'+k)) for k,v in sorted(b.files.items()) if original[k]!=v)
+result=json.loads((HERE/'RESULT.json').read_text());result['files']={k:b.binding(k,True) for k in sorted(b.files)};result['behavior_files']=['core/workflow.py','core/android_directory_adapter.py','core/cold_bridge.py','core/bounded_boot_control.py','core/directory_session.py','recovery/evidence_contract.py','recovery/recovery.py'];result['directory_policy_contract_sha256']=b.digest('recovery/evidence_contract.py');result['new_evidence_no_backdating']=True
+for name,data in [('RESULT.json',a.encode(result)),('CHANGES.patch',patch.encode())]:
+ p=HERE/name;history=HERE/(name+'.initial')
+ if not history.exists():a.write_new(history,p.read_bytes())
+ with p.open('wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+print(a.sha(a.encode(result)))

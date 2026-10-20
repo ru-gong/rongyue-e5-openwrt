@@ -1,0 +1,11 @@
+# New FD-slot bounded reacquisition
+
+Observed Android STOP: native RESULT complete=false, detail fd-final-coverage-new-slot, errno116, PID1233/FD248, 3 observed closed slots and 0 confirmed. This is an explicitly rejected incomplete snapshot, not a USB timeout or evidence of partition damage. All65 current requests were read-only;64 completed and the last returned70 in1.4057s with no transport failure. No further device command was issued after STOP.
+
+The final FD re-enumeration still refuses to accept an uninspected new slot. It now marks only that exact failure with a distinct internal return code(-2). The caller discards this entire snapshot AND the preceding candidate, then may reacquire the whole table within the existing THREE attempts. It still requires TWO fresh complete strict nonstream projections to agree. A witnessed-closed FD that reappears is a hard refusal. Permission failures, protected objects, identity changes, limits, deadlines and cancellation remain failures. All observed protected references stop immediately; they are never discarded into success.
+
+No rounds/read/FD/time budget was raised. The scan remains a finite, non-atomic observation; this repair cannot establish hidden-reference absence, future stability, Android compatibility or storage power-loss safety.
+
+Tests cover new pipe/regular slots (one discard followed by two complete fresh snapshots); new protected FD (EBUSY at the next full acquisition); continuous new slots (all3 attempts exhausted); a new slot after an already complete snapshot (that prior snapshot cannot be reused); old native control reproducing the exact new-slot refusal; FD reuse, closures, permission errors, task exit, cancellation and deadlines. Test hooks are absent from the production static AArch64 ELF.
+
+Current source family69 remains frozen and bound to the prior scanner. The new ELF has NOT been uploaded. The new read-only STOP ACTIVE/UNCERTAIN and the original stage STOP are retained. No stop marker has been cleared for this second failure. A new fixed-case STOP reconciliation and source-bound deployment family must be prepared and validated before any new device operation. Do not replace a frozen artifact or rerun the already-used resume entry. No user power cycle is part of this offline repair.

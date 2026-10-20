@@ -1,0 +1,38 @@
+# 本机 tmp 元数据兼容修复：仅禁用准备副本
+
+本轮现场在任何上传之前停止：读取的 850 字节 `stage2-state-old` 响应完整、返回码 0，`/data/local/tmp` 为 uid=2000、gid=2000、mode=0771。旧 Python 校验错误要求 uid=0；原生归档器生产分支也有同一假设。此为工具兼容问题，不能据此指称设备挂死、文件系统损坏或权限需要更改。
+
+仅两处生产语义改动：
+
+- `stage2_deploy.py` 的固定 tmp 元组改为严格 `2000:2000 / 0771`；由实际 6c405 运行源复制，同时将 `DEVICE_IO_DISABLED=True`。
+- `native/lock_archive.c` 的生产 tmp UID 谓词由 0 改为 2000。其 `DEVICE_EXECUTION_ENABLED=0` 保持不变。
+
+不会同时接受 uid 0 与 2000。data/local 的既有所有权与模式、同设备、目录类型、inode、无符号链接、owner 17 字节单链接及旧事务内容、lock/owner 的 root 所有权、归档目标不存在、期限、取消、no-replace rename、fsync 和前后身份校验全部保留。没有 chmod/chown 手机权限、设备连接、marker 变更、重试或清理代码新增。
+
+`CHANGES.patch` 分别显示源码与测试夹具的最小差异。测试保留旧合约与归档回归；原假数据 tmp 的默认 uid=0 改为实测 uid=2000，合成 cold 路径适配保留的 6c405 固定依赖路径。该准备目录没有 runner 或生产执行清单，不可当作可直接部署的新执行包。
+
+## 验证与产物
+
+100 项本地主机测试通过：47 项 Stage2 旧回归、17 项实际 850B 响应和负向校验、30 项原生临时文件系统回归、6 项生产元数据谓词测试。
+
+```sh
+python3 -B -m unittest -v test_stage2_deploy test_actual_metadata
+python3 -B -m unittest -v test_lock_archive
+python3 -B -m unittest -v test_native_metadata
+```
+
+原生两个套件必须分别启动进程，各自的审计钩子只允许本套件编译器及临时测试程序。最初合并运行的拒绝记录保留在 `build/native-combined-harness-failed.log`。这些拒绝属于主机测试隔离，并非设备或产品测试失败。
+
+原生 HOST_TEST 为在 macOS 普通用户临时目录测试，刻意跳过 Android 数字 UID 校验。新增测试直接提取**生产源码内的完整 ancestor-metadata 谓词**，用本地 C 编译器执行纯数值夹具：实测 2000:2000/0771 通过；uid 0、uid 1000、gid 0、mode 0777 拒绝。因此没有把原 30 项回归冒充为生产 UID 分支覆盖。
+
+`build/lock_archive.macos.DISABLED` 为 Apple clang 编译的 **macOS arm64 Mach-O 禁用产物**，不是 Android ELF，不得上传。PATH 未找到本机 aarch64-linux GNU/musl 编译器或 Zig；没有联网、安装依赖或启动 VM。Android ARM64 编译及启用副本仍待单独完成、重新绑定和审核。
+
+## 同类检查与停止状态
+
+已查当前相关源码：修复版 scanner、目录 helper、native I/O 不含 tmp uid=0 的固定前提；既有 bounded provision 与 no-replace probe 对父目录保存并比较实际身份，仅对其 root 锁/owner/helper施加 root 门，不复现此错误。Python 与原生归档器之外未发现本范围内同类固定 UID 假设。
+
+本次冻结运行源码 `bounded_transport.py` 在解析失败后保留 ACTIVE/UNCERTAIN。`reconciliation_only` 只能只读保全，不能解除屏障。现有 `uncertainty_recovery.stage/finish` 绑定新 boot、双审及真实原 B+BC32 恢复；它**不是**“零设备写异常”结案接口。当前没有已审、可直接使用的纯主机只读异常结案入口；不得删除 marker，也不应为了清除主机屏障而重复写入已经相同的 B/misc。
+
+本包没有实现结案器。后续若准备该接口，应单独绑定全部请求、失败 raw/argv/退出状态、零 payload/零 mutation、完整帧、实际旧源、共享 marker/ledger 的精确哈希并由独立审核决定；这只是待审设计，不是本轮许可或自动清除行为。
+
+旧源、历史请求、设备目录与共享状态均保留。此次异常仍须向用户如实报告；本包仅离线准备，不代表可继续现场执行。

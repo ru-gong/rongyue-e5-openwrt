@@ -1,0 +1,390 @@
+"""Fake adapter integration and local tar/journal checks. No device/process IO."""
+import copy
+from datetime import datetime, timezone, timedelta
+import hashlib
+import io
+import json
+from pathlib import Path
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import directory_session as s
+REAL_COLD_VALIDATE = s._cold_validate
+
+
+def audit(event, args):
+    if event.startswith(("subprocess.", "socket.")) or event in ("os.system", "os.exec", "os.posix_spawn"):
+        raise AssertionError("external execution forbidden: " + event)
+sys.addaudithook(audit)
+
+TX = "0123456789abcdef"
+BOOT = "00000000-0000-4000-8000-000000000001"
+NOW = datetime.now(timezone.utc)
+
+
+def sha(data): return hashlib.sha256(data).hexdigest()
+
+
+class FakeBackend:
+    def __init__(self, original, stage, profile):
+        self.txid, self.boot_id = TX, BOOT
+        self.trees = {"active": original, "stage": stage, "archive": None, "failed": None}
+        self.profile, self.calls, self.moves = profile, [], []
+        self.crash_after = None; self.fresh_error = False; self.inspect_error = False
+
+    def fresh_gate(self, binding):
+        self.calls.append("fresh")
+        if self.fresh_error: raise s.Refusal("simulated fresh failure")
+        return {**binding, "serial": s.SERIAL, "captured_at": NOW.isoformat(),
+                "original_B_misc_restored": True, "profile_sha256": s.PROFILE_SHA,
+                "hashes": dict(self.profile["protected_hashes"], boot_b=s.B_SHA, misc=s.M_SHA),
+                "gpt_prefix_sha256": self.profile["gpt_prefix_sha256"], "partitions": self.profile["partitions"],
+                "data": {"node": "/dev/block/mmcblk0p70", "fstype": "f2fs", "rw": True}}
+
+    def inventory_optional(self, role):
+        if self.inspect_error: raise s.Refusal("read failed, not ENOENT")
+        item = self.trees[role]
+        if item is None: return None
+        value = copy.deepcopy(item); value.update(role=role, boot_id=self.boot_id)
+        return value
+
+    def inspect(self, role):
+        value = self.inventory_optional(role)
+        if value is None: raise s.Refusal("missing")
+        return value
+
+    def seal(self, role, snapshot):
+        self.calls.append("seal:" + role)
+        if self.inspect(role) != snapshot: raise s.Refusal("seal changed")
+
+    def move(self, action, snapshot):
+        self.calls.append(action); self.moves.append(action)
+        source, destination = s.adapter_api.MOVES[action]
+        if self.inspect(source) != snapshot or self.trees[destination] is not None: raise s.Refusal("move unsafe")
+        self.trees[destination] = self.trees[source]; self.trees[source] = None
+        if self.crash_after == action: raise OSError("lost connection after rename, no retry")
+        return self.inspect(destination), b'{"ok":true,"fsync_completed":true,"renamed":true}'
+
+    def backup_to_mac(self, role, snapshot, output):
+        raise AssertionError("test must explicitly fake the byte stream for capture")
+
+
+class SessionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.root = Path(self.tmp.name).resolve()
+        self.profile = {"protected_hashes": {"boot_a": "a" * 64}, "gpt_prefix_sha256": "b" * 64,
+                        "partitions": {"boot_a": {"node": "/dev/block/mmcblk0p36", "bytes": 67108864}}}
+        self.candidate = {"schema": "e5-clean-author-candidate-v1", "approved_for_device_execution": False,
+                          "attestation": {k: True for k in ("inner_default_android", "no_private_nv", "no_previous_origin", "no_pending_update")},
+                          "outer_file_set": {"openwrt.ext4": {"bytes": 3, "sha256": sha(b"new")}}}
+        self.cb = self.write_json("candidate.json", self.candidate)
+        self.pb = self.write_json("profile.json", self.profile)
+        self.original = self.inventory("active", b"old", 100)
+        self.stage = self.inventory("stage", b"new", 200)
+        self.ob = self.write_json("original.json", self.original)
+        self.sb = self.write_json("stage.json", self.stage)
+        self.backup = self.make_backup("original", self.original, b"old")
+        self.cold = {"schema": "e5-offline-resume-plan-v1", "status": "NO_WRITE_NEEDED", "serial": s.SERIAL,
+                     "boot_id": BOOT, "current_boot_b_sha256": s.B_SHA, "current_misc_sha256": s.M_SHA,
+                     "device_execution_allowed": False, "approved_to_flash": False,
+                     "expires_at": (NOW + timedelta(minutes=10)).isoformat()}
+        self.cold_binding = {"evidence_directory": str(self.root / "future-evidence"), "evidence_sha256": "c"*64,
+                             "review_sha256": "d"*64, "plan_path": str(self.root / "cold-plan.json"), "plan_sha256": "e"*64}
+        self.request = {"schema": "e5-clean-directory-session-request-v1", "mode": "activate", "serial": s.SERIAL,
+                        "txid": TX, "boot_id": BOOT, "candidate": self.cb, "cold_resume": self.cold_binding,
+                        "original_inventory": self.ob, "stage_inventory": self.sb, "original_backup": self.backup}
+        self.backend = FakeBackend(self.original, self.stage, self.profile)
+        self.patches = [patch.object(s, "_receipt_sources", return_value={"native_io":"f"*64}), patch.object(s, "DEVICE_SESSION_DISABLED", False), patch.object(s, "CANDIDATE_PATH", Path(self.cb["path"])),
+                        patch.object(s, "CANDIDATE_SHA", self.cb["sha256"]), patch.object(s, "PROFILE_PATH", Path(self.pb["path"])),
+                        patch.object(s, "PROFILE_SHA", self.pb["sha256"]), patch.object(s, "_now", return_value=NOW),
+                        patch.object(s, "GLOBAL_DEVICE_LOCK", self.root / "global-device.lock"),
+                        patch.object(s, "_cold_validate", side_effect=self.fake_cold)]
+        for p in self.patches: p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches): p.stop()
+        self.tmp.cleanup()
+
+    def fake_cold(self, binding, boot_id, now):
+        if binding != self.cold_binding or boot_id != BOOT or now >= datetime.fromisoformat(self.cold["expires_at"]):
+            raise s.Refusal("cold evidence stale or wrong boot")
+        return self.cold
+
+    def write_json(self, name, value):
+        p = self.root / name; raw = (json.dumps(value, sort_keys=True) + "\n").encode(); p.write_bytes(raw)
+        return {"path": str(p), "sha256": sha(raw)}
+
+    def inventory(self, role, data, inode):
+        rows = [{"path": ".", "type": "d", "sha256": "-", "dev": 1, "inode": inode, "bytes": 4096,
+                 "mode": "700", "uid": 0, "gid": 0},
+                {"path": "./openwrt.ext4", "type": "f", "sha256": sha(data), "dev": 1, "inode": inode+1,
+                 "bytes": len(data), "mode": "600", "uid": 0, "gid": 0}]
+        return {"schema": "e5-device-directory-inventory-v1", "txid": TX, "boot_id": BOOT,
+                "role": role, "rows": rows, "tree_sha256": s.adapter_api.tree_digest(rows)}
+
+    def make_backup(self, name, inventory, data):
+        p = self.root / (name + ".tar")
+        with tarfile.open(p, "w") as archive:
+            item=tarfile.TarInfo("."); item.type=tarfile.DIRTYPE; item.mode=0o700; archive.addfile(item)
+            item=tarfile.TarInfo("./openwrt.ext4"); item.mode=0o600; item.size=len(data); archive.addfile(item, io.BytesIO(data))
+        verified=s.adapter_api.verify_backup_tar(p, inventory)
+        receipt={**verified,"schema":"e5-full-directory-backup-v1","txid":TX,"boot_id":inventory["boot_id"],
+                 "role":inventory["role"],"path":str(p)}
+        rb=self.write_json(name+".receipt.json",receipt)
+        return {"path":str(p),"bytes":p.stat().st_size,"sha256":sha(p.read_bytes()),
+                "receipt_path":rb["path"],"receipt_sha256":rb["sha256"]}
+
+    def bind(self, request=None, name="request"):
+        request=copy.deepcopy(request or self.request)
+        review={"schema":"e5-clean-directory-session-review-v1","bindings":s.review_binding(request),
+                "reviewer":"synthetic-independent-test","conclusion":"exact_directory_transaction_reviewed",
+                "reviewed_at":NOW.isoformat()}
+        request["technical_review"]=self.write_json(name+".review.json",review)
+        return self.write_json(name+".json",request)
+
+    def open(self, binding=None, name="session", resume=False):
+        binding=binding or self.bind()
+        return s.DirectorySession.open(self.backend,binding["path"],binding["sha256"],self.root/name,resume=resume)
+
+    def rollback_request(self, origin, changed=None):
+        request=copy.deepcopy(self.request); request["mode"]="rollback"
+        p=origin.folder/"plan.json";request["origin_session"]={"path":str(p),"sha256":sha(p.read_bytes())}
+        request["failed_inventory"]=request["failed_backup"]=None
+        if changed is not None:
+            inv=self.backend.inspect("active")
+            request["failed_inventory"]=self.write_json("failed.json",inv)
+            request["failed_backup"]=self.make_backup("failed",inv,changed)
+        return self.bind(request,"rollback-request")
+
+    def test_hard_gate_before_any_backend_or_path_read(self):
+        with patch.object(s,"DEVICE_SESSION_DISABLED",True):
+            with self.assertRaisesRegex(s.Refusal,"DEVICE_SESSION_DISABLED"):
+                s.DirectorySession.open(self.backend,"/missing", "0"*64,self.root/"x")
+        self.assertEqual(self.backend.calls,[])
+
+    def test_activate_real_api_sequence(self):
+        tx=self.open(); result=tx.activate()
+        self.assertEqual(result["state"],"ACTIVE")
+        self.assertEqual(self.backend.moves,["move-active-to-archive","move-stage-to-active"])
+        tx.activate();self.assertEqual(len(self.backend.moves),2)
+        self.assertGreaterEqual(self.backend.calls.count("fresh"),3)
+
+    def test_archive_gap_restore_retains_stage_no_extra_move(self):
+        original=self.open();self.backend.crash_after="move-active-to-archive"
+        with self.assertRaises(OSError):original.activate()
+        self.backend.crash_after=None
+        rollback=self.open(self.rollback_request(original),"rollback-session")
+        self.assertEqual(rollback.rollback()["state"],"ROLLED_BACK_WITH_STAGE")
+        self.assertEqual(self.backend.moves,["move-active-to-archive","move-archive-to-active"])
+        self.assertIsNotNone(self.backend.trees["stage"])
+
+    def test_lost_ack_after_second_rename_reconciles(self):
+        binding=self.bind();tx=self.open(binding);self.backend.crash_after="move-stage-to-active"
+        with self.assertRaises(OSError):tx.activate()
+        self.backend.crash_after=None
+        with self.assertRaisesRegex(s.Refusal,"unresolved prior directory move"):
+            self.open(binding,resume=True)
+        self.assertEqual(len(self.backend.moves),2)
+
+    def test_changed_candidate_rollback_bound_inventory_and_tar(self):
+        tx=self.open();tx.activate()
+        self.backend.trees["active"]=self.inventory("active",b"runtime-NV-log",200)
+        with self.assertRaises(s.Refusal):self.open(self.rollback_request(tx),"bad-rollback").rollback()
+        rollback=self.open(self.rollback_request(tx,b"runtime-NV-log"),"good-rollback")
+        self.assertEqual(rollback.rollback()["state"],"ROLLED_BACK")
+        self.assertEqual(self.backend.inspect("failed")["rows"][1]["sha256"],sha(b"runtime-NV-log"))
+
+    def test_rollback_lost_ack_each_move_no_repeat(self):
+        tx=self.open();tx.activate();binding=self.rollback_request(tx,b"new")
+        rollback=self.open(binding,"rollback");self.backend.crash_after="move-active-to-failed"
+        with self.assertRaises(OSError):rollback.rollback()
+        self.backend.crash_after=None
+        with self.assertRaisesRegex(s.Refusal,"unresolved prior directory"):
+            self.open(binding,"rollback",True).rollback()
+        self.assertEqual(self.backend.moves.count("move-active-to-failed"),1)
+        self.assertEqual(self.backend.moves.count("move-archive-to-active"),0)
+        self.assertIsNone(self.backend.trees["active"])
+        self.assertIsNotNone(self.backend.trees["failed"])
+
+    def test_new_recovery_session_can_bind_preserved_failed_directory(self):
+        tx=self.open();tx.activate();binding=self.rollback_request(tx,b"new")
+        rollback=self.open(binding,"rollback");self.backend.crash_after="move-active-to-failed"
+        with self.assertRaises(OSError):rollback.rollback()
+        self.backend.crash_after=None
+        # New reviewed request, current inventory/backup from the preserved
+        # failed role. Real transport additionally requires reconciled UNKNOWN.
+        inv=self.backend.inspect("failed")
+        request=copy.deepcopy(self.request);request["mode"]="rollback"
+        p=tx.folder/"plan.json";request["origin_session"]={"path":str(p),"sha256":sha(p.read_bytes())}
+        request["failed_inventory"]=self.write_json("preserved-failed.json",inv)
+        request["failed_backup"]=self.make_backup("preserved-failed",inv,b"new")
+        recovered=self.open(self.bind(request,"new-rollback-request"),"new-rollback")
+        self.assertEqual(recovered.rollback()["state"],"ROLLED_BACK")
+        self.assertEqual(self.backend.moves.count("move-active-to-failed"),1)
+        self.assertEqual(self.backend.moves.count("move-archive-to-active"),1)
+
+    def test_activation_receipt_binds_inventory_candidate_and_sources(self):
+        tx=self.open();got=tx.activate();bound=got["activation_receipt"]
+        raw=Path(bound["path"]).read_bytes();self.assertEqual(sha(raw),bound["sha256"])
+        receipt=json.loads(raw)
+        self.assertEqual(receipt["candidate_sha256"],self.cb["sha256"])
+        self.assertEqual(receipt["request_sha256"],tx.request_sha256)
+        self.assertEqual(receipt["source_versions"],{"native_io":"f"*64})
+        self.assertFalse(receipt["flash_authorization"])
+        self.assertEqual(s._json(receipt["active_inventory"]),self.backend.inspect("active"))
+
+    def test_failed_receipt_after_moves_stays_uncertain(self):
+        tx=self.open()
+        with patch.object(tx,"_activation_receipt",side_effect=OSError("receipt disk full")):
+            with self.assertRaises(OSError):tx.activate()
+        self.assertEqual(len(self.backend.moves),2)
+        self.assertTrue((tx.folder/"SESSION_UNCERTAIN.json").exists())
+        with self.assertRaises(s.Refusal):tx.activate()
+        self.assertEqual(len(self.backend.moves),2)
+
+    def test_completed_move_receipt_tamper_refuses_reopen(self):
+        binding=self.bind();tx=self.open(binding);tx.activate()
+        p=tx.folder/"MOVE-ARCHIVE-COMPLETE.json"
+        value=json.loads(p.read_text());value["begin_sha256"]="0"*64;p.write_text(json.dumps(value))
+        with self.assertRaises(s.Refusal):self.open(binding,resume=True)
+
+    def test_archive_drift_never_restored(self):
+        tx=self.open();tx.activate();binding=self.rollback_request(tx,b"new")
+        self.backend.trees["archive"]=self.inventory("archive",b"corrupt",100)
+        with self.assertRaises(s.Refusal):self.open(binding,"rollback").rollback()
+        self.assertEqual(len(self.backend.moves),2)
+
+    def test_inventory_error_not_treated_as_absent(self):
+        tx=self.open();self.backend.inspect_error=True
+        with self.assertRaises(s.Refusal):tx.activate()
+        self.assertEqual(self.backend.moves,[])
+
+    def test_fresh_gate_failure_before_move(self):
+        tx=self.open();self.backend.fresh_error=True
+        with self.assertRaises(s.Refusal):tx.activate()
+        self.assertEqual(self.backend.moves,[])
+
+    def test_stale_or_wrong_boot_request(self):
+        self.cold["expires_at"]=(NOW-timedelta(seconds=1)).isoformat()
+        with self.assertRaises(s.Refusal):self.open()
+        self.cold["expires_at"]=(NOW+timedelta(minutes=10)).isoformat()
+        req=copy.deepcopy(self.request);req["boot_id"]="00000000-0000-4000-8000-000000000001"
+        with self.assertRaises(s.Refusal):self.open(self.bind(req,"wrong"))
+
+    def test_unknown_candidate_and_pending_attestation(self):
+        req=copy.deepcopy(self.request);req["candidate"]["sha256"]="0"*64
+        with self.assertRaises(s.Refusal):self.open(self.bind(req))
+
+    def test_tar_receipt_boolean_cannot_replace_full_backup(self):
+        p=Path(self.backup["path"]);raw=bytearray(p.read_bytes());raw[1024]^=1;p.write_bytes(raw)
+        with self.assertRaises(Exception):self.open()
+
+    def test_review_not_bound_or_missing(self):
+        binding=self.bind();req=json.loads(Path(binding["path"]).read_text())
+        req["technical_review"]["sha256"]="0"*64
+        bad=self.write_json("bad.json",req)
+        with self.assertRaises(s.Refusal):self.open(bad)
+
+    def test_existing_evidence_refused_and_mixed_resume_refused(self):
+        binding=self.bind();self.open(binding)
+        with self.assertRaises(FileExistsError):self.open(binding)
+        req=copy.deepcopy(self.request);req["txid"]="fedcba9876543210"
+        with self.assertRaises(s.Refusal):self.open(self.bind(req,"other"),resume=True)
+
+    def test_journal_fsync_failure_prevents_move(self):
+        tx=self.open()
+        with patch.object(s.os,"fsync",side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):tx.activate()
+        self.assertEqual(self.backend.moves,[])
+
+    def test_torn_journal_stops(self):
+        tx=self.open();p=tx.folder/"journal.jsonl";p.write_bytes(p.read_bytes()+b"{partial")
+        with self.assertRaises(s.Refusal):tx.activate()
+        self.assertEqual(self.backend.moves,[])
+
+    def test_capture_connects_seal_backup_and_reverifies_tar(self):
+        receipt=json.loads(Path(self.backup["receipt_path"]).read_text())
+        with patch.object(self.backend,"backup_to_mac",return_value=receipt) as backup:
+            got=s.capture_backup(self.backend,cold_resume=self.cold_binding,request_sha256="f"*64,
+                                 txid=TX,boot_id=BOOT,inventory_binding=self.ob,output=self.backup["path"])
+        self.assertEqual(got["tree_sha256"],self.original["tree_sha256"])
+        backup.assert_called_once();self.assertIn("seal:active",self.backend.calls)
+
+    def test_pending_original_markers_stop_before_backup_or_backend(self):
+        for marker in sorted(s.PENDING_NAMES):
+            with self.subTest(marker=marker):
+                inv=copy.deepcopy(self.original)
+                inv["rows"].append({**inv["rows"][1],"path":"./"+marker,"inode":300})
+                inv["tree_sha256"]=s.adapter_api.tree_digest(inv["rows"])
+                req=copy.deepcopy(self.request);req["original_inventory"]=self.write_json("pending-inventory.json",inv)
+                with self.assertRaisesRegex(s.Refusal,"pending boot/update"):
+                    self.open(self.bind(req,"pending"),"pending-session")
+        self.assertEqual(self.backend.calls,[])
+
+    def test_global_lock_blocks_different_evidence_folder(self):
+        first=self.open(name="one");second=self.open(name="two")
+        with first._locked():
+            with self.assertRaises(BlockingIOError):second.activate()
+        self.assertEqual(self.backend.calls,[])
+
+    def test_global_lock_symlink_refused(self):
+        tx=self.open();target=self.root/"other";target.write_text("")
+        s.GLOBAL_DEVICE_LOCK.symlink_to(target)
+        with self.assertRaisesRegex(s.Refusal,"global lock"):tx.activate()
+        self.assertEqual(self.backend.calls,[])
+
+    def test_fresh_reply_without_geometry_refused(self):
+        tx=self.open();original=self.backend.fresh_gate
+        def incomplete(binding):
+            reply=original(binding);reply.pop("partitions");return reply
+        with patch.object(self.backend,"fresh_gate",side_effect=incomplete):
+            with self.assertRaisesRegex(s.Refusal,"geometry"):tx.activate()
+        self.assertEqual(self.backend.moves,[])
+
+    def test_second_move_fresh_failure_preserves_archived_gap(self):
+        tx=self.open();original=self.backend.fresh_gate
+        def fail_after_first(binding):
+            if self.backend.moves:raise s.Refusal("new baseline failure")
+            return original(binding)
+        with patch.object(self.backend,"fresh_gate",side_effect=fail_after_first):
+            with self.assertRaisesRegex(s.Refusal,"baseline"):tx.activate()
+        self.assertEqual(self.backend.moves,["move-active-to-archive"])
+        self.assertIsNone(self.backend.trees["active"])
+        self.assertIsNotNone(self.backend.trees["stage"])
+
+    def test_expires_binding_and_post_move_expiry_not_success(self):
+        tx=self.open();original=self.backend.move
+        def move_then_expire(action,snapshot):
+            result=original(action,snapshot)
+            s._now.return_value=NOW+timedelta(minutes=11)
+            return result
+        with patch.object(self.backend,"move",side_effect=move_then_expire):
+            with self.assertRaisesRegex(s.Refusal,"after evidence expiry"):tx.activate()
+        rows=tx._records();begin=next(r for r in rows if r["event"]=="ARCHIVE_BEGIN")
+        self.assertEqual(begin["fresh_gate"]["expires_at"],self.cold["expires_at"])
+        self.assertFalse(any(r["event"]=="ARCHIVE_DONE" for r in rows))
+        self.assertEqual(self.backend.moves,["move-active-to-archive"])
+
+    def test_cold_bridge_invokes_pinned_validator_and_requires_exact_record(self):
+        source=self.root/"cold.py";source.write_bytes(b"# synthetic module loader only\n")
+        pb=self.write_json("cold-plan.json",self.cold)
+        binding={**self.cold_binding,"plan_path":pb["path"],"plan_sha256":pb["sha256"]}
+        validator=Mock(return_value=self.cold)
+        module=SimpleNamespace(validate_future=validator)
+        spec=SimpleNamespace(loader=SimpleNamespace(exec_module=Mock()))
+        with patch.object(s,"COLD_SOURCE",source),patch.object(s,"COLD_SOURCE_SHA",sha(source.read_bytes())),\
+             patch.object(s.importlib.util,"spec_from_file_location",return_value=spec),\
+             patch.object(s.importlib.util,"module_from_spec",return_value=module):
+            self.assertEqual(REAL_COLD_VALIDATE(binding,BOOT,NOW),self.cold)
+            validator.assert_called_once_with(binding["evidence_directory"],binding["evidence_sha256"],
+                                              binding["review_sha256"],now=NOW)
+            validator.return_value={**self.cold,"status":"RESTORE_REQUIRED"}
+            with self.assertRaisesRegex(s.Refusal,"not reproducible"):REAL_COLD_VALIDATE(binding,BOOT,NOW)
+
+
+if __name__ == "__main__": unittest.main(verbosity=2)

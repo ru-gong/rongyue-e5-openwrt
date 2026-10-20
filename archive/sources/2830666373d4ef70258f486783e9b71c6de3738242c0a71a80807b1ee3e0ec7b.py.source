@@ -1,0 +1,92 @@
+"""Real grant/gate/ledger/transport integration; only fake device memory."""
+import sys
+
+def sentinel(event,args):
+    if event.startswith(('subprocess.','socket.','os.exec','os.posix_spawn','os.spawn')) or event=='os.system':
+        raise AssertionError('external execution forbidden: '+event)
+sys.addaudithook(sentinel)
+import copy
+from pathlib import Path
+import unittest
+from unittest.mock import patch
+import bounded_boot_control as b
+import bounded_transport as t
+import uncertainty_recovery as u
+import test_bounded_boot_control as fixtures
+NEW='00000000-0000-4000-8000-000000000001'
+class Integration(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):fixtures.Tests.setUpClass()
+    def setUp(self):
+        self.f=fixtures.Tests('test_default_disabled_before_device_or_ledger');self.f.setUp()
+        self.root=self.f.root;self.state=u.state_path();self.state.mkdir()
+        self.f.p["partitions"].update(boot_b={"bytes":b.BOOT_BYTES},misc={"bytes":b.MISC_BYTES})
+        self.digest=b.sha(Path(u.__file__).read_bytes())
+        old=t.BoundedTransport(self.root/'evidence/old-transport',self.state,b.SERIAL,fixtures.BOOT,'a'*16)
+        self.f.fail_with('lost_ack');self.f.device.fault=None;old.mark_uncertain('synthetic lost ACK')
+        self.markers=u.observed_markers(self.state);self.f.device.boot_id=NEW
+        self.ro=t.BoundedTransport(self.root/'evidence/ro-transport',self.state,b.SERIAL,NEW,'b'*16,
+            reconciliation_only=True,recovery_source_sha=self.digest)
+        with self.ro._lock():self.ro._mode_gate('read-boot_b',False,None,b'')
+        recdir=self.root/'evidence/reconcile';rec=b.reconcile_readonly(self.f.device,recdir,900)
+        self.assertEqual(u.observed_markers(self.state),self.markers)
+        recpath=recdir/'reconciliation.json';recsha=b.sha(recpath.read_bytes());reviewpath=self.root/'boot-review.json'
+        binding={'reconciliation_path':str(recpath),'reconciliation_sha256':recsha,'review_path':str(reviewpath),'review_sha256':'0'*64}
+        self.request=self.f.request(tx='c'*16,recovery=binding);self.request['boot_id']=NEW
+        proposal=copy.deepcopy(self.request);proposal['recovery'].pop('review_path');proposal['recovery'].pop('review_sha256')
+        review={'schema':'e5-explicit-boot-recovery-review-v3','serial':b.SERIAL,'proposal_sha256':b.sha(b.canonical(proposal)),
+            'reconciliation_sha256':recsha,'ledger_head':rec['ledger_head'],'decision':'NEW_ORIGINAL_RECOVERY_ONLY_NO_REPLAY'}
+        reviewpath.write_bytes(b.canonical(review));binding['review_sha256']=b.sha(reviewpath.read_bytes())
+        self.requestpath=self.root/'reviewed-request.json';self.requestpath.write_bytes(b.canonical(self.request));self.requestsha=b.sha(self.requestpath.read_bytes())
+        self.context={'request_sha256':self.requestsha,'txid':self.request['txid'],'boot_id':NEW}
+        bundle={'schema':'e5-uncertainty-recovery-bundle-v3','serial':b.SERIAL,'context':self.context,
+            'request':{'path':str(self.requestpath),'sha256':self.requestsha},'reconciliation':{'path':str(recpath),'sha256':recsha},'markers':self.markers}
+        review=self.root/'grant-review.json';review.write_bytes(b.canonical({'schema':'e5-uncertainty-recovery-review-v3','serial':b.SERIAL,
+            'proposal_sha256':b.sha(b.canonical(bundle)),'decision':'NEW_ORIGINAL_RECOVERY_ONLY_NO_REPLAY'}))
+        bundle['review']={'path':str(review),'sha256':b.sha(review.read_bytes())}
+        self.bundle=self.root/'grant-bundle.json';self.bundle.write_bytes(b.canonical(bundle))
+    def tearDown(self):self.f.tearDown()
+    def stage(self):
+        with patch.object(u,'RECOVERY_TRANSITION_DISABLED',False):return u.stage(self.bundle,b.sha(self.bundle.read_bytes()))
+    def backend(self):
+        transport=t.BoundedTransport(self.root/'evidence/recovery-transport',self.state,b.SERIAL,NEW,'c'*16,
+            recovery_context=self.context,recovery_source_sha=self.digest)
+        n=object.__new__(b.NativeBackend);n.transport=transport;n.pins={'uncertainty_recovery':self.digest}
+        n.native='/data/local/tmp/e5-clean-io.'+'a'*16;n.txid='c'*16
+        self.f.device.execution_scope=n.execution_scope;self.f.device.finish_recovery=n.finish_recovery
+        self.f.device.poison=transport.mark_uncertain;self.f.device.txid=self.request['txid'];return transport
+    def test_real_full_grant_engine_finish_lifecycle(self):
+        self.assertEqual(self.stage(),self.context);transport=self.backend()
+        with transport._lock():transport._mode_gate('write-boot_b',True,lambda *a:None,b'x')
+        result=b.execute(self.f.device,self.requestpath,self.requestsha,self.root/'evidence/recovered')
+        self.assertTrue(result['complete']);self.assertFalse((self.state/'RECOVERY_ONLY.json').exists())
+        archive=next(self.state.glob('recovery-evidence-*'))
+        self.assertTrue((archive/'RECOVERY_COMPLETED.json').exists());self.assertTrue((archive/'UNCERTAIN.json').exists())
+        self.assertEqual(self.f.events()[-1]['event'],'COMPLETE')
+        ordinary=t.BoundedTransport(self.root/'evidence/ordinary-after',self.state,b.SERIAL,NEW,'d'*16)
+        with ordinary._lock():ordinary._mode_gate('read-boot_b',False,None,b'')
+    def test_grant_denies_ordinary_wrong_context_and_nonblock_write(self):
+        self.stage();transport=self.backend()
+        ordinary=t.BoundedTransport(self.root/'evidence/ordinary-denied',self.state,b.SERIAL,NEW,'d'*16)
+        with self.assertRaisesRegex(t.TransportError,'recovery-only'):
+            with ordinary._lock():pass
+        with self.assertRaisesRegex(t.TransportError,'only fixed'):
+            with transport._lock():transport._mode_gate('directory-helper',True,lambda *a:None,b'')
+        wrong=t.BoundedTransport(self.root/'evidence/wrong-context',self.state,b.SERIAL,NEW,'c'*16,
+            recovery_context=dict(self.context,request_sha256='f'*64),recovery_source_sha=self.digest)
+        with self.assertRaisesRegex(RuntimeError,'context mismatch'):
+            with wrong._lock():pass
+    def test_failed_restore_keeps_grant_and_restart_poison(self):
+        self.stage();self.backend();self.f.device.fault='lost_ack'
+        with self.assertRaises(TimeoutError):b.execute(self.f.device,self.requestpath,self.requestsha,self.root/'evidence/failed-recovery')
+        self.assertTrue((self.state/'RECOVERY_ONLY.json').exists());self.assertTrue((self.state/'UNCERTAIN.json').exists())
+        self.assertEqual(self.f.events()[-1]['event'],'UNKNOWN')
+        retry=t.BoundedTransport(self.root/'evidence/retry-denied',self.state,b.SERIAL,NEW,'c'*16,
+            recovery_context=self.context,recovery_source_sha=self.digest)
+        with self.assertRaisesRegex(t.TransportError,'persistent uncertainty'):
+            with retry._lock():pass
+    def test_pending_denies_even_readonly_mode(self):
+        (self.state/'RECOVERY_PENDING.json').write_text('{}')
+        with self.assertRaisesRegex(t.TransportError,'unfinished recovery'):
+            with self.ro._lock():pass
+if __name__=='__main__':unittest.main(verbosity=2)

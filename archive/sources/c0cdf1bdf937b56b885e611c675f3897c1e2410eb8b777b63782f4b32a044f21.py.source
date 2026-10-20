@@ -1,0 +1,179 @@
+"""Disabled thin staging wrapper; fixed create-stage timeout and existing IO.
+
+No bootstrap, block writes, real-directory activation, retry or cleanup.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sys
+import uuid
+
+STAGE_IO_DISABLED=False
+ROOT=Path(__file__).resolve().parents[2]
+LIVE=ROOT/'tools/e5_nextphase_core_live_69b2a5b04287f071'
+ADAPTER_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+TRANSPORT_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+BB='/data/adb/magisk/busybox'
+SERIAL='DEVICE_SERIAL_REDACTED'
+RAW_BYTES=2<<30
+RAW_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CHUNK=4<<20
+PINNED={
+ 'openwrt.ext4.gz':(149230668,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'device-files.tar':(60661760,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'openwrt-install.conf':(123,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'boot.img':(67108864,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'fscrypt-probe':(716192,'0000000000000000000000000000000000000000000000000000000000000000'),
+}
+
+from host_inputs import PinnedInput
+
+class Refusal(RuntimeError):pass
+def require(ok,why):
+ if not ok:raise Refusal(why)
+def sha(data):return hashlib.sha256(data).hexdigest()
+def file_sha(p):
+ p=Path(p);require(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe source')
+ require(p.is_file() and p.stat().st_nlink==1,'source type/link');return sha(p.read_bytes())
+
+class BoundedStage:
+ def __init__(self,adapter):
+  self.a=adapter;self.used=False
+  require(re.fullmatch('[a-f0-9]{16}',adapter.txid) and re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',adapter.boot_id),'tx/boot')
+  self.path='/data/e5linux.stage.'+adapter.txid
+ def _contract(self,artifacts,raw_image):
+  require(file_sha(LIVE/'android_directory_adapter.py')==ADAPTER_SHA and file_sha(LIVE/'bounded_transport.py')==TRANSPORT_SHA,'frozen source changed')
+  module=sys.modules.get(type(self.a).__module__)
+  require(module is not None and Path(module.__file__).resolve()==LIVE/'android_directory_adapter.py' and type(self.a) is module.AndroidDirectoryAdapter,'exact real adapter required')
+  require(self.a.path('stage')==self.path and self.a._part is None,'fixed stage/no enclosing mutation')
+  require(all(type(item) is module.Artifact for item in [*artifacts.values(),raw_image]),'exact Artifact type')
+  transport=self.a._ensure_transport()
+  require(transport.recovery_context is None and transport.reconciliation_only is False,'normal-only stage')
+  require(transport.state==ROOT/('evidence/e5-clean-v3-device-state-'+SERIAL) and transport.serial==SERIAL and transport.boot_id==self.a.boot_id and transport.txid==self.a.txid,'shared state binding')
+  return module,transport
+ def _parents(self):
+  # Exact parent identities immediately surrounding exclusive stage creation.
+  paths=('/data',self.a.path('active'),self.a.lock);script=self.a._locked()
+  for path in paths:script+=f'test ! -L {path}; test -d {path}; test "$(readlink -f {path})" = {path}; stat -c "%d %i" {path}\n'
+  def parse(raw):
+   lines=raw.splitlines();require(len(lines)==3,'parent rows');rows=[]
+   for line in lines:
+    fields=line.split();require(len(fields)==2 and all(v.isdigit() and int(v)>0 for v in fields),'parent identity');rows.append(tuple(map(int,fields)))
+   require(len({x[0] for x in rows})==1,'parent filesystem changed');return rows
+  return self.a._request('bounded-stage-parents',script,limit=512,validator=parse)
+ def _create(self,required_kib):
+  before=self._parents();deadline=self.a._deadline();op=uuid.uuid4().hex
+  tick=f"awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime\n"
+  body=self.a._locked()+f'test ! -e {self.path}; test ! -L {self.path}\n'
+  body+=f'test "$(df -Pk /data | tail -n 1 | awk \'{{print $4}}\')" -ge {required_kib}\n'
+  for path,(dev,ino) in zip(('/data',self.a.path('active'),self.a.lock),before):
+   body+=f'test ! -L {path}; test -d {path}; test "$(readlink -f {path})" = {path}; test "$(stat -c \'%d %i\' {path})" = \'{dev} {ino}\'\n'
+  body+=tick+f'umask 077; mkdir {self.path}\n'+tick
+  script=BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote('set -eu\nset -o pipefail\nset -C\n'+body)
+  def empty(raw):require(raw==b'','unexpected create output');return None
+  def follow(ack):
+   require(self._parents()==before,'parent replaced during stage create')
+   check=self.a._locked()+f'test ! -L {self.path}; test -d {self.path}; test "$(readlink -f {self.path})" = {self.path}\n'
+   check+=f'test "$({BB} find {self.path} -mindepth 1 -maxdepth 1 -print0 | {BB} wc -c)" = 0\nstat -c "%d %i %u %g %a" {self.path}\n'
+   def parse(raw):
+    fields=raw.split();require(len(fields)==5 and all(x.isdigit() for x in fields),'stage stat')
+    dev,ino,uid,gid=int(fields[0]),int(fields[1]),int(fields[2]),int(fields[3])
+    require(dev==before[0][0] and ino>0 and uid==gid==0 and fields[4]==b'700','stage device/inode/owner/mode')
+    return (dev,ino)
+   identity=self.a._request('bounded-stage-readback',check,limit=256,validator=parse)
+   require(self._parents()==before,'parent changed after stage readback');return identity
+  return self.a._request('bounded-create-stage',script,limit=4096,mutating=True,validator=empty,followup=follow,op_id=op),op
+ def run(self,artifacts,raw_image):
+  require(not STAGE_IO_DISABLED,'STAGE_IO_DISABLED: prepared only')
+  require(not self.used,'no replay');self.used=True;transport=None
+  try:
+   module,transport=self._contract(artifacts,raw_image)
+   require(transport.recovery_context is None and transport.reconciliation_only is False,'normal-only stage')
+   require(set(artifacts)==set(PINNED),'exact five stage inputs')
+   for name,item in artifacts.items():require((item.size,item.sha256)==PINNED[name],'candidate changed');item.verify()
+   require((raw_image.size,raw_image.sha256)==(RAW_BYTES,RAW_SHA),'pristine raw binding');raw_image.verify()
+   fields=dict(re.findall(r"^(E5_[A-Z_]+)='([^'\r\n]*)'$",artifacts['openwrt-install.conf'].path.read_text(),re.M))
+   require(fields.get('E5_DEFAULT_BOOT')=='android','default must remain Android')
+   self.a.occupancy()
+   needed=(RAW_BYTES+sum(x.size for x in artifacts.values())+(1<<30)+1023)//1024
+   identity,create_op=self._create(needed)
+   inputs={**artifacts,'openwrt.ext4':raw_image}
+   for name,data in (('boot-os',b'openwrt\n'),('openwrt-default-boot',b'android\n')):
+    host=self.a.evidence_dir/(name+'.input');module.transport_api.save(host,data);inputs[name]=module.Artifact(host,len(data),sha(data))
+   for name in sorted(inputs):
+    item=inputs[name];item.verify();inode=0
+    with PinnedInput(item.path,item.size,item.sha256) as source:
+     for offset in range(0,item.size,CHUNK):
+      payload=source.read(min(CHUNK,item.size-offset));require(len(payload)==min(CHUNK,item.size-offset),'short host input')
+      ack=self.a._write_file_chunk(name,item,offset,payload,inode,identity);inode=ack['inode']
+     source.finish()
+   probe=self.path+'/fscrypt-probe'
+   for name in ('',*sorted(inputs)):
+    target=self.path+('/'+name if name else '')
+    self.a._request('fscrypt-check',f'test "$({probe} {target})" = unencrypted\nprintf "UNENCRYPTED\\n"\n',limit=128,
+     validator=lambda raw:raw if raw==b'UNENCRYPTED\n' else (_ for _ in ()).throw(Refusal('fscrypt policy')))
+   inventory=self.a.inspect('stage')
+   module.transport_api.save_json(self.a.evidence_dir/'BOUNDED_STAGE_RESULT.json',{'schema':'e5-bounded-stage-v1','serial':SERIAL,'txid':self.a.txid,'boot_id':self.a.boot_id,'create_op_id':create_op,'stage_identity':identity,'inventory':inventory,'activated':False,'block_writes':False,'default_boot':'android','requires_matching_transport_complete':True})
+   return inventory
+  except BaseException as exc:
+   if transport is not None:
+    try:transport.mark_uncertain('bounded stage: '+type(exc).__name__+': '+str(exc))
+    except BaseException:pass
+   raise
+
+if __name__=='__main__':raise SystemExit('Prepared-only library; STAGE_IO_DISABLED; no device CLI.')
+
+
+def validate_partial(adapter,partial):
+ require(set(partial)=={'schema','txid','boot_id','path','identity','file_meta','file_sha256'},'partial binding fields')
+ require(partial['schema']=='e5-stage-eight-byte-preimage-v1' and partial['txid']==adapter.txid and partial['boot_id']==adapter.boot_id and partial['path']==adapter.path('stage'),'fixed partial identity')
+ adapter.occupancy();before=adapter._inventory('stage')
+ require(len(before)==2 and {r['path'] for r in before}=={'.','./boot-os'},'partial has unexpected members')
+ root=next(r for r in before if r['path']=='.');file=next(r for r in before if r['path']=='./boot-os')
+ require(root['type']=='d' and (root['dev'],root['inode'])==tuple(partial['identity']) and root['uid']==root['gid']==0 and root['mode']=='700','partial root identity')
+ require({k:v for k,v in file.items() if k!='path'}==partial['file_meta'] and file['type']=='f' and file['bytes']==8 and file['nlink']==1,'partial file identity')
+ data,meta=adapter._read_twice(adapter.path('stage')+'/boot-os',0,8,partial['file_meta'])
+ require(data==b'openwrt\n' and sha(data)==partial['file_sha256'] and meta==partial['file_meta'],'partial file bytes')
+ require(adapter._inventory('stage')==before,'partial changed during read');adapter.occupancy()
+ return tuple(partial['identity'])
+
+def resume_stage(stage,artifacts,raw_image,partial):
+ require(not STAGE_IO_DISABLED,'STAGE_IO_DISABLED: preparation only')
+ require(not stage.used,'no replay');stage.used=True;transport=None
+ try:
+  module,transport=stage._contract(artifacts,raw_image)
+  require(set(artifacts)==set(PINNED),'exact five stage inputs')
+  for name,item in artifacts.items():require((item.size,item.sha256)==PINNED[name],'candidate changed');item.verify()
+  require((raw_image.size,raw_image.sha256)==(RAW_BYTES,RAW_SHA),'pristine raw binding');raw_image.verify()
+  fields=dict(re.findall(r"^(E5_[A-Z_]+)='([^'\r\n]*)'$",artifacts['openwrt-install.conf'].path.read_text(),re.M))
+  require(fields.get('E5_DEFAULT_BOOT')=='android','default must remain Android')
+  identity=validate_partial(stage.a,partial)
+  inputs={**artifacts,'openwrt.ext4':raw_image}
+  for name,data in (('boot-os',b'openwrt\n'),('openwrt-default-boot',b'android\n')):
+   host=stage.a.evidence_dir/(name+'.input');module.transport_api.save(host,data);inputs[name]=module.Artifact(host,len(data),sha(data))
+  for name in sorted(inputs):
+   if name=='boot-os':continue  # exact previously committed eight bytes were checked; never rewrite them
+   item=inputs[name];item.verify();inode=0
+   with PinnedInput(item.path,item.size,item.sha256) as source:
+    for offset in range(0,item.size,CHUNK):
+     payload=source.read(min(CHUNK,item.size-offset));require(len(payload)==min(CHUNK,item.size-offset),'short host input')
+     ack=stage.a._write_file_chunk(name,item,offset,payload,inode,identity);inode=ack['inode']
+    source.finish()
+  probe=stage.path+'/fscrypt-probe'
+  for name in ('',*sorted(inputs)):
+   target=stage.path+('/'+name if name else '')
+   stage.a._request('fscrypt-check',f'test "$({probe} {target})" = unencrypted\nprintf "UNENCRYPTED\\n"\n',limit=128,validator=lambda raw:raw if raw==b'UNENCRYPTED\n' else (_ for _ in ()).throw(Refusal('fscrypt policy')))
+  inventory=stage.a.inspect('stage')
+  module.transport_api.save_json(stage.a.evidence_dir/'RESUMED_STAGE_RESULT.json',{'schema':'e5-fixed-stage-resume-result-v1','serial':SERIAL,'txid':stage.a.txid,'boot_id':stage.a.boot_id,'stage_identity':identity,'inventory':inventory,'skipped_previously_verified_boot_os_bytes':8,'activated':False,'block_writes':False,'default_boot':'android','requires_matching_transport_complete':True})
+  return inventory
+ except BaseException as exc:
+  if getattr(exc,'details',None):
+   try:module.transport_api.save_json(stage.a.evidence_dir/'HOST_INPUT_FAILURE.json',exc.details)
+   except BaseException:pass
+  if transport is not None:
+   try:transport.mark_uncertain('fixed stage resume: '+type(exc).__name__+': '+str(exc))
+   except BaseException:pass
+  raise

@@ -1,0 +1,56 @@
+"""Source templates only; no device caller or executable deployment entry."""
+STAGE = '''    def _preserved_partial(self,before=None):
+        # Twelve fixed read-only items from both previous deployments.
+        closure=_closure_api();case=closure._load().c;known=case['retained_device_state']
+        if before is not None:
+            for key,oldkey in (('old_lock','new_lock'),('old_owner','new_owner')):
+                old=known['current_lock'][oldkey];row=before[key]
+                for field in ('dev','inode','uid','gid','bytes','nlink'):
+                    require(row[field]==int(old[field]),'retained current lock identity: '+key+'/'+field)
+                require(row['mode_bits']==int(old['mode_bits'],16) and row['mode']==old['mode'],'retained current lock mode')
+                for field in ('mtime','ctime','mtime_text','ctime_text'):
+                    require(row[field]==old[field],'retained current owner/time: '+key+'/'+field)
+        items=case['retained_read_items'];require([x['label'] for x in items]==list(RETAINED_PATHS),'fixed retained items/order')
+        records={}
+        for item in items:
+            label=item['label'];path=RETAINED_PATHS[label];require(item['path']==path,'fixed retained path')
+            kind=item['kind'];require(kind in ('archive_dir','archive_owner','program'),'fixed retained kind')
+            typ='d' if kind=='archive_dir' else 'f'
+            body=f'test ! -L {path}; test -{typ} {path}; test "$(readlink -f {path})" = {path}\\nstat -c \\'{STAT}\\' {path}\\n'
+            if kind=='archive_dir':body+=f'{BB} find {path} -mindepth 1 -maxdepth 1 -print\\n'
+            elif kind=='archive_owner':body+=f'cat {path}\\n'
+            else:body+=f'{BB} sha256sum {path}\\nstat -c \\'{STAT}\\' {path}\\n'
+            def parse(raw,item=item,path=path):
+                require(raw==('\\n'.join(item['expected_lines'])+'\\n').encode(),'retained raw SHA/identity changed')
+                return {'path':path,'stdout_sha256':sha(raw)}
+            records[label]=self._request(label,body,limit=8192,validator=parse)
+        return records
+'''
+
+PHASE = '''def partial_retained_proof(rows, result, before, manifest):
+    binding=manifest['closure_case']
+    need(set(binding)=={'path','sha256','bytes'} and binding['path']==CASE_PATH and binding['sha256']==CASE_SHA,'lifecycle fixed case binding')
+    raw=read(binding['path'],binding['sha256']);need(len(raw)==binding['bytes'],'case length');case=json.loads(raw)
+    need(case['schema']=='e5-fixed-lifecycle-stop-case-v1' and case['txid']==OLD_TX,'fixed lifecycle case')
+    known=case['retained_device_state']
+    for key,oldkey in (('old_lock','new_lock'),('old_owner','new_owner')):
+        expected=known['current_lock'][oldkey];got=before[key]
+        for field in ('dev','inode','uid','gid','bytes','nlink'):need(got[field]==int(expected[field]),'current lock identity')
+        need(got['mode_bits']==int(expected['mode_bits'],16) and got['mode']==expected['mode'],'current lock mode')
+        for field in ('mtime','ctime','mtime_text','ctime_text'):need(got[field]==expected[field],'current lock time identity')
+    items=case['retained_read_items'];need([x['label'] for x in items]==list(RETAINED_PATHS),'retained case item order')
+    expected={x['label']:x for x in items}
+    selected=[(i,r) for i,r in enumerate(rows) if r['begin']['label'] in RETAINED_LABELS]
+    need([r['begin']['label'] for _,r in selected]==list(RETAINED_LABELS)*2,'two exact retained groups')
+    writes=[i for i,r in enumerate(rows) if r['begin']['mutating']];scans=[i for i,r in enumerate(rows) if r['begin']['label']=='occupancy']
+    n=len(RETAINED_LABELS)
+    need(writes and len(scans)==1 and selected[n-1][0]<min(writes)<=max(writes)<scans[0]<selected[n][0],'retained read bracketing')
+    records={}
+    for _,r in selected:
+        b=r['begin'];need(b['mutating'] is False and b['payload_bytes']==0 and b['payload_sha256']==sha(b''),'retained read scope')
+        item=expected[b['label']];path=RETAINED_PATHS[b['label']];need(item['path']==path,'retained fixed path')
+        need(r['raw']==('\\n'.join(item['expected_lines'])+'\\n').encode(),'retained raw/identity differs')
+        records[b['label']]={'path':path,'stdout_sha256':sha(r['raw'])}
+    need(result.get('partial_deployment_preserved')==records,'retained result/raw disconnected')
+    return records
+'''

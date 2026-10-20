@@ -1,0 +1,22 @@
+"""Reviewed host copy only; does not call any device entry."""
+import hashlib,importlib.util,json,secrets,sys,datetime as dt
+from pathlib import Path
+H=Path(__file__).resolve().parent;R=H.parents[1]
+def load(p):
+ sp=importlib.util.spec_from_file_location('_newslot_bundle',p);m=importlib.util.module_from_spec(sp);sp.loader.exec_module(m);return m
+b=load(H/'build_bundle.py');a=b.a
+for name,expected in [('TESTS_FINAL.log','Ran 18 tests'),('INLINE_READER_TESTS.log','Ran 20 tests')]:
+ raw=(H/name).read_text();a.need(expected in raw and '\nOK\n' in raw,'host tests incomplete')
+a.need(json.loads((H/'PREPARED_SMOKE.json').read_bytes())['material_contracts']=='PASS','prepared smoke')
+for name,count in [('TESTS.log',20),('RETAINED_TESTS.log',14)]:
+ raw=(R/'tools/e5_new_slot_stop_prepare_20261019'/name).read_text();a.need('Ran '+str(count)+' tests' in raw and '\nOK\n' in raw,'closure/retained regressions')
+base=json.loads((H/'prepared/RESULT.json').read_bytes());original={k:b.bound(v) for k,v in base['files'].items()};cfg,_,_,_=b.load_inputs();ident=secrets.token_hex(8);dest={g:R/'tools'/(a.DEST_STEMS[g]+ident) for g in base['directories']}
+# Explicit evidence review is source/range based; no separate reviewer is claimed.
+review={'schema':'e5-newslot-copy-review-v1','reviewed_at':dt.datetime.now(dt.timezone.utc).isoformat(),'reviewer':'Primary Codex source/manifest/raw-evidence review; no separate reviewer claimed','authorization':'User: 继续补齐这次停止的续接绑定，部署验证新扫描器，通过后就按已确认范围继续安装作者版 OpenWrt。遇异常先停，别再反复让我开关机，需要我配合时告诉我。','normal_and_restore_scope':'same approved B64MiB + misc@2048 32 bytes; original directories retained, no A/GPT/super/metadata/NV writes, no userdata wipe','prepared_result':{'path':str(H/'prepared/RESULT.json'),'sha256':b.sha((H/'prepared/RESULT.json').read_bytes())},'source_overlay':cfg['overlay'],'closure':cfg['closure'],'closure_case':cfg['closure_case'],'only_gates_paths_pins_change_in_enabled_copy':True,'device_io_in_copy':False}
+a.write_new(H/'PRE_ENABLE_REVIEW.json',a.encode(review));new=b.reseal(original,base,dest,cfg,disabled=False)
+for k in ('core/bounded_boot_control.py','core/android_directory_adapter.py'):
+ # Gate-only rewriting does not change physical partition write constants.
+ for target in ('/dev/block/mmcblk0p37','/dev/block/mmcblk0p3'):
+  a.need(new.files[k].count(target.encode())==original[k].count(target.encode()),'physical scope changed')
+result=b.publish(new,original,R/'tools'/('e5_activation_bundle_'+ident),{'activation_id':ident,'host_writes_disabled':False,'preparation_result':review['prepared_result'],'preparation_review':{'path':str(H/'PRE_ENABLE_REVIEW.json'),'sha256':b.sha(a.encode(review))},'same_primary_review_no_separate_reviewer':True,'requires_actual_fresh_device_checks':True})
+a.write_new(H/'ENABLED_COPY.json',a.encode({'activation_id':ident,'result':{'path':str(R/'tools'/('e5_activation_bundle_'+ident)/'RESULT.json'),'sha256':b.sha(a.encode(result))},'directories':result['directories'],'device_io':False}));print(json.dumps({'family':ident,'result_sha256':b.sha(a.encode(result))}))

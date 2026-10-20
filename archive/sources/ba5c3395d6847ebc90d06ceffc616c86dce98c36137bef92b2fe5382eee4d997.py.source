@@ -1,0 +1,171 @@
+"""Real host evidence/barrier files; synthetic device snapshots, no device I/O."""
+import copy
+import datetime as dt
+import json
+from pathlib import Path
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest.mock import patch
+import uncertainty_recovery as u
+
+# This suite may not spawn any process or network socket.
+def audit(event,args):
+    if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn'):
+        raise AssertionError('external execution forbidden')
+sys.addaudithook(audit)
+OLD='00000000-0000-4000-8000-000000000001'
+NEW='00000000-0000-4000-8000-000000000001'
+
+class RecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name).resolve();(self.root/'evidence').mkdir()
+        self.state=self.root/('evidence/e5-clean-v3-device-state-'+u.boot.SERIAL);self.state.mkdir()
+        self.clock=dt.datetime.now(dt.timezone.utc)
+        self.ledger=SimpleNamespace(head='a'*64,rows=[],poisoned=lambda:False)
+        self.patches=[patch.object(u.boot,'ROOT',self.root),patch.object(u,'now',return_value=self.clock),
+            patch.object(u.boot,'PROTECTED',frozenset({'boot_a'})),patch.object(u.boot,'BOOT_BYTES',8192),
+            patch.object(u.boot,'MISC_BYTES',4096),patch.object(u,'_ledger',return_value=self.ledger),
+            patch.object(u,'RECOVERY_TRANSITION_DISABLED',False)]
+        for p in self.patches:p.start()
+        self.original_b=b'b'*8192;self.original_m=b'm'*4096
+        self.current_b=b'c'*8192;self.current_m=self.original_m[:2048]+b'x'*32+self.original_m[2080:]
+        self.profile={'partitions':{'boot_b':{'bytes':8192},'misc':{'bytes':4096},'boot_a':{'bytes':4096}},
+            'protected_hashes':{'boot_a':u.sha(b'a'*4096)},'gpt_prefix_sha256':u.sha(b'g'*32768),
+            'original_boot_b_sha256':u.sha(self.original_b),'original_misc_sha256':u.sha(self.original_m)}
+        orig=self.raw('original.misc',self.original_m)
+        self.request={'txid':'1234567890abcdef','boot_id':NEW,'mode':'restore-original',
+            'expected_before':{'boot_b':u.sha(self.current_b),'misc':u.sha(self.current_m)},
+            'original_misc':orig}
+        self.request_binding=self.write('request.json',self.request)
+        self.context={'request_sha256':self.request_binding['sha256'],'boot_id':NEW,'txid':self.request['txid']}
+        self.rec={'schema':'e5-boot-reconciliation-v3','serial':u.boot.SERIAL,'boot_id':NEW,
+            'captured_at':self.clock.isoformat(),'ledger_head':self.ledger.head,'complete':True,'does_not_clear_poison':True,
+            'protected_match':True,'misc_outside_original_match':True,'hashes':self.request['expected_before'],
+            'artifacts':{k:self.raw(k+'.raw',v) for k,v in {
+                'boot_b':self.current_b,'misc':self.current_m,'gpt':b'g'*32768,'boot_a':b'a'*4096}.items()}}
+        self.write_state('ACTIVE.json',{'serial':u.boot.SERIAL,'boot_id':OLD,'status':'IN_FLIGHT'})
+        self.write_state('UNCERTAIN.json',{'serial':u.boot.SERIAL,'boot_id':OLD,'status':'UNCERTAIN'})
+        more=[patch.object(u.boot,'approved_request',side_effect=self.approved),patch.object(u.boot,'profile',return_value=self.profile),
+            patch.object(u.boot,'_recovery_gate',return_value=None)]
+        self.patches+=more
+        for p in more:p.start()
+    def tearDown(self):
+        for p in reversed(self.patches):p.stop()
+        self.tmp.cleanup()
+    def approved(self,path,digest):
+        return json.loads(u.read(path,digest)),self.profile,self.original_b,self.original_m
+    def raw(self,name,data):
+        path=self.root/name;path.write_bytes(data)
+        return {'path':str(path),'sha256':u.sha(data),'bytes':len(data)}
+    def write(self,name,value):
+        raw=u.canonical(value)+b'\n';path=self.root/name;path.write_bytes(raw)
+        return {'path':str(path),'sha256':u.sha(raw)}
+    def write_state(self,name,value):
+        (self.state/name).write_bytes(u.canonical(value)+b'\n')
+    def bundle(self,rec=None):
+        b={'schema':'e5-uncertainty-recovery-bundle-v3','serial':u.boot.SERIAL,'context':self.context,
+            'request':self.request_binding,'reconciliation':self.write('reconciliation.json',rec or self.rec),
+            'markers':u.observed_markers(self.state)}
+        b['review']=self.write('review.json',{'schema':'e5-uncertainty-recovery-review-v3','serial':u.boot.SERIAL,
+            'proposal_sha256':u.sha(u.canonical(b)),'decision':'NEW_ORIGINAL_RECOVERY_ONLY_NO_REPLAY'})
+        return self.write('bundle.json',b)
+    def stage(self,b=None):
+        b=b or self.bundle();return u.stage(b['path'],b['sha256'])
+    def finish_fixture(self):
+        out=self.root/'result';out.mkdir();(out/'boot_b.readback.bin').write_bytes(self.original_b)
+        (out/'misc.readback.bin').write_bytes(self.original_m)
+        result={'schema':'e5-bounded-boot-result-v3','txid':self.context['txid'],'request_sha256':self.context['request_sha256'],
+            'complete':True,'boot_b_sha256':u.sha(self.original_b),'misc_sha256':u.sha(self.original_m),
+            'reboot_performed':False,'boot_a_written':False}
+        p=out/'result.json';p.write_bytes(u.canonical(result)+b'\n');digest=u.sha(p.read_bytes())
+        self.ledger.rows=[{'event':'COMPLETE','txid':self.context['txid'],'result_sha256':digest}]
+        return p,digest
+    def test_literal_gate_before_files(self):
+        with patch.object(u,'RECOVERY_TRANSITION_DISABLED',True):
+            with self.assertRaisesRegex(RuntimeError,'DISABLED'):u.stage('/missing','0'*64)
+    def test_stage_archives_markers_before_restricted_admission(self):
+        old={n:u.marker_hash(self.state/n) for n in ('ACTIVE.json','UNCERTAIN.json')}
+        self.assertEqual(self.stage(),self.context)
+        grant=u.validate_context(self.state,u.boot.SERIAL,self.context)
+        for name,digest in old.items():
+            self.assertFalse((self.state/name).exists());self.assertEqual(u.marker_hash(Path(grant['archive'])/name),digest)
+        self.assertFalse((self.state/'RECOVERY_PENDING.json').exists())
+    def test_same_boot_never_proves_remote_exit(self):
+        self.write_state('ACTIVE.json',{'serial':u.boot.SERIAL,'boot_id':NEW})
+        with self.assertRaisesRegex(RuntimeError,'newly observed'):self.stage()
+    def test_no_unknown_cannot_create_grant(self):
+        (self.state/'ACTIVE.json').unlink();(self.state/'UNCERTAIN.json').unlink()
+        with self.assertRaisesRegex(RuntimeError,'newly observed'):self.stage()
+    def test_missing_protected_raw_refused(self):
+        del self.rec['artifacts']['boot_a']
+        with self.assertRaisesRegex(RuntimeError,'full protected'):self.stage()
+    def test_changed_protected_bytes_refused(self):
+        self.rec['artifacts']['boot_a']=self.raw('boot_a.raw',b'z'*4096)
+        with self.assertRaisesRegex(RuntimeError,'protected bytes'):self.stage()
+    def test_changed_misc_outside32_refused(self):
+        self.rec['artifacts']['misc']=self.raw('misc.raw',b'z'*4096)
+        self.rec['hashes']['misc']=u.sha(b'z'*4096)
+        self.request_binding=self.write('request.json',self.request)
+        self.context['request_sha256']=self.request_binding['sha256']
+        with self.assertRaisesRegex(RuntimeError,'outside32'):self.stage()
+    def test_stale_and_future_snapshot_refused(self):
+        for age in (-1,901):
+            self.rec['captured_at']=(self.clock-dt.timedelta(seconds=age)).isoformat()
+            with self.assertRaisesRegex(RuntimeError,'stale'):self.stage()
+    def test_marker_changed_after_review_refused(self):
+        b=self.bundle();self.write_state('UNCERTAIN.json',{'serial':u.boot.SERIAL,'boot_id':OLD,'reason':'changed'})
+        with self.assertRaisesRegex(RuntimeError,'state changed'):self.stage(b)
+    def test_review_does_not_bind_proposal_refused(self):
+        b=self.bundle();value=json.loads(Path(b['path']).read_text())
+        value['review']=self.write('badreview.json',{'decision':'yes'})
+        with self.assertRaisesRegex(RuntimeError,'independent recovery review'):self.stage(self.write('badbundle.json',value))
+    def test_install_linux_cannot_get_original_recovery_grant(self):
+        self.request['mode']='install-linux';self.request_binding=self.write('request.json',self.request)
+        self.context['request_sha256']=self.request_binding['sha256']
+        with self.assertRaisesRegex(RuntimeError,'only exact'):self.stage()
+    def test_wrong_context_refused(self):
+        self.stage();wrong=dict(self.context,txid='f'*16)
+        with self.assertRaisesRegex(RuntimeError,'context mismatch'):u.validate_context(self.state,u.boot.SERIAL,wrong)
+    def test_expired_context_refused(self):
+        self.stage()
+        with patch.object(u,'now',return_value=self.clock+dt.timedelta(seconds=901)):
+            with self.assertRaisesRegex(RuntimeError,'expired'):u.validate_context(self.state,u.boot.SERIAL,self.context)
+    def test_archive_evidence_tamper_refused(self):
+        self.stage();g=u.validate_context(self.state,u.boot.SERIAL,self.context)
+        (Path(g['archive'])/'ACTIVE.json').write_text('{}')
+        with self.assertRaisesRegex(RuntimeError,'evidence changed'):u.validate_context(self.state,u.boot.SERIAL,self.context)
+    def test_crash_during_transition_keeps_pending_barrier(self):
+        rename=u.os.rename;calls=[]
+        def fail(src,dst):
+            calls.append(str(src))
+            if len(calls)==2:raise OSError('host disk failure')
+            return rename(src,dst)
+        with patch.object(u.os,'rename',side_effect=fail):
+            with self.assertRaises(OSError):self.stage()
+        self.assertTrue((self.state/'RECOVERY_PENDING.json').exists())
+        self.assertTrue((self.state/'UNCERTAIN.json').exists())
+        with self.assertRaisesRegex(RuntimeError,'unfinished recovery'):u.validate_context(self.state,u.boot.SERIAL,self.context)
+        with self.assertRaisesRegex(RuntimeError,'torn grant'):self.stage()
+    def test_full_original_recovery_releases_only_after_result_and_ledger(self):
+        self.stage();p,digest=self.finish_fixture();u.finish(self.state,self.context,p,digest)
+        self.assertFalse((self.state/'RECOVERY_ONLY.json').exists())
+        archive=next(self.state.glob('recovery-evidence-*'))
+        self.assertTrue((archive/'COMPLETED_RECOVERY_ONLY.json').exists());self.assertTrue((archive/'ACTIVE.json').exists())
+    def test_finish_unknown_leaves_recovery_only(self):
+        self.stage();p,digest=self.finish_fixture();self.write_state('UNCERTAIN.json',{'reason':'lost ack'})
+        with self.assertRaisesRegex(RuntimeError,'unresolved'):u.finish(self.state,self.context,p,digest)
+        self.assertTrue((self.state/'RECOVERY_ONLY.json').exists())
+    def test_finish_raw_readback_required(self):
+        self.stage();p,digest=self.finish_fixture();(p.parent/'boot_b.readback.bin').write_bytes(b'z'*8192)
+        with self.assertRaisesRegex(RuntimeError,'hash changed'):u.finish(self.state,self.context,p,digest)
+        self.assertTrue((self.state/'RECOVERY_ONLY.json').exists())
+    def test_finish_ledger_complete_required(self):
+        self.stage();p,digest=self.finish_fixture();self.ledger.poisoned=lambda:True
+        with self.assertRaisesRegex(RuntimeError,'ledger not complete'):u.finish(self.state,self.context,p,digest)
+    def test_symlink_marker_never_absent(self):
+        (self.state/'ACTIVE.json').unlink();(self.state/'ACTIVE.json').symlink_to(self.root/'missing')
+        with self.assertRaisesRegex(RuntimeError,'dangling'):self.bundle()
+
+if __name__=='__main__':unittest.main()

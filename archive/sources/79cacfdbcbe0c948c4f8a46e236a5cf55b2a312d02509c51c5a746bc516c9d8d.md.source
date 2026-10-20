@@ -1,0 +1,37 @@
+# 证据接口（待真实采集，不是通过凭据）
+
+所有 binding 必须且只能含 `{path, sha256}`，绝对路径为单链接普通文件、无符号链接；值由真实文件计算。下面列字段语义，不填时间、boot、digest 或批准值。
+
+## 输入顺序
+
+1. 物理 SIM 放置确认：精确字段 `schema=e5-sim-placement-confirmation-v2, serial, slot1=China Mobile, slot2=China Unicom, user_confirmed`。它不证明 SIM 软件状态或网络可用。
+2. 当前 SIM cold：同既有 v2 request / raw COMPLETE / 独审 cold review / `e5-next-directory-evidence-v1` envelope，但 purpose 只能 `rearm-with-sim`。历史 noSIM 文件只作为 previous_observation 排除来源。
+3. `rearm.capture` 保存本次 `READONLY_RESULT.json`：schema `e5-next-readonly-v1`，serial、boot_id、txid、purpose、nv_baseline binding、reconciliation、cold_envelope、state_snapshot、helper_owner_tx、producer_source_sha256、source_pins、transport_binding；device_writes/native_helpers_executed/approved_to_restore 均 false。这一步只读，不授予写入。
+
+## 首次 Linux NV 来源链
+
+`e5-sim-first-linux-source-v1` 精确四字段：schema、install_complete binding、linux_collection binding、review binding。install 必须来自固定 b36a719a15cd4241 workflow；实际 REQUEST/COMPLETE、九 NV 原件及完整原始读/远端 SHA transport 均重放，不仅验证摘要布尔。
+
+对应 review `e5-first-linux-origin-review-v1` 包含 collector、reviewer（非空不同）、install_complete、linux_collection、baseline、raw_nv_evidence_sha256、reviewed_at，decision 必须由独审形成 `FIRST_FRESH_ORIGIN_VERIFIED_NO_REARM_AUTHORITY`。这只是专项 NV 来源结论；主线程还必须另行通过完整无卡首次验收，不能将该 decision 当整体稳定证明或执行批准。
+
+## 当前 NV / Android 网络独审
+
+`e5-sim-nv-network-review-v1` 字段：
+
+- collector、reviewer、captured_at、expires_at（aware UTC，最长 900 秒）；
+- first_reference binding、readonly_result binding、current_baseline binding、raw_evidence_sha256；
+- `difference` 必须逐字等于 `nv_origin.difference(first_hashes,current_hashes)` 的重算结果，含 changed 明细、fresh/retained 预期，以及 physical_nv_writes_allowed=false / working_copy_refresh_allowed=false；
+- `raw_network_records_reviewed` 必须绑定本次两项网络原始操作的 op_id；android_registered_both_slots / android_cellular_data_validated 为独立审阅原文后的结论，并非自动推断，也不能凭两卡 READY/LOADED 填写；
+- decision `SOURCE_DIFF_REVIEWED_FOR_BC32_ONLY`。
+
+`nv_origin.validate_gate(result_binding,review_binding)` 纯主机重放返回 hashes、difference、review、expires_at、first_reference。它不会修改设备或共享状态。
+
+## BC32 proposal 与单独执行审阅
+
+`rearm.draft(result_binding, request_id, nv_review_binding, out, seconds=600)` 形成 `e5-next-bc32-rearm-request-v1`，明确唯一 `{node:/dev/block/mmcblk0p3, offset:2048, bytes:32}`，boot_b_written=false。总预算必须 30–600 秒且完全落在当前 cold/raw/NV/review 租约内。
+
+第二份独审 `e5-next-bc32-rearm-review-v1` 绑定 proposal、collector/reviewer、captured_at/expires_at、candidate_independently_reviewed、user_confirmed_slot1_mobile_slot2_unicom 和 decision `REARM_BC32_ONLY`。`validate` 重算全部前置；准备件的 `run` 仍无条件由 gate 拒绝。将来启用副本需要另行独审，不从本文件获得授权。
+
+## 固定现场 pending
+
+真实 clean install、首次 Linux 全体验收和 fresh NV 来源、带卡新 cold/当前 UI/日志、两卡注册/实际蜂窝连接、当前九 NV 两遍、独审差异、当前 helper 与普通共享状态，以及足够剩余时间均未由本准备件生成。没有通用 trusted 字段或用历史通过推定当前通过的接口。来源不符/时间不足/变化即停止；不补历史时间，不更改 NV。

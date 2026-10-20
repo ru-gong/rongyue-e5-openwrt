@@ -1,0 +1,110 @@
+#!/usr/bin/env python3
+"""Offline base -> own-device final manifest binder; never executes ADB/USB.
+
+The technical review input is not permission to flash. e5_install remains
+LIVE_DISABLED. Conversion is reproduced, copies hash while writing, and the
+complete installer validator must pass before final-manifest.json is published.
+"""
+import argparse
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import e5_install as e
+import prepare_device_files as package
+
+BASE_ARTIFACTS={"boot","rootfs_gz","runtime_audit"}
+CAP_PATCH_SHA="0000000000000000000000000000000000000000000000000000000000000000"
+
+def checked_copy(source, target, record):
+    source=e.regular(source);h=hashlib.sha256();n=0
+    with source.open("rb") as src,target.open("xb") as dst:
+        os.fchmod(dst.fileno(),0o600)
+        for chunk in iter(lambda:src.read(1<<20),b""):
+            n+=len(chunk);e.require(n<=record["bytes"],"copy grew beyond approved length")
+            h.update(chunk);dst.write(chunk)
+        e.require(n==record["bytes"] and h.hexdigest()==record["sha256"],"copy changed after review")
+        dst.flush();os.fsync(dst.fileno())
+    e.fsync_directory(target.parent)
+    return {**record,"path":target.name}
+
+def bind(base_path,base_sha,collection_path,collection_sha,provenance_path,provenance_sha,
+         conf_path,conf_sha,review_path,review_sha,adb_path,adb_sha,output):
+    base_path=e.regular(base_path);base=e.pinned_json(base_path,base_sha)
+    e.require(base["schema"]==1 and base["serial"]==e.SERIAL and base["source_commit"]==e.COMMIT and
+              base["mode"]=="userdata-first-install" and base["device_profile"]=="e5" and
+              base["device_profile_sha256"]==e.PROFILE_SHA256,"base identity mismatch")
+    e.require(base["submodules"]==e.pinned_json(e.ROOT/"source-lock.json",e.SOURCE_LOCK_SHA256)["submodules"],"base submodules differ")
+    e.require(set(base["artifacts"])==BASE_ARTIFACTS,"base must contain only boot/rootfs_gz/runtime_audit")
+    patches=base["source_modifications"]
+    e.require(len(patches)==1 and patches[0]["path"]=="boot/init" and patches[0]["sha256"]==CAP_PATCH_SHA,
+              "unreviewed production source modifications")
+    sources={key:e.artifact(base_path.parent,entry) for key,entry in base["artifacts"].items()}
+    collection_path=e.regular(collection_path);e.pinned_json(collection_path,collection_sha)
+    provenance_path=e.regular(provenance_path);prov=e.pinned_json(provenance_path,provenance_sha)
+    conf_path=e.regular(conf_path);e.require(e.file_hash(conf_path)==conf_sha,"settings changed after review")
+    e.require(e.file_hash(e.regular(adb_path))==adb_sha and re.fullmatch(r"[a-f0-9]{64}",adb_sha),"ADB hash mismatch")
+    review_path=e.regular(review_path);review=e.pinned_json(review_path,review_sha)
+    e.require(review=={"schema":1,"serial":e.SERIAL,"technical_review_complete":True,
+                       "base_manifest_sha256":base_sha,"collection_manifest_sha256":collection_sha,
+                       "provenance_sha256":provenance_sha,"install_conf_sha256":conf_sha,"adb_sha256":adb_sha},
+              "technical review does not bind all final inputs")
+    tar_record=prov["device_files_tar"];original_tar=e.artifact(provenance_path.parent,tar_record)
+    e.safe_tar(original_tar)
+    e.validate_device_provenance(original_tar,provenance_path,{"reviewed":True,"collection_manifest_sha256":collection_sha})
+    output=Path(output);e.require(not output.exists(),"final output already exists")
+    output.mkdir(mode=0o700);e.fsync_directory(output.parent)
+    try:
+        # Repeat the fixed conversion from original inputs, rather than trusting
+        # a provenance statement alone. No collected binaries are executed.
+        with tempfile.TemporaryDirectory(dir=output,prefix="reproduce-") as td:
+            reproduced=package.prepare(collection_path,collection_sha,Path(td)/"converted")
+            for field in ("serial","source_build","source_commit","synthetic_fixture","collection_manifest_sha256",
+                          "converter_hashes","collector_sha256","inputs","outputs","nv_included","device_files_tar"):
+                e.require(reproduced[field]==prov[field],"conversion reproduction differs: "+field)
+        final=copy.deepcopy(base);final["status"]="PREPARED_LIVE_DISABLED_NOT_EXECUTION_AUTHORIZATION"
+        final["adb_sha256"]=adb_sha
+        final["device_files_review"]={"reviewed":True,"collection_manifest_sha256":collection_sha}
+        final["binding_evidence"]={"base_manifest_sha256":base_sha,"technical_review_sha256":review_sha,
+                                   "conversion_reproduced":True,"device_execution_performed":False}
+        names={"boot":"boot.img","rootfs_gz":"openwrt.ext4.gz","runtime_audit":"runtime-audit.json"}
+        for key in BASE_ARTIFACTS:
+            final["artifacts"][key]=checked_copy(sources[key],output/names[key],base["artifacts"][key])
+        extra={"device_files_tar":(original_tar,"device-files.tar",tar_record),
+               "device_files_provenance":(provenance_path,"device-files.provenance.json",{"bytes":provenance_path.stat().st_size,"sha256":provenance_sha}),
+               "install_conf":(conf_path,"openwrt-install.conf",{"bytes":conf_path.stat().st_size,"sha256":conf_sha}),
+               "fscrypt_probe":(e.ROOT/"fscrypt-policy-probe","fscrypt-policy-probe",{"bytes":(e.ROOT/"fscrypt-policy-probe").stat().st_size,"sha256":e.PROBE_SHA256})}
+        for key,(source,name,record) in extra.items():final["artifacts"][key]=checked_copy(source,output/name,record)
+        # Retain small source/review evidence; raw collection stays at its source.
+        for source,name,sha in ((base_path,"base-manifest.input.json",base_sha),(collection_path,"collection.input.json",collection_sha),
+                                (review_path,"technical-review.input.json",review_sha)):
+            checked_copy(source,output/name,{"bytes":source.stat().st_size,"sha256":sha})
+        raw=(json.dumps(final,ensure_ascii=False,indent=2)+"\n").encode()
+        candidate=output/"candidate-manifest.json";e.durable_write(candidate,raw)
+        manifest_sha=e.digest(raw)
+        e.validate_bundle(candidate,manifest_sha)
+        target=output/"final-manifest.json"
+        result={"schema":1,"manifest":str(target.resolve()),"sha256":manifest_sha,
+                "conversion_reproduced":True,"full_bundle_validator_passed":True,
+                "live_disabled":e.LIVE_DISABLED,"ready_for_device":False,"device_execution_performed":False}
+        e.durable_write(output/"binding-result.json",(json.dumps(result,indent=2)+"\n").encode())
+        candidate.rename(target);e.fsync_directory(output)
+        return result
+    except BaseException:
+        e.durable_write(output/"FAILED_NOT_INSTALLABLE",b"Binding failed. No final approval; preserve evidence for review.\n")
+        raise
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    for name in ("base-manifest","collection","provenance","install-conf","technical-review","adb"):
+        ap.add_argument("--"+name,type=Path,required=True)
+        ap.add_argument("--"+name+"-sha256",required=True)
+    ap.add_argument("--output",type=Path,required=True);a=ap.parse_args()
+    print(json.dumps(bind(a.base_manifest,a.base_manifest_sha256,a.collection,a.collection_sha256,
+        a.provenance,a.provenance_sha256,a.install_conf,a.install_conf_sha256,a.technical_review,
+        a.technical_review_sha256,a.adb,a.adb_sha256,a.output),indent=2))
+
+if __name__=="__main__":main()

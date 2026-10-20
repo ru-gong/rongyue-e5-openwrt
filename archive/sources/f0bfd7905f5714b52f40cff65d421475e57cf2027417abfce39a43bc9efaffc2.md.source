@@ -1,0 +1,9 @@
+# SIM-only 禁用机械副本
+
+本包仅固定新 noSIM 工具族、三层永久停止记录与独立新临时恢复门。8 项 SIM/NV/BC32 业务材料保持 b56c 准备包逐字节不变；全部设备 gate 禁用，原件恢复入口始终拒绝。本包不 close、不清共享标记、不访问设备或 AT。
+
+仅在未来另行启用且现场完整验收成立后，唯一分区写仍是 p3 offset2048 的32B；boot_b、rootfs、NV 均无写入口。九NV双读及写前复核、READY/LOADED合法原值、600秒总预算/900秒证据上限、6/8秒单请求限制不变。NV来源专项证据不等于完整无卡日志/网络/SSH验收，首次实际安装与NV验收材料仍待取得。
+
+MANIFEST 的源码绑定与 SOURCE_BINDINGS 为纯主机材料，不是现场批准。已有三层永久标记必须精确重验；任何新的 ACTIVE/UNCERTAIN/RECOVERY_ONLY/RECOVERY_LIFECYCLE_TRANSITION 继续阻断。退役boot/tx与旧日志保留。
+
+测试命令：python3 -B -m unittest discover -s 本目录 -p 'test_*.py' -v。70项原回归与11项真实临时closure测试保留；新fixture对应第三层归档，不修改真实state。独立测试/材料导入结果在单独报告中绑定，不能由复制动作推定通过。

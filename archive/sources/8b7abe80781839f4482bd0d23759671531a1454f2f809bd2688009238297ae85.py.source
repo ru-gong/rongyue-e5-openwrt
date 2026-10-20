@@ -1,0 +1,97 @@
+"""One fixed acknowledged host STOP; default plan. Never reboot or auto retry."""
+import argparse,datetime as dt,hashlib,importlib.util,json,sys,threading,time,os
+from pathlib import Path
+HERE=Path(__file__).resolve().parent;ROOT=HERE.parents[1]
+RUN=ROOT/'evidence/author-closed-fd-install-20261019';CORE=ROOT/'tools/e5_nextphase_core_live_69b2a5b04287f071'
+DEVICE_RESUME_ENABLED=False
+CASE_SHA256='0000000000000000000000000000000000000000000000000000000000000000'
+HOST_INPUT_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+STOP_CASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+FIXED_STAGE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+SCOPE='SETTLE_ACKNOWLEDGED_HOST_STOP_AND_CONTINUE_REMAINING_STAGE'
+
+def need(v,m):
+ if not v:raise RuntimeError(m)
+def sha(b):return hashlib.sha256(b).hexdigest()
+def bind(p):return {'path':str(p),'sha256':sha(p.read_bytes())}
+def obj(binding):
+ p=Path(binding['path']);need(not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe binding');b=p.read_bytes();need(sha(b)==binding['sha256'],'binding differs');return json.loads(b)
+def load(name,p,digest=None):
+ raw=p.read_bytes();need(digest is None or sha(raw)==digest,'module source differs')
+ old=sys.modules.get(name);need(old is None or Path(old.__file__).resolve()==p,'module conflict')
+ import types
+ m=types.ModuleType(name);m.__file__=str(p);sys.modules[name]=m;exec(compile(raw,str(p),'exec'),m.__dict__);return m
+def setup():
+ need(sha((HERE/'CASE.json').read_bytes())==CASE_SHA256,'fixed case changed')
+ load('host_inputs',HERE/'host_inputs.py',HOST_INPUT_SHA)
+ sc=load('_host_stop_case',HERE/'stop_case.py',STOP_CASE_SHA)
+ c=sc.Case(ROOT,json.loads((HERE/'CASE.json').read_bytes()),CASE_SHA256)
+ return c
+
+def expires(case):
+ env=obj(case.c['cold_ready']);r=obj(env['original_review']);end=dt.datetime.fromisoformat(r['expires_at']);need(end.tzinfo is not None,'expiry timezone');return end
+
+def approval(binding,case):
+ v=obj(binding);need(set(v)=={'schema','case_sha256','scope','user_confirmed','confirmed_by','expires_at','total_seconds'},'approval fields')
+ need(v['schema']=='e5-fixed-stage-resume-approval-v1' and v['case_sha256']==CASE_SHA256 and v['scope']==SCOPE and v['user_confirmed'] is True and isinstance(v['confirmed_by'],str) and v['confirmed_by'].strip(),'explicit fixed-scope approval required')
+ now=dt.datetime.now(dt.timezone.utc);end=dt.datetime.fromisoformat(v['expires_at']);need(now<end<=expires(case),'approval lease')
+ need(type(v['total_seconds']) is int and 30<=v['total_seconds']<=5400 and v['total_seconds']+5<(end-now).total_seconds(),'whole phase must fit reviewed evidence')
+ return v
+
+def save(p,value):
+ need(not p.exists() and not p.is_symlink(),'never overwrite output');raw=(json.dumps(value,sort_keys=True,indent=2)+'\n').encode()
+ fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+ fd=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+ return bind(p)
+
+def execute(approved):
+ need(DEVICE_RESUME_ENABLED,'DEVICE_RESUME_DISABLED: explicit user approval and reviewed activation copy required')
+ case=setup();a=approval(approved,case);case.verify()
+ sys.path.insert(0,str(CORE));family=obj(case.c['source_family']);w=load('_fixed_resume_workflow',CORE/'workflow.py',family['files']['core/workflow.py']['sha256'])
+ m=w.verify_materials();m['_bound_manifest_sha256']=w.MANIFEST_SHA;w.verify_support_bindings(m);mods=w.load_modules(m)
+ fixed=load('_fixed_stage',HERE/'bounded_stage_fixed.py',FIXED_STAGE_SHA)
+ out=RUN/'resume-stage-execution';need(not out.exists() and not out.is_symlink(),'new evidence output required')
+ cancel=threading.Event();adapter=None;transport=None
+ with mods['directory_session']._device_lock(),mods['bounded_transport'].cancellation_signals():
+  case.verify();out.mkdir(mode=0o700)
+  save(out/'INPUT.json',{'case_sha256':CASE_SHA256,'approval':approved,'old_stop_preserved':True,'source_family':case.c['source_family'],'fixed_stage':bind(HERE/'bounded_stage_fixed.py'),'host_inputs':bind(HERE/'host_inputs.py'),'does_not_replay_old_mutations':True})
+  try:
+   api=mods['bounded_transport']._closure_api()
+   settlement=case.settle(api,enabled=True);save(out/'HOST_SETTLEMENT.json',settlement)
+   # The archived marker represented a host check after *all* requests completed.
+   # It is not a blanket exception to fresh current state/partition/occupancy guards.
+   req={'txid':case.c['txid'],'boot_id':case.c['boot_id']};deadline=time.monotonic()+a['total_seconds']
+   adapter=w.make_adapter(mods,m,req,out,cancel,deadline);transport=adapter._ensure_transport()
+   ready=mods['cold_bridge'].validate_directory_ready({k:case.c['cold_ready'][k] for k in ('path','sha256')},req['boot_id'])
+   need(a['total_seconds']+5<(dt.datetime.fromisoformat(ready['expires_at'])-dt.datetime.now(dt.timezone.utc)).total_seconds(),'evidence expired before dispatch')
+   adapter.fresh_gate({'request_sha256':approved['sha256'],'txid':req['txid'],'boot_id':req['boot_id'],'expires_at':ready['expires_at']})
+   requirements={'deployment':bind(RUN/'scanner-execution/result/COMPLETE.json'),'probe':bind(RUN/'probe-execution/COMPLETE.json')}
+   proof=mods['phase_evidence'].validate_requirements(requirements,m,'stage',req['txid']);mods['phase_evidence'].verify_current(adapter,proof,m)
+   make=lambda n:mods['android_directory_adapter'].Artifact(Path(m['stage_inputs'][n]['path']),m['stage_inputs'][n]['bytes'],m['stage_inputs'][n]['sha256'])
+   artifacts={n:make(n) for n in mods['android_directory_adapter'].STAGE_INPUTS}
+   inventory=fixed.resume_stage(fixed.BoundedStage(adapter),artifacts,make('openwrt.ext4'),case.c['partial'])
+   # The original verified backup and original core activation policy are retained.
+   session=mods['directory_session'];session._stage_matches(inventory,w.json_binding(m['candidate']))
+   original=session._inventory({k:case.c['inventory'][k] for k in ('path','sha256')},req['txid'],'active',req['boot_id'])
+   tar=RUN/'original-e5linux.tar';receipt=RUN/'original-e5linux.tar.verified.json'
+   backup={**bind(tar),'bytes':tar.stat().st_size,'receipt_path':str(receipt),'receipt_sha256':bind(receipt)['sha256']};session._backup(backup,original)
+   need(time.monotonic()<deadline and not cancel.is_set(),'phase deadline or cancellation after stage')
+   need(transport is not None and not transport.poisoned,'transport did not complete')
+   mods['bounded_transport']._closure_api().normal_gate(transport.state,ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl',req['boot_id'],req['txid'])
+   inv=save(out/'stage.inventory.json',inventory)
+   result={'schema':'e5-fixed-stage-resume-complete-v1','complete':True,'case_sha256':CASE_SHA256,'serial':w.SERIAL,'txid':req['txid'],'boot_id':req['boot_id'],'stage_inventory':inv,'producer_sha256':sha(Path(__file__).read_bytes()),'fixed_stage_sha256':FIXED_STAGE_SHA,'host_inputs_sha256':HOST_INPUT_SHA,'skipped_original_boot_os_bytes':8,'no_old_command_replay':True,'block_writes':False,'old_directory_not_moved':True,'default_boot':'android','automatic_next_phase':False,'automatic_retry':False,'reboot_performed':False}
+   save(out/'COMPLETE.json',result);return result
+  except BaseException as exc:
+   if transport is not None:
+    try:transport.mark_uncertain('fixed-stage-resume: '+type(exc).__name__+': '+str(exc))
+    except BaseException:pass
+   if not (out/'STOP.json').exists():save(out/'STOP.json',{'reason':type(exc).__name__+': '+str(exc),'no_retry_or_cleanup':True,'block_write_entry_not_invoked':True,'host_input_diagnostics':getattr(exc,'details',{})})
+   raise
+
+def main():
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',choices=('plan','continue'),nargs='?',default='plan');p.add_argument('--approval');p.add_argument('--sha256');a=p.parse_args()
+ if a.mode=='plan':
+  c=setup();v=c.verify();return {**v,'device_resume_enabled':DEVICE_RESUME_ENABLED,'evidence_expires_at':expires(c).isoformat(),'old_eight_bytes_will_be_verified_then_skipped':True,'all_other_stage_files_exclusive_create_only':True,'new_device_operations':False}
+ return execute({'path':str(Path(a.approval).absolute()),'sha256':a.sha256})
+if __name__=='__main__':print(json.dumps(main(),sort_keys=True))

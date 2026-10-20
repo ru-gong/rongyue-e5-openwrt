@@ -1,0 +1,92 @@
+"""Host-only source chain for a second trial. No source refresh or device calls."""
+from pathlib import Path
+import ast,json,re
+import importlib.util as _iu,sys as _sys
+_cp=Path(__file__).resolve().with_name('common.py');_key='_e5_sim_common'
+if _key not in _sys.modules:
+ _sp=_iu.spec_from_file_location(_key,_cp);_cm=_iu.module_from_spec(_sp);_sys.modules[_key]=_cm;_sp.loader.exec_module(_cm)
+c=_sys.modules[_key]
+if Path(c.__file__).resolve()!=_cp:raise RuntimeError('common source conflict')
+nv=c.sibling('sim_nv');e=c.sibling('evidence_contract')
+CONTRACT_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+BOOT_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+def render_guard(path,digest,boot):
+ """Evaluate only the fixed _guard's literal f-string, never execute source."""
+ source=c.read(path,digest);tree=ast.parse(source)
+ cls=next(x for x in tree.body if isinstance(x,ast.ClassDef) and x.name=='AndroidDirectoryAdapter')
+ fn=next(x for x in cls.body if isinstance(x,ast.FunctionDef) and x.name=='_guard')
+ c.require(len(fn.body)==1 and isinstance(fn.body[0],ast.Return),'guard must remain a literal expression')
+ def value(x):
+  if isinstance(x,ast.Constant) and isinstance(x.value,str):return x.value
+  if isinstance(x,ast.JoinedStr):return ''.join(value(y) for y in x.values)
+  if isinstance(x,ast.FormattedValue) and x.conversion==-1 and x.format_spec is None:
+   if isinstance(x.value,ast.Name) and x.value.id=='SERIAL':return c.SERIAL
+   if isinstance(x.value,ast.Attribute) and isinstance(x.value.value,ast.Name) and x.value.value.id=='self' and x.value.attr=='boot_id':return c.validboot(boot)
+  raise c.Refusal('unknown dynamic code in pinned historical guard')
+ return value(fn.body[0].value)
+def legacy_script(r,off,n,op,boot,hashed):
+ node=r['node'];g=nv.guard(r);pipe=' | '+nv.BB+' sha256sum' if hashed else ''
+ return g+f"printf 'NV\\t{op}\\t{boot}\\t{node}\\t{off}\\t{n}\\t'; stat -c '%i %d' {node}\n"+f'{nv.BB} dd if={node} bs=4096 skip={off//4096} count={n} iflag=count_bytes status=none{pipe}\n'+g+f"printf '\\nNV\\t{op}\\t%s\\t{node}\\t{off}\\t{n}\\t' \"$(cat /proc/sys/kernel/random/boot_id)\"; stat -c '%i %d' {node}\n"
+def parse_legacy(raw,r,off,n,op,boot,hashed):
+ prefix=f'NV\t{op}\t{boot}\t{r["node"]}\t{off}\t{n}\t'.encode();head,sep,body=raw.partition(b'\n');c.require(sep and head.startswith(prefix),'first NV frame')
+ ident=head[len(prefix):].split();c.require(len(ident)==2 and all(v.isdigit() and int(v)>0 for v in ident),'first NV identity');size=68 if hashed else n
+ c.require(body[size:]==b'\n'+head+b'\n','first NV size/footer')
+ if hashed:c.require(re.fullmatch(rb'[a-f0-9]{64}  -\n',body[:size]),'first NV digest format')
+ return body[:size],list(map(int,ident))
+def first_baseline(item,transport,boot,tx,deps):
+ v=c.obj(item);folder=Path(item['path']).parent
+ c.require(v.get('schema')=='e5-nine-nv-baseline-v1' and v['serial']==c.SERIAL and v['boot_id']==boot and v['txid']==tx and v['geometry_sha256']==nv.GEOMETRY_SHA and v['source_sha256']==deps['first_install_sources']['nv_baseline_sha256'] and v['read_only'] is True and v['device_mutations']==0 and v['approved_to_flash'] is False,'first NV source/scope')
+ c.require([x['name'] for x in v['items']]==[r['name'] for r in nv.rows()],'first exact nine')
+ core=Path(deps['core_path']);g=render_guard(core/'android_directory_adapter.py',deps['first_install_sources']['adapter_sha256'],boot)
+ data={};expected=[];ident={}
+ for row,r in zip(v['items'],nv.rows()):
+  a=row['artifact'];c.require({k:row[k] for k in r}==r and row['two_complete_passes_match'] is True and a['path']==str(folder/(r['name']+'.bin')) and a['bytes']==r['bytes'],'first NV artifact')
+  data[r['name']]=c.read(a['path'],a['sha256'],a['bytes']);ident[r['name']]=[row['inode'],row['host_dev']]
+  for hashed in (False,True):expected += [(r,off,min(nv.CHUNK,r['bytes']-off),hashed) for off in range(0,r['bytes'],nv.CHUNK)]
+ folders=[p for p in sorted(Path(transport).iterdir()) if p.is_dir() and any(t in p.name for t in ('-nv-read-chunk-','-nv-hash-chunk-'))];c.require(len(folders)==len(expected),'first NV transcript exact count');hashes={}
+ for p,(r,off,n,hashed) in zip(folders,expected):
+  q=c.obj(c.binding(p/'COMPLETE.json'));flight=c.obj(c.binding(p/'IN_FLIGHT.json'));m=c.obj(c.binding(p/'transport-result.json'));raw=c.read(p/'stdout.bin');err=c.read(p/'stderr.bin');op=q['op_id']
+  c.require(q.get('schema')=='e5-bounded-transport-v1' and q['status']=='COMPLETE' and q['validated'] is True and q['serial']==c.SERIAL and q['boot_id']==boot and q['txid']==tx and q['mutating'] is False and q['reconciliation_only'] is False and q['recovery_context'] is None and q['payload_bytes']==0 and q['payload_sha256']==c.sha(b'') and q['deadline_seconds']==8 and q['automatic_retry'] is False,'first NV complete scope')
+  c.require(not (p/'UNCERTAIN.json').exists() and all(q.get(k)==v for k,v in flight.items() if k!='status') and q['argv_sha256']==c.sha(c.canonical(q['argv'])) and q['stdout_sha256']==c.sha(raw),'first NV receipt binding')
+  c.require(m.get('failure') is None and m['returncode']==0 and 0<=m['elapsed_seconds']<=8 and m['host_child_reaped'] is True and m['stdin_bytes_sent']==0 and m['stdout_bytes']==len(raw) and m['stdout_sha256']==c.sha(raw) and not err and m['stderr_bytes']==0,'first NV transport failed')
+  value,identity=parse_legacy(raw,r,off,n,op,boot,hashed);wanted=data[r['name']][off:off+n]
+  c.require(identity==ident[r['name']] and value==((c.sha(wanted)+'  -\n').encode() if hashed else wanted),'first NV double read changed')
+  limit=(68 if hashed else n)+4096
+  c.require(q['label']==('nv-hash-chunk' if hashed else 'nv-read-chunk') and q['output_limit']==limit and q['argv']==e.argv(g+legacy_script(r,off,n,op,boot,hashed)),'first NV source script differs')
+  for name in ('COMPLETE.json','IN_FLIGHT.json','transport-result.json','stdout.bin','stderr.bin'):hashes[p.name+'/'+name]=c.binding(p/name)['sha256']
+ return {k:c.sha(v) for k,v in data.items()},c.sha(c.canonical(hashes))
+def linux_origin(binding,expected):
+ raw=c.read(binding['path'],binding['sha256']);c.require(len(raw)<=32<<20,'Linux log cap');rows=[json.loads(x) for x in raw.splitlines()];c.require(all(isinstance(x,dict) and isinstance(x.get('id'),str) for x in rows),'Linux JSONL schema');r={x['id']:x for x in rows};c.require(len(r)==len(rows),'duplicate Linux evidence ID')
+ contract=json.loads(c.read(c.HERE/'acceptance-contract.json',CONTRACT_SHA));c.require(r['identity-observation']['ok'] is True and r['identity-observation']['data']['contract']==contract,'new candidate Linux contract')
+ ids=['gpt-prefix','misc-outside32-and-CRC','bootB-outside-diagnostic','NV-upstream-verify','NV-this-boot-source','NV-working-copy-origin','next-boot-status','release-image']+['protected:'+n for n in contract['protected_hashes']]+['map:'+n for n in contract['partitions']]+['runtime-script:'+n for n in contract['runtime_scripts']]
+ c.require(all(r[n]['ok'] is True for n in ids),'critical first Linux failure')
+ c.require(r['NV-this-boot-source']['data']==expected and r['NV-working-copy-origin']['data']['origin_sha256']==expected and r['NV-working-copy-origin']['data']['origin_matches_this_boot_source'] is True,'first working origin not fresh Android baseline')
+ for name,h in expected.items():
+  a,z=r['NV-first:'+name],r['NV-second:'+name];c.require(a['ok'] is True and z['ok'] is True and a['data']['sha256']==z['data']['sha256']==h and a['data']['this_boot_source_sha256']==h and z['data']['stable_two_reads'] is True,'first physical NV/source mismatch')
+  for row in (a,z):c.require(row['data']['mapping']['sysfs_ro']=='1' and row['data']['mapping']['block_ro']==1 and row['data']['mapping']['loop_backing']=='/opt/e5/nv/'+name,'first physical protection/loop')
+ status=r['next-boot-status']['data'];c.require(status['exit_code']==0 and 'default boot: android\n' in status['stdout'] and 'next boot: android\n' in status['stdout'],'first Android default')
+ return c.validboot(r['identity-observation']['data']['boot_id'])
+def validate_first(binding):
+ ref=c.obj(binding);c.require(set(ref)=={'schema','install_complete','linux_collection','review'} and ref['schema']=='e5-sim-first-linux-source-v1','first reference exact fields');deps=c.dependencies()
+ install=c.obj(ref['install_complete']);folder=Path(ref['install_complete']['path']).parent;request=c.obj(c.binding(folder/'REQUEST.json'))
+ c.require(install['schema']=='e5-nextphase-workflow-result-v1' and install['phase']=='install' and install['serial']==c.SERIAL and install['complete'] is True and install['request_sha256']==c.binding(folder/'REQUEST.json')['sha256'] and install['boot_id']==request['boot_id'] and install['txid']==request['txid'],'first install source/identity')
+ c.require(install['result']['boot_b_sha256']==BOOT_SHA and install['result']['complete'] is True,'first install candidate readback')
+ manifest=c.obj(deps['core_manifest']);c.require(request['manifest_sha256']==deps['core_manifest']['sha256'] and request['runner_sha256']==deps['first_install_sources']['workflow_sha256'] and manifest['modules']['nv_baseline']==deps['first_install_sources']['nv_baseline_sha256'],'first install fixed source family')
+ b=c.obj(c.binding(folder/'NV_BASELINE_BINDING.json'));c.require(b['path']==str(folder/'physical-nv-before/COMPLETE.json'),'first baseline directory');hashes,digest=first_baseline(b,folder/'transport',install['boot_id'],install['txid'],deps)
+ linux_boot=linux_origin(ref['linux_collection'],hashes);c.require(linux_boot!=install['boot_id'],'Linux must be a separate actual boot')
+ review=c.obj(ref['review']);e.review_people(review);c.require(review.get('schema')=='e5-first-linux-origin-review-v1' and review.get('install_complete')==ref['install_complete'] and review.get('linux_collection')==ref['linux_collection'] and review.get('baseline')==b and review.get('raw_nv_evidence_sha256')==digest and review.get('decision')=='FIRST_FRESH_ORIGIN_VERIFIED_NO_REARM_AUTHORITY','first source review binding')
+ c.require(c.timestamp(review['reviewed_at'])<=c.now(),'future first review')
+ return {'hashes':hashes,'linux_boot_id':linux_boot,'android_boot_id':install['boot_id'],'baseline':b,'first_reference':binding,'device_execution_allowed':False}
+def difference(origin,current):
+ names={r['name'] for r in nv.rows()};c.require(set(origin)==set(current)==names and all(c.validsha(x) for x in list(origin.values())+list(current.values())),'exact nine digest map')
+ changed={n:{'origin_sha256':origin[n],'current_sha256':current[n]} for n in sorted(names) if origin[n]!=current[n]}
+ forbidden=[n for n in changed if not n.startswith(('nr_fixnv','nr_runtimenv'))];c.require(not forbidden,'delta/cal source changed; stop before BC32, no refresh')
+ return {'changed':changed,'retained_origin_on_second_linux_expected':bool(changed),'fresh_origin_expected':not changed,'physical_nv_writes_allowed':False,'working_copy_refresh_allowed':False}
+def validate_gate(result_binding,review_binding):
+ result=c.obj(result_binding);c.require(result['purpose']=='rearm-with-sim','SIM source purpose');current=nv.validate_capture(result['nv_baseline'],c.now(),result['boot_id'],result['txid'],Path(result_binding['path']).parent/'transport')
+ review=c.obj(review_binding);e.review_people(review);expiry=e.lease(review,c.now());first=validate_first(review['first_reference']);diff=difference(first['hashes'],current['hashes'])
+ c.require(first['linux_boot_id']!=result['boot_id'],'SIM evidence must be new Android boot')
+ c.require(review.get('schema')=='e5-sim-nv-network-review-v1' and review.get('readonly_result')==result_binding and review.get('current_baseline')==result['nv_baseline'] and review.get('raw_evidence_sha256')==current['raw_evidence_sha256'] and review.get('difference')==diff and review.get('decision')=='SOURCE_DIFF_REVIEWED_FOR_BC32_ONLY','NV source review differs')
+ c.require(review.get('android_registered_both_slots') is True and review.get('android_cellular_data_validated') is True and review.get('raw_network_records_reviewed')==current['network'],'Android actual network review is required')
+ c.require(c.timestamp(current['completed_at'])<=c.timestamp(review['captured_at']),'review predates current NV')
+ return {'hashes':current['hashes'],'difference':diff,'review':review_binding,'expires_at':min(expiry,c.timestamp(current['completed_at'])+__import__('datetime').timedelta(seconds=900)).isoformat(),'first_reference':review['first_reference']}

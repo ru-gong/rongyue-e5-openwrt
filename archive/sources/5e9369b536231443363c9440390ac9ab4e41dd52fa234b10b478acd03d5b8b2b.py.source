@@ -1,0 +1,63 @@
+"""Execute the real retained-read method with a pure host recorder only."""
+import importlib.util,json,sys,types,unittest
+from pathlib import Path
+def guard(event,args):
+    if event.startswith(('subprocess.','socket.','os.exec','os.spawn')) or event in ('os.system','os.fork'):raise AssertionError(event)
+sys.addaudithook(guard)
+H=Path(__file__).resolve().parent
+spec=importlib.util.spec_from_file_location('_stage_retained',H/'overlay/scanner/stage2_deploy.py')
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.case=json.loads((H/'CASE.json').read_bytes());self.items=self.case['retained_read_items'];self.expected={x['label']:x for x in self.items}
+        m._closure_api=lambda:types.SimpleNamespace(_load=lambda:types.SimpleNamespace(c=self.case))
+        self.a=m.Stage2Deploy.__new__(m.Stage2Deploy);self.calls=[];self.change=lambda label,raw:raw
+        def request(label,script,limit,validator):
+            self.calls.append((label,script,limit));x=self.expected[label]
+            return validator(self.change(label,('\n'.join(x['expected_lines'])+'\n').encode()))
+        self.a._request=request;self.before={}
+        for dest,src in [('old_lock','new_lock'),('old_owner','new_owner')]:
+            v=self.case['retained_device_state']['current_lock'][src]
+            self.before[dest]={k:int(x,16) if k in ('mode_bits','rdev_major','rdev_minor') else int(x) if k in ('dev','inode','uid','gid','bytes','nlink') else x for k,x in v.items()}
+    def test_exact_twelve_paths_only_read_scripts(self):
+        result=self.a._preserved_partial(self.before)
+        self.assertEqual(list(result),list(m.RETAINED_PATHS));self.assertEqual(len(self.calls),12)
+        for label,script,limit in self.calls:
+            self.assertIn(self.expected[label]['path'],script);self.assertEqual(limit,8192)
+            for word in (' > ','mkdir ','mv ','rm ','chmod ','write-block','reboot'):self.assertNotIn(word,script)
+    def test_new_owner_bound_and_old_layers_present(self):
+        self.assertEqual(m.OLD_TX,'722b7e1f5956cc07');self.assertEqual(m.OLD_BOOT,'00000000-0000-4000-8000-000000000001')
+        self.a._preserved_partial(self.before);paths=list(m.RETAINED_PATHS.values())
+        for tx in ('7d125fa2bd1c4e63','722b7e1f5956cc07'):
+            self.assertEqual(sum(p.endswith('.'+tx) and 'directory.lock' not in p for p in paths),4)
+        self.assertEqual(sum('/owner' in p for p in paths),2)
+    def test_each_raw_drift_rejected(self):
+        for item in self.items:
+            with self.subTest(label=item['label']):
+                self.change=lambda label,raw:raw+b'X' if label==item['label'] else raw
+                with self.assertRaises(m.Refusal):self.a._preserved_partial(self.before)
+    def test_path_forgery_rejected(self):
+        self.items[0]['path']='/data/e5linux/openwrt.ext4'
+        with self.assertRaises(m.Refusal):self.a._preserved_partial(self.before)
+        self.assertEqual(self.calls,[])
+    def test_unknown_kind_rejected(self):
+        self.items[0]['kind']='write'
+        with self.assertRaises(m.Refusal):self.a._preserved_partial(self.before)
+    def test_missing_layer_rejected(self):
+        self.items[:6]=[]
+        with self.assertRaises(m.Refusal):self.a._preserved_partial(self.before)
+    def test_item_reorder_rejected(self):
+        self.items[0],self.items[1]=self.items[1],self.items[0]
+        with self.assertRaises(m.Refusal):self.a._preserved_partial(self.before)
+    def test_current_lock_drift_before_reads(self):
+        self.before['old_lock']['inode']+=1
+        with self.assertRaises(m.Refusal):self.a._preserved_partial(self.before)
+        self.assertEqual(self.calls,[])
+    def test_owner_time_drift_before_reads(self):
+        self.before['old_owner']['ctime_text']+='x'
+        with self.assertRaises(m.Refusal):self.a._preserved_partial(self.before)
+        self.assertEqual(self.calls,[])
+    def test_post_scan_same_fixed_twelve_reads(self):
+        first=self.a._preserved_partial(self.before);second=self.a._preserved_partial()
+        self.assertEqual(first,second);self.assertEqual(len(self.calls),24)
+if __name__=='__main__':unittest.main(verbosity=2)

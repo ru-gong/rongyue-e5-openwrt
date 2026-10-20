@@ -1,0 +1,106 @@
+{
+  "reviewed_on": "2026-10-20",
+  "timezone": "Asia/Shanghai",
+  "note": "Fixed revisions refer to the cited source or installed dependency as identified in THIRD_PARTY_NOTICES.md; current verification refs for mu300-linux and original spreadtrum_flash are not claimed as historical build inputs.",
+  "sources": [
+    {
+      "component": "e5-linux",
+      "repo": "Enceka/e5-linux",
+      "ref": "569f13d4ce15585f70817c2a1e03bb574a84720b",
+      "commit": "569f13d4ce15585f70817c2a1e03bb574a84720b",
+      "license_url": "https://github.com/Enceka/e5-linux/blob/569f13d4ce15585f70817c2a1e03bb574a84720b/LICENSE",
+      "sha256": "33f2068d58f9b43f9282b7621db24efdcf32b409a14fcc8d221efe22f5e83ce6",
+      "license_file": "LICENSES/MIT-Enceka.txt",
+      "distributed_upstream_binary": false,
+      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+    },
+    {
+      "component": "infoscreen",
+      "repo": "Enceka/infoscreen",
+      "ref": "09b7ec822e56062f1891136c78860d5e257493c6",
+      "commit": "09b7ec822e56062f1891136c78860d5e257493c6",
+      "license_url": "https://github.com/Enceka/infoscreen/blob/09b7ec822e56062f1891136c78860d5e257493c6/LICENSE",
+      "sha256": "33f2068d58f9b43f9282b7621db24efdcf32b409a14fcc8d221efe22f5e83ce6",
+      "license_file": "LICENSES/MIT-Enceka.txt",
+      "distributed_upstream_binary": false,
+      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+    },
+    {
+      "component": "openclash-v0.48.002",
+      "repo": "vernesong/OpenClash",
+      "ref": "v0.48.002",
+      "commit": "e553e82e01c697aefbe1555261a503f425e00ccd",
+      "license_url": "https://github.com/vernesong/OpenClash/blob/e553e82e01c697aefbe1555261a503f425e00ccd/LICENSE",
+      "sha256": "bf598f1d704d1a9adbef8eb382b63aee036b500ad11e673f6e5f9e15dda7885d",
+      "license_file": "LICENSES/MIT-OpenClash-v0.48.002.txt",
+      "distributed_upstream_binary": false,
+      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+    },
+    {
+      "component": "mihomo-v1.19.32",
+      "repo": "MetaCubeX/mihomo",
+      "ref": "v1.19.32",
+      "commit": "88dcbf7f1614a67c3b36b848ee3592dfa92ada36",
+      "license_url": "https://github.com/MetaCubeX/mihomo/blob/88dcbf7f1614a67c3b36b848ee3592dfa92ada36/LICENSE",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "license_file": "LICENSES/GPL-3.0-Mihomo-v1.19.32.txt",
+      "distributed_upstream_binary": false,
+      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+    },
+    {
+      "component": "magisk-canary-28103",
+      "repo": "topjohnwu/Magisk",
+      "ref": "1e3edb888375c75777120a018637b5d945df6d15",
+      "commit": "1e3edb888375c75777120a018637b5d945df6d15",
+      "license_url": "https://github.com/topjohnwu/Magisk/blob/1e3edb888375c75777120a018637b5d945df6d15/LICENSE",
+      "sha256": "589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2",
+      "license_file": "LICENSES/GPL-3.0-Magisk-canary-28103.txt",
+      "distributed_upstream_binary": false,
+      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+    },
+    {
+      "component": "mu300-linux",
+      "repo": "dikeckaan/mu300-linux",
+      "ref": "main",
+      "commit": "3280409500ea21a639bac22c1e11c090a64d49e1",
+      "license_url": "https://github.com/dikeckaan/mu300-linux/blob/3280409500ea21a639bac22c1e11c090a64d49e1/LICENSE",
+      "sha256": "27f276ceb52f141a9632e0ca13841f829e2a5342b6e6133dd3833358cda84fd7",
+      "license_file": "LICENSES/MIT-mu300-linux.txt",
+      "distributed_upstream_binary": false,
+      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+    },
+    {
+      "component": "spreadtrum-original",
+      "repo": "ilyakurdyukov/spreadtrum_flash",
+      "ref": "main",
+      "commit": "3d0582579f3521f35a4937b2e871312e4dd6c308",
+      "license_url": "https://github.com/ilyakurdyukov/spreadtrum_flash/blob/3d0582579f3521f35a4937b2e871312e4dd6c308/LICENSE",
+      "sha256": "6b0382b16279f26ff69014300541967a356a666eb0b91b422f6862f6b7dad17e",
+      "license_file": "LICENSES/Unlicense-spreadtrum-original.txt",
+      "distributed_upstream_binary": false,
+      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+    },
+    {
+      "component": "OpenWrt v25.12.5 COPYING",
+      "repo": "openwrt/openwrt",
+      "ref": "v25.12.5",
+      "commit": "f0a60eee2fe051741c643ea6118718aae1ef17fb",
+      "license_url": "https://github.com/openwrt/openwrt/blob/f0a60eee2fe051741c643ea6118718aae1ef17fb/COPYING",
+      "license_file": "LICENSES/OpenWrt-v25.12.5-COPYING.txt",
+      "sha256": "d7bcdf97912effaa40a12a4f7a7ac4038e247e405679ab4e5f0aa0e5dc3789ef",
+      "distributed_upstream_binary": false,
+      "scope": "external build system; distribution packages have separate licenses"
+    },
+    {
+      "component": "OpenWrt v25.12.5 LICENSES/GPL-2.0",
+      "repo": "openwrt/openwrt",
+      "ref": "v25.12.5",
+      "commit": "f0a60eee2fe051741c643ea6118718aae1ef17fb",
+      "license_url": "https://github.com/openwrt/openwrt/blob/f0a60eee2fe051741c643ea6118718aae1ef17fb/LICENSES/GPL-2.0",
+      "license_file": "LICENSES/GPL-2.0-OpenWrt-v25.12.5.txt",
+      "sha256": "4a4d5c03ac503d809243f9d8de5517601e345990a85b6a59666c3f1caca02474",
+      "distributed_upstream_binary": false,
+      "scope": "external build system; distribution packages have separate licenses"
+    }
+  ]
+}

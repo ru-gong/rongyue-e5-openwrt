@@ -1,0 +1,17 @@
+# Android 目录写适配器：仅修正 /data 别名的离线副本
+
+此目录仅包含独立适配器副本与主机测试，原 `tools/e5_clean_author_prepare_20261014/` 冻结文件未改。`DEVICE_IO_DISABLED=True` 保持，任何 `_shell` 或备份设备入口都在创建进程之前拒绝；没有 CLI、环境变量启用方式。本轮没有调用 ADB、USB、SSH 或 VM。
+
+唯一生产逻辑差异位于 `_guard()` 的 `/data` 挂载校验：允许 mount source 为已观测的 `/dev/block/by-name/userdata` 或固定 `/dev/block/mmcblk0p70`。两种源和固定 by-name 链接均必须通过 `readlink -f` 指向原始 p70；p70 本身必须解析为自身、为块设备、`stat %t:%T` 为 `103:3f`，且 sysfs dev 为 `259:63`。`/proc/mounts` 中必须恰有一个 `/data`，文件系统为 F2FS，挂载包含 rw、不含 ro。错误节点、未知别名、只读挂载、缺失或重复匹配全部拒绝。
+
+没有移除或放宽写事务的全进程 mountinfo/FD 检查、global loop 检查、当前原 B/misc/13 保护门、租约、锁、候选固定哈希或失败处理。原 `_shell` 默认 1800 秒、整目录流式 tar 2400 秒等超时保持不变；这不代表这些时限适合当前设备。整进程扫描、`inspect` 对每个完整文件的 SHA、以及大文件 stage/verify/tar 路径仍需独立有界化和现场验证。此前只读扫描 8 秒超时不能由此归因设备故障，也不能通过放长本适配器超时来绕过。
+
+此修补**不是可执行就绪版本**。未复制或修改 directory session/helper/candidate，原 session 的适配器绑定仍指向旧冻结版本；未来整合必须更新绑定、补齐剩余有界实现并独审。新只读 capture v2 的较窄占用检查与本写适配器完全分离，备份通过不满足 rename/写入门。
+
+测试：
+
+```
+python3 -B -m unittest -v test_android_directory_adapter.py test_data_mount_guard.py
+```
+
+共 26 项主机测试：原 17 项＋新增 9 项。新增测试执行的是生产 `_guard()` 中精确截取的 DATA_MOUNT_GUARD 片段，`/bin/bash` 中所有设备文件读取均由固定主机夹具替代，只调用本机 awk 读取临时 mounts 文本。通过用例包括固定别名和原始节点；拒绝用例包括错误 source、错误 resolve、rdev、块类型、ro/矛盾选项、多个匹配和其他文件系统。AST 比较确认除 `_guard` 外生产代码不变，设备禁用门单独用进程哨兵验证。主机夹具不证明设备端 shell/节点/时序实际通过。

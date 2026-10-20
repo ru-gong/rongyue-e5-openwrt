@@ -1,0 +1,152 @@
+"""Fixed 4MiB stage append with combined readonly framing.
+
+The existing native writer, write range, fsync, full scanner and two physical
+readbacks remain. Combine shell round trips only; no device call on import.
+"""
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+import uuid
+
+DEVICE_APPEND_ENABLED=True
+CORE=Path('/REDACTED_HOST_PATH')
+CHUNK=4<<20
+BB='/data/adb/magisk/busybox'
+ALLOWED={'boot-os','boot.img','device-files.tar','fscrypt-probe','openwrt-default-boot',
+         'openwrt-install.conf','openwrt.ext4','openwrt.ext4.gz'}
+
+
+def need(ok,why):
+    if not ok:raise RuntimeError(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+
+
+class CombinedAppend:
+    def __init__(self,adapter,stage_identity):
+        need(DEVICE_APPEND_ENABLED,'DEVICE_APPEND_DISABLED')
+        self.a=adapter;self.identity=tuple(stage_identity)
+        self.api=sys.modules[type(adapter).__module__]
+        need(Path(self.api.__file__).resolve()==CORE/'android_directory_adapter.py' and
+             type(adapter) is self.api.AndroidDirectoryAdapter,'exact source-bound adapter')
+        need(self.a._part is None and len(self.identity)==2 and all(type(x)is int and x>0 for x in self.identity),
+             'stage identity/no enclosing write')
+
+    def program_script(self,key,path,item,op):
+        fmt=self.api.STAT_FORMAT
+        return (f'test ! -L {path}; test -f {path}; test "$(readlink -f {path})" = {path}\n'
+                f'test "$(stat -c %s {path})" = {item.size}\n'
+                f'printf "CPROG\\t{op}\\t{key}\\t{item.size}\\t"; stat -c \'{fmt}\' {path}\n'
+                f'{BB} dd if={path} bs=4096 count={item.size} iflag=count_bytes status=none\n'
+                f'printf "\\nCSHA\\t{op}\\t{key}\\t"; {BB} sha256sum {path}\n'
+                f'printf "CMETA\\t{op}\\t{key}\\t"; stat -c \'{fmt}\' {path}\n')
+
+    def parse_preflight(self,raw,op):
+        remain=raw;programs={}
+        for key,path,item in (('scanner',self.a.remote_scanner,self.a.scanner),('io',self.a.remote_io,self.a.io_helper)):
+            head,sep,remain=remain.partition(b'\n')
+            prefix=f'CPROG\t{op}\t{key}\t{item.size}\t'.encode()
+            need(sep and head.startswith(prefix),'program frame')
+            before=self.api.parse_stat(head[len(prefix):]);payload=remain[:item.size];remain=remain[item.size:]
+            need(len(payload)==item.size and sha(payload)==item.sha256,'program streamed hash')
+            line,sep,remain=remain.partition(b'\n')
+            need(line==b'' and sep,'program payload separator')
+            line,sep,remain=remain.partition(b'\n')
+            need(sep and line==f'CSHA\t{op}\t{key}\t{item.sha256}  {path}'.encode(),'program independent physical SHA')
+            line,sep,remain=remain.partition(b'\n');prefix=f'CMETA\t{op}\t{key}\t'.encode()
+            need(sep and line.startswith(prefix),'program post metadata frame')
+            after=self.api.parse_stat(line[len(prefix):]);need(after==before,'program metadata drift')
+            need(before['type']=='f' and before['dev']==self.identity[0] and before['inode']>0 and
+                 before['mode']=='700' and before['uid']==before['gid']==0 and before['nlink']==1 and
+                 before['bytes']==item.size,'program metadata scope')
+            programs[key]={'inode':before['inode'],'sha256':item.sha256,'bytes':item.size}
+        line,sep,remain=remain.partition(b'\n');prefix=f'CDEADLINE\t{op}\t'.encode()
+        need(sep and line.startswith(prefix) and line[len(prefix):].isdigit(),'scanner deadline frame')
+        deadline=int(line[len(prefix):]);mark=f'CNOW\t{op}\t'.encode()
+        pos=remain.find(mark);need(pos>0,'scanner footer missing')
+        native,remain=remain[:pos],remain[pos:]
+        rows=self.a._native_records(native,op,deadline,'e5-native-occupancy-v1');last=rows[-1]
+        need(last.get('complete') is True and last.get('event')=='RESULT' and last.get('unknown')==[],
+             'full occupancy incomplete')
+        need(all(type(last.get(k))is int and last[k]>=0 for k in
+                 ('processes','fds','namespaces','loops','tree_entries','read_bytes')) and
+             last['processes']>0 and last['namespaces']>0,'full occupancy coverage')
+        line,sep,remain=remain.partition(b'\n');value=line[len(mark):]
+        need(sep and line.startswith(mark) and re.fullmatch(rb'[0-9]+(?:\.[0-9]+)?',value),'fresh clock')
+        now=int(float(value)*1000)
+        need(remain==f'CEND\t{op}\t{self.a.boot_id}\n'.encode(),'guard boot/footer')
+        need(0<now<=deadline+1000,'scanner clock scope')
+        return {'deadline_ms':now+5000,'programs':programs,'scanner':last,'clock_ms':now}
+
+    def preflight(self):
+        self.a._enabled();need(self.a._part is None,'not a nested preflight')
+        op=uuid.uuid4().hex;script=self.a._locked()
+        for key,path,item in (('scanner',self.a.remote_scanner,self.a.scanner),('io',self.a.remote_io,self.a.io_helper)):
+            need(self.a._check_path(path)=='f','fixed program path')
+            script+=self.program_script(key,path,item,op)
+        script+=(f'scan_deadline=$({BB} awk \'{{printf "%.0f",$1*1000+5000}}\' /proc/uptime)\n'
+                 f'printf "CDEADLINE\\t{op}\\t%s\\n" "$scan_deadline"\n'
+                 f'{self.a.remote_scanner} scan {self.a.txid} {self.a.boot_id} {op} "$scan_deadline"\n'
+                 f'printf "CNOW\\t{op}\\t"; {BB} awk \'{{print $1}}\' /proc/uptime\n'
+                 f'printf "CEND\\t{op}\\t%s\\n" "$(cat /proc/sys/kernel/random/boot_id)"\n')
+        cap=self.a.scanner.size+self.a.io_helper.size+65536
+        return self.a._request('stage-combined-preflight',script,limit=cap,op_id=op,
+                               validator=lambda raw:self.parse_preflight(raw,op))
+
+    def readback_script(self,name,offset,length,op):
+        need(name in ALLOWED and offset%CHUNK==0 and 0<length<=CHUNK,'fixed readback range')
+        path=self.a.path('stage')+'/'+name;fmt=self.api.STAT_FORMAT;dev,ino=self.identity
+        need(self.a._check_path(path)=='f','fixed staged readback')
+        checks=(self.a._locked()+f'test ! -L {self.a.path("stage")}; test -d {self.a.path("stage")}\n'
+                f'test "$(stat -c \'%d %i\' {self.a.path("stage")})" = \'{dev} {ino}\'\n'
+                f'test ! -L {path}; test -f {path}; test "$(readlink -f {path})" = {path}\n'
+                f'test "$(stat -c %h {path})" = 1\n')
+        dd=f'{BB} dd if={path} bs=4096 skip={offset//4096} count={length} iflag=count_bytes status=none'
+        return (checks+f'printf "CDATA\\t{op}\\t"; stat -c \'{fmt}\' {path}\n'+dd+'\n'+
+                f'printf "\\nCMID\\t{op}\\t"; stat -c \'{fmt}\' {path}\n'+checks+
+                f'printf "CDIGEST\\t{op}\\t"; '+dd+f' | {BB} sha256sum\n'+checks+
+                f'printf "CVERIFY\\t{op}\\t%s\\t" "$(cat /proc/sys/kernel/random/boot_id)"; stat -c \'{fmt}\' {path}\n')
+
+    def parse_readback(self,raw,op,payload,ack,mode='600'):
+        line,sep,rest=raw.partition(b'\n');prefix=f'CDATA\t{op}\t'.encode()
+        need(sep and line.startswith(prefix),'readback first metadata')
+        before=self.api.parse_stat(line[len(prefix):]);data=rest[:len(payload)];rest=rest[len(payload):]
+        need(data==payload,'full chunk bytes differ')
+        line,sep,rest=rest.partition(b'\n');need(sep and line==b'','readback separator')
+        line,sep,rest=rest.partition(b'\n');prefix=f'CMID\t{op}\t'.encode()
+        need(sep and line.startswith(prefix) and self.api.parse_stat(line[len(prefix):])==before,'readback middle identity')
+        line,sep,rest=rest.partition(b'\n')
+        need(sep and line==f'CDIGEST\t{op}\t{sha(payload)}  -'.encode(),'second physical read SHA differs')
+        line,sep,rest=rest.partition(b'\n');prefix=f'CVERIFY\t{op}\t{self.a.boot_id}\t'.encode()
+        need(sep and line.startswith(prefix) and not rest and
+             self.api.parse_stat(line[len(prefix):])==before,'readback final identity/boot')
+        need(before['type']=='f' and before['nlink']==1 and before['dev']==self.identity[0] and
+             before['inode']==ack['inode'] and before['bytes']==ack['size'] and
+             before['uid']==before['gid']==0 and before['mode']==mode,'readback ACK identity/length/mode')
+        return ack
+
+    def write(self,name,item,offset,payload,inode):
+        need(DEVICE_APPEND_ENABLED,'DEVICE_APPEND_DISABLED')
+        need(name in ALLOWED and type(offset)is int and offset%CHUNK==0 and 0<len(payload)<=CHUNK and
+             offset+len(payload)<=item.size and (offset==0)==(inode==0),'4MiB append scope')
+        need(len(payload)==min(CHUNK,item.size-offset),'exact native chunk length')
+        guard=self.preflight();deadline=guard['deadline_ms'];op=uuid.uuid4().hex;d1,d2=self.identity
+        script=self.a._locked()+f'{self.a.remote_io} write-file {self.a.txid} {self.a.boot_id} {op} {deadline} {d1} {d2} {inode} {offset} {len(payload)} {item.size} {name}\n'
+        def parse(raw):
+            rows=self.a._native_records(raw,op,deadline)
+            need(len(rows)==2 and rows[0].get('event')=='START' and rows[0].get('action')=='write-file','native START')
+            ack=rows[-1]
+            need(ack.get('event')=='DONE' and ack.get('ok') is True and ack.get('action')=='write-file' and
+                 ack.get('offset')==offset and ack.get('bytes')==len(payload) and ack.get('total')==item.size and
+                 ack.get('size')==offset+len(payload) and ack.get('dev')==d1 and
+                 type(ack.get('inode'))is int and ack['inode']>0 and (inode==0 or ack['inode']==inode) and
+                 ack.get('fsync_completed') is True,'native exact append/fsync ACK')
+            return ack
+        def follow(ack):
+            self.a._request('stage-combined-double-readback',self.readback_script(name,offset,len(payload),op),
+                limit=len(payload)+8192,op_id=op,
+                validator=lambda raw:self.parse_readback(raw,op,payload,ack,'700' if name=='fscrypt-probe' else '600'))
+            return ack
+        return self.a._request('write-stage-chunk',script,payload=payload,limit=8192,
+                               validator=parse,mutating=True,followup=follow,op_id=op)

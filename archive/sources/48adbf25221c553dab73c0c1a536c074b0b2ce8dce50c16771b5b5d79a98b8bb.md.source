@@ -1,0 +1,29 @@
+# Scanner starttime compatibility fix — preparation only
+
+This is an independent, default-disabled candidate. It does not replace the frozen v3 source, uploaded helpers, host uncertainty markers, or any device data. No live candidate is produced. Its CLI is unchanged:
+
+```text
+scan TXID BOOT_UUID OPID32 DEADLINE_BOOTTIME_MS
+```
+
+Production keeps `DEVICE_EXECUTION_ENABLED=0` and exits before device inspection. HOST_TEST accepts only the canonical dedicated `/tmp/e5-native-test-*/sandbox` fixture root (including the macOS `/private/tmp` spelling), never `/data`. Linux static ARM64 build evidence and independent review are bound by the final delivery manifest; Mac test success alone is not an ARM or hardware result.
+
+## Change
+
+Observed target `/proc/PID/stat` field22 is an unsigned number; zero is legal for sufficiently early processes. `have_start` now records successful field parsing separately from its numeric value, alongside required state and flags. All target PIDs, including init and early kernel threads, may retain zero. No PID is skipped and no FD, cwd/root, mount namespace, global loop or protected-tree check is bypassed. Missing/truncated fields, negative/overflow/nondecimal values, invalid PID, malformed comm delimiters and invalid state remain fail-closed. The state field now rejects unknown letters in addition to the previous single-character check; comm with spaces and nested/right parentheses is handled through the final closing delimiter.
+
+Native self identity is a distinct contract: after collecting its own stat, main rejects `self_start==0`. This scanner is launched well after the boot observation window. The fix does not weaken native START identity or deadlines. The same target starttime is still compared after the PID scan and in the final identity pass, alongside the existing namespace/boot/process-set checks. All uncertainty, natural-disappearance, signal and bounded-read rules remain.
+
+The JSONL schema remains `e5-native-occupancy-v1`; every record adds static-string `subphase` and `detail` fields. These locate initial/post/final stat and namespace, mountinfo, cwd, root, FD, and native-self parsing. Existing field names and success meanings are unchanged. `detail` distinguishes stat-read/format/pid/state/flags/starttime/required-fields and path-related failures. Failure still returns70/complete=false; a successful complete result is never an atomic-snapshot or future-nonuse guarantee.
+
+Limits remain MAX_PIDS4096, MAX_FDS131072, MAX_NS256, MAX_TREE1024, total reads32MiB, mountinfo1MiB, tree depth16, loops128, native supplied deadline at most7000ms. The caller's existing shorter per-call budget is not extended. SIGTERM/INT/HUP/PIPE installation checks, cancellations and short-deadline behavior are retained. Production has no subprocess, network, file write, removal or rename path. HOST_TEST-only alternate static records let tests exercise second/final identity changes without the scanner writing even its fixture filesystem.
+
+## Verification
+
+Mac suite: 57 tests, comprising all original35 test-method ASTs unchanged plus22 new tests. New coverage includes PID1 and nonPID1 zero values, early kernel zero with/without fs, actual namespace/FD coverage counters, protected FD/mount/cwd/root/inode-alias rejection with zero start, missing FD identity, malformed/negative/overflow/missing fields, comm parentheses, second and final start/namespace drift, separate native-self-zero refusal and failure subphase assertions. The compiler and confined HOST_TEST executables are the only subprocesses allowed by the test audit hook; network/other process execution is blocked. The production-disabled host binary is checked only for its immediate disabled refusal.
+
+The first real failure had PID1/EPROTO and299 extra read bytes, but its `/proc/1/stat` was not retained. Prior20 synthetic comparisons proved the bug, not that this was the sole real failure cause. This57-test repair validates the general parser behavior and preserved checks; it does not establish Android scan throughput, process-race success, D-state cancellation, or hardware compatibility. A different fail-closed condition may surface when a later separately approved tool is tested.
+
+## Deployment boundary
+
+No environment or CLI can enable this candidate. A future deployment needs explicit reviewed enablement, fixed source/binary/hash changes, a controlled uploaded-scanner replacement or new-path procedure, independent readback and treatment of the existing UNKNOWN state. The already successful provisioning of old helpers must not be replayed or overwritten blindly. This candidate does not clear barriers or authorize directory changes, B/misc writes, reboots or recovery. The recovery tooling is a separate owned task and must bind this final disabled artifact only as preparation evidence, not as proof of a real scan.

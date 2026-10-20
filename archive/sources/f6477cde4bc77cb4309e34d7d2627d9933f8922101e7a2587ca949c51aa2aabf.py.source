@@ -1,0 +1,145 @@
+"""Host-only proof of the fixed all-ACK staging checkpoint and prefix.
+
+No phone query or data write. Settlement only archives the exact host lock
+refusal; fresh device checks and complete prefix reads are still mandatory.
+"""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import sys
+
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+RUN=ROOT/'evidence/author-lock-lineage-install-20261020'
+CORE=ROOT/'tools/e5_nextphase_core_live_265962d3c1cdbde8'
+TX='314ff262fa18c842';BOOT='00000000-0000-4000-8000-000000000001'
+STATE=ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+LEDGER=ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+CLOSURE=ROOT/'tools/e5_lock_lineage_stop_live_20261020/closure.py'
+CLOSURE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+
+
+def need(ok,why):
+    if not ok:raise RuntimeError(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def bind(p):return {'path':str(p),'sha256':sha(p.read_bytes())}
+def pin(p):return {'bytes':p.stat().st_size,'sha256':sha(p.read_bytes())}
+def obj(p):return json.loads(p.read_bytes())
+def load(name,p):
+    s=importlib.util.spec_from_file_location(name,p);m=importlib.util.module_from_spec(s);sys.modules[name]=m;s.loader.exec_module(m);return m
+def api():
+    need(sha(CLOSURE.read_bytes())==CLOSURE_SHA,'closure source')
+    return load('_prefix_closure',CLOSURE)
+def sources():
+    family=obj(RUN/'FAMILY.json');fpath=Path(family['result']['path'])
+    need(sha(fpath.read_bytes())==family['result']['sha256'],'family pin')
+    f=obj(fpath)
+    for item in f['files'].values():
+        p=Path(item['path']);need(not p.is_symlink() and pin(p)=={k:item[k] for k in ('bytes','sha256')},'source drift')
+    sys.path.insert(0,str(CORE))
+    p=load('_prefix_phase_proof',CORE/'phase_evidence.py')
+    a=load('_prefix_adapter',CORE/'android_directory_adapter.py')
+    d=a.AndroidDirectoryAdapter.__new__(a.AndroidDirectoryAdapter)
+    d.txid=TX;d.boot_id=BOOT;d.lock='/data/local/tmp/e5-clean-directory.lock'
+    return f,p,a,d
+
+
+def replay():
+    f,p,a,d=sources();base=RUN/'stage-execution';transport=base/'transport'
+    need(not (STATE/'ACTIVE.json').exists() and not (base/'COMPLETE.json').exists(),'active/completed stage')
+    stop=obj(base/'STOP.json');uncertainty=obj(STATE/'UNCERTAIN.json')
+    need(stop['phase']=='stage' and stop['no_retry_or_cleanup'] is True and
+         stop['reason']=='[Errno 35] Resource temporarily unavailable','fixed planned lock stop')
+    need(uncertainty['reason']=='BlockingIOError: '+stop['reason'] and uncertainty['txid']==TX and
+         uncertainty['boot_id']==BOOT and uncertainty['evidence_directory']==str(transport) and
+         uncertainty['remote_completion_proven'] is False,'fixed host refusal marker')
+    checkpoint=ROOT/'tools/e5_stage_checkpoint_prepare_20261020'
+    review=obj(checkpoint/'REVIEW.json')
+    need(sha((checkpoint/'checkpoint_enabled.py').read_bytes())==review['enabled_sha256'],'checkpoint controller source')
+    error=(checkpoint/'EXECUTION.stderr').read_text()
+    need('RuntimeError: unexpected worker stop' in error and 'line 95' in error,'controller stopped at final format assertion')
+    stage_error=(RUN/'stage.log').read_text()
+    need('fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)' in stage_error and stage_error.rstrip().endswith('BlockingIOError: '+stop['reason']),
+         'worker stopped before next dispatch at serial lock')
+    rows=p.transport_proof(transport,'DEVICE_SERIAL_REDACTED',TX,BOOT)
+    need(len(rows)==506,'fixed completed request set')
+    for row in rows:
+        q=row['folder']/'COMPLETE.json'
+        need(q.read_bytes()==(STATE/'completed'/(row['begin']['op_id']+'.json')).read_bytes(),'shared completion drift')
+    writes=[row for row in rows if row['begin']['mutating']]
+    need(len(writes)==55 and writes[0]['begin']['label']=='bounded-create-stage' and
+         all(x['begin']['label']=='write-stage-chunk' for x in writes[1:]),'known create and54 exact appends only')
+    create=writes[0]
+    part=create['folder']/'part-002-bounded-stage-readback/stdout.bin'
+    fields=part.read_bytes().split();need(len(fields)==5 and fields[2:]==[b'0',b'0',b'700'],'stage creation readback')
+    stage_identity=tuple(map(int,fields[:2]))
+    staged='/data/e5linux.stage.'+TX
+    material=obj(CORE/'SOURCE_MANIFEST.json');inputs=material['stage_inputs']
+    expected={};wire_payload=0
+    for row in writes[1:]:
+        b=row['begin'];native=[json.loads(line) for line in row['raw'].splitlines()]
+        need(len(native)==2 and native[0]['event']=='START' and native[-1]['event']=='DONE','native complete sequence')
+        ack=native[-1];need(ack['ok'] is True and ack['fsync_completed'] is True and ack['action']=='write-file','native file fsync')
+        need(all(v['op_id']==b['op_id'] and v['txid']==TX and v['boot_id']==BOOT for v in native),'native identity')
+        # The mutating command must be the unchanged native writer with exactly
+        # the original adapter guard and lock guard, with no additional shell.
+        command=shlex.split(b['argv'][-1]);need(len(command)==3 and command[:2]==[a.SU,'-c'],'fixed su command')
+        body=command[2];prefix=d._guard()+d._locked();need(body.startswith(prefix),'unchanged root/file guard')
+        line=body[len(prefix):];tokens=shlex.split(line)
+        need(len(tokens)==13 and tokens[:4]==['/data/local/tmp/e5-clean-io.'+TX,'write-file',TX,BOOT] and
+             tokens[4]==b['op_id'] and line.endswith('\n') and '\n' not in line[:-1],'single unchanged native append')
+        deadline,dev,stage_ino,inode,offset,length,total=map(int,tokens[5:12]);name=tokens[12]
+        need(name in inputs and (dev,stage_ino)==stage_identity and total==inputs[name]['bytes'] and
+             length==min(4<<20,total-offset) and offset%(4<<20)==0,'fixed candidate range')
+        previous=expected.get(name)
+        need(offset==(previous['bytes'] if previous else 0) and inode==(previous['inode'] if previous else 0),
+             'prefix gap/overwrite or inode drift')
+        source=Path(inputs[name]['path'])
+        with source.open('rb') as stream:stream.seek(offset);data=stream.read(length)
+        need(len(data)==length and sha(data)==b['payload_sha256'] and b['payload_bytes']==length,'payload/local source binding')
+        need(ack['deadline_ms']==deadline and ack['offset']==offset and ack['bytes']==length and
+             ack['total']==total and ack['dev']==dev and ack['size']==offset+length and ack['inode']>0 and
+             (inode==0 or ack['inode']==inode),'native exact prefix ACK')
+        parts=sorted(row['folder'].glob('part-*/IN_FLIGHT.json'))
+        need(len(parts)==2,'two independent write readbacks')
+        metas=[]
+        for part,hash_only in zip(parts,(False,True)):
+            pb=obj(part);raw=(part.parent/'stdout.bin').read_bytes();head,sep,rest=raw.partition(b'\n')
+            hf=head.split(b'\t',6);n=68 if hash_only else length;payload,tail=rest[:n],rest[n:]
+            tf=tail[1:-1].split(b'\t',6)
+            need(sep and tail.startswith(b'\nEND\t') and tail.endswith(b'\n') and hf[1:]==tf[1:] and
+                 hf[2:6]==[BOOT.encode(),(staged+'/'+name).encode(),str(offset).encode(),str(length).encode()],
+                 'readback range/boot/metadata frame')
+            meta=a.parse_stat(hf[6]);need(meta['inode']==ack['inode'] and meta['dev']==dev and
+                 meta['bytes']==offset+length and meta['type']=='f' and meta['nlink']==1,'readback ACK metadata')
+            need(pb['label']==('hash-chunk' if hash_only else 'read-chunk'),'readback operation order')
+            need(payload==(sha(data)+'  -\n').encode() if hash_only else payload==data,'readback data/independent hash')
+            metas.append(meta)
+        need(metas[0]==metas[1],'readback metadata drift')
+        expected[name]={'bytes':offset+length,'inode':ack['inode'],'dev':dev,'meta':metas[0],
+                        'total':total,'source':inputs[name]}
+        wire_payload+=length
+    need(wire_payload==208178731,'known acknowledged prefix bytes')
+    need(sha(LEDGER.read_bytes())=='0000000000000000000000000000000000000000000000000000000000000000','no boot writer invoked')
+    files={str(q.relative_to(ROOT)):pin(q) for q in base.rglob('*') if q.is_file()}
+    for q in (RUN/'stage.log',RUN/'stage-checkpoint/INTENT.json',checkpoint/'checkpoint_enabled.py',checkpoint/'EXECUTION.stderr',checkpoint/'REVIEW.json'):
+        files[str(q.relative_to(ROOT))]=pin(q)
+    return {'schema':'e5-fixed-ack-prefix-checkpoint-v1','serial':'DEVICE_SERIAL_REDACTED','txid':TX,'boot_id':BOOT,
+            'stage_identity':stage_identity,'prefix':expected,'acknowledged_payload_bytes':wire_payload,
+            'all506_requests_completed':True,'stopped_before_dispatch':True,'native_writer_changed':False,
+            'source_family':bind(Path(obj(RUN/'FAMILY.json')['result']['path'])),'files':files,
+            'uncertainty':pin(STATE/'UNCERTAIN.json'),'ledger':pin(LEDGER),'fresh_prefix_read_required':True,
+            'archive_rel':'host-stage-checkpoints/'+TX,'block_writes_dispatched':False}
+
+
+def build():
+    result=replay()
+    with (HERE/'CASE.json').open('x') as stream:json.dump(result,stream,sort_keys=True,indent=2);stream.write('\n')
+    return {'case':bind(HERE/'CASE.json'),'prefix_bytes':result['acknowledged_payload_bytes']}
+
+
+if __name__=='__main__':print(json.dumps(build(),ensure_ascii=False))

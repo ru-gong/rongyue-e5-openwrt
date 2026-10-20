@@ -1,0 +1,230 @@
+"""Offline reviewed transition from UNKNOWN to one original-B/misc recovery.
+
+No device commands, CLI activation, resume, deletion, or same-boot exception.
+A fresh boot and full read-only evidence are required. Hashes bind evidence;
+they do not authenticate the reviewer or replace the user's authorization.
+"""
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import uuid
+import bounded_boot_control as boot
+
+RECOVERY_TRANSITION_DISABLED = False
+MARKERS = ('ACTIVE.json', 'UNCERTAIN.json', 'RECOVERY_ONLY.json')
+ABSENT = 'ABSENT'
+
+def require(ok, reason):
+    if not ok: raise RuntimeError(reason)
+def sha(data): return hashlib.sha256(data).hexdigest()
+def canonical(value): return json.dumps(value,sort_keys=True,separators=(',',':')).encode()
+def now(): return dt.datetime.now(dt.timezone.utc)
+def state_path(): return boot.ROOT / ('evidence/e5-clean-v3-device-state-'+boot.SERIAL)
+def ledger_path(): return boot.ROOT / ('evidence/.bounded-boot-v3-'+boot.SERIAL) / 'ledger.jsonl'
+def _directory(path):
+    p=Path(path)
+    require(p.is_absolute() and not p.is_symlink() and all(not x.is_symlink() for x in p.parents) and p.is_dir(),'unsafe state directory')
+    return p
+
+def read(path, digest=None, size=None):
+    p=Path(path)
+    require(p.is_absolute() and not p.is_symlink() and all(not x.is_symlink() for x in p.parents),'unsafe file path')
+    s=p.lstat();require(stat.S_ISREG(s.st_mode) and s.st_nlink==1,'non-singleton file')
+    if size is not None: require(s.st_size==size,'wrong file size')
+    raw=p.read_bytes()
+    require(digest is None or sha(raw)==digest,'file hash changed')
+    require(size is None or len(raw)==size,'file size changed')
+    return raw
+
+def _json(binding):
+    require(set(binding)=={'path','sha256'} and boot.valid_sha(binding['sha256']),'binding fields')
+    require(Path(binding['path']).stat().st_size<=4<<20,'oversized metadata')
+    return json.loads(read(binding['path'],binding['sha256']))
+
+def sync(path):
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+
+def save(path,value):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f:f.write(canonical(value)+b'\n');f.flush();os.fsync(f.fileno())
+    sync(path.parent)
+
+@contextlib.contextmanager
+def locked(state,global_lock=False):
+    state=_directory(state);fds=[]
+    try:
+        paths=[state/'LOCK']
+        if global_lock:paths.insert(0,boot.ROOT/'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock')
+        for p in paths:
+            fd=os.open(p,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600);fds.append(fd)
+            s=os.fstat(fd);require(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==os.getuid(),'unsafe lock')
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        yield
+    finally:
+        for fd in reversed(fds):os.close(fd)
+
+def marker_hash(path):
+    p=Path(path)
+    if not p.exists():
+        require(not p.is_symlink(),'dangling marker')
+        return ABSENT
+    return sha(read(p))
+
+def _ledger():
+    ledger=boot.Ledger();ledger.reload()
+    return ledger
+
+def observed_markers(state):
+    return {**{n:marker_hash(Path(state)/n) for n in MARKERS},'boot_ledger':marker_hash(ledger_path())}
+
+def _snapshot(rec,request,profile):
+    require(rec['schema']=='e5-boot-reconciliation-v3' and rec['serial']==boot.SERIAL and
+        rec['boot_id']==request['boot_id'] and rec['complete'] is True and rec['does_not_clear_poison'] is True,'snapshot identity')
+    stamp=dt.datetime.fromisoformat(rec['captured_at']);require(stamp.tzinfo is not None,'snapshot timezone')
+    require(0<=(now()-stamp).total_seconds()<=900,'snapshot stale')
+    required={'boot_b','misc','gpt'}|set(boot.PROTECTED)
+    require(set(rec['artifacts'])==required,'snapshot must contain all full protected raw artifacts')
+    values={}
+    for part in sorted(required):
+        entry=rec['artifacts'][part]
+        require(set(entry)=={'path','sha256','bytes'} and boot.valid_sha(entry['sha256']),'raw artifact binding')
+        size=32768 if part=='gpt' else profile['partitions'][part]['bytes']
+        require(entry['bytes']==size,'snapshot artifact dimensions')
+        raw=read(entry['path'],entry['sha256'],size)
+        if part in ('boot_b','misc'):values[part]=raw
+        else:require(sha(raw)==(profile['gpt_prefix_sha256'] if part=='gpt' else profile['protected_hashes'][part]),'protected bytes differ')
+    require(rec['hashes']==request['expected_before']=={k:sha(v) for k,v in values.items()},'fresh preimage binding')
+    original=read(request['original_misc']['path'],profile['original_misc_sha256'],boot.MISC_BYTES)
+    require(boot.outside_bc(values['misc'])==boot.outside_bc(original),'misc outside32 differs')
+    require(rec['protected_match'] is True and rec['misc_outside_original_match'] is True,'snapshot conclusion differs')
+    return stamp
+
+def _validated_bundle(bundle,state):
+    require(set(bundle)=={'schema','serial','context','request','reconciliation','markers','review'},'bundle fields')
+    require(bundle['schema']=='e5-uncertainty-recovery-bundle-v3' and bundle['serial']==boot.SERIAL,'bundle identity')
+    context=bundle['context'];require(set(context)=={'request_sha256','txid','boot_id'},'context fields')
+    request,profile,_,_=boot.approved_request(bundle['request']['path'],bundle['request']['sha256'])
+    require(request['mode']=='restore-original' and context=={k:request[k] for k in ('txid','boot_id')}|{'request_sha256':bundle['request']['sha256']},'only exact new original restoration')
+    require(bundle['markers']==observed_markers(state),'old uncertainty state changed')
+    ledger=_ledger();rec=_json(bundle['reconciliation'])
+    require(rec['ledger_head']==ledger.head,'ledger head differs')
+    stamp=_snapshot(rec,request,profile)
+    closure=_closure_api().transport_gate(state,ledger_path(),boot.SERIAL,context['boot_id'],context['txid'])
+    old_boots=set()
+    for name in MARKERS:
+        if bundle['markers'][name]!=ABSENT:
+            value=json.loads(read(state/name,bundle['markers'][name]))
+            require(value.get('serial')==boot.SERIAL,'old state serial differs')
+            old=value.get('boot_id') or value.get('context',{}).get('boot_id')
+            require(old is not None,'unknown previous boot; independent manual investigation required')
+            old_boots.add(old)
+    starts=[row for row in ledger.rows if row['event']=='START']
+    if ledger.poisoned():
+        require(starts,'uncertain ledger without start')
+        old_boots.add(starts[-1]['boot_id'])
+    elif not old_boots and ledger.rows:
+        # A fully written trial may fail only after boot. Its clean COMPLETE
+        # ledger is evidence, not a reason to invent an UNKNOWN marker. Admit
+        # only a distinct boot and a new reviewed original-restoration request.
+        require(ledger.rows[-1]['event']=='COMPLETE' and starts,
+                'normal restoration requires completed prior transaction')
+        old_boots.add(starts[-1]['boot_id'])
+    old_boots.update(closure['excluded_boot_ids'])
+    require(old_boots and context['boot_id'] not in old_boots,'a newly observed Android boot is required; no same-boot retry')
+    require(not any(x.get('txid')==context['txid'] for x in ledger.rows),'transaction replay')
+    proposal={k:v for k,v in bundle.items() if k!='review'}
+    review=_json(bundle['review'])
+    require(review=={'schema':'e5-uncertainty-recovery-review-v3','serial':boot.SERIAL,
+        'proposal_sha256':sha(canonical(proposal)),'decision':'NEW_ORIGINAL_RECOVERY_ONLY_NO_REPLAY'},'independent recovery review differs')
+    # The boot engine independently validates its reconciliation/review binding.
+    boot._recovery_gate(request,ledger,context['request_sha256'])
+    return context,stamp
+
+def stage(bundle_path,bundle_sha):
+    """Host-only barrier transition, disabled until separately reviewed execution."""
+    require(not RECOVERY_TRANSITION_DISABLED,'RECOVERY_TRANSITION_DISABLED: preparation only')
+    state=_directory(state_path());bundle=_json({'path':str(bundle_path),'sha256':bundle_sha})
+    with locked(state,True):
+        require(not (state/'RECOVERY_LIFECYCLE_TRANSITION.json').exists() and not (state/'RECOVERY_LIFECYCLE_TRANSITION.json').is_symlink(),'torn grant transition; manual host evidence reconciliation required')
+        context,stamp=_validated_bundle(bundle,state)
+        archive=state/('recovery-evidence-'+uuid.uuid4().hex);archive.mkdir(mode=0o700);sync(state)
+        save(archive/'bundle.json',bundle)
+        grant={'schema':'e5-recovery-only-v3','serial':boot.SERIAL,'boot_id':context['boot_id'],
+            'context':context,'bundle_path':str(archive/'bundle.json'),'bundle_sha256':sha((archive/'bundle.json').read_bytes()),
+            'source_bundle_sha256':bundle_sha,'archive':str(archive),'markers':bundle['markers'],
+            'expires_at':(stamp+dt.timedelta(seconds=900)).isoformat(),'allowed_mutations':['write-boot_b','write-misc32'],
+            'automatic_resume':False}
+        # Pending blocks all new writers BEFORE any old barrier is moved.
+        save(state/'RECOVERY_LIFECYCLE_TRANSITION.json',grant)
+        for name in MARKERS:
+            if bundle['markers'][name]!=ABSENT:
+                require(marker_hash(state/name)==bundle['markers'][name],'marker changed during archive')
+                os.rename(state/name,archive/name);sync(archive);sync(state)
+        require(not (state/'RECOVERY_ONLY.json').exists(),'recovery destination unexpectedly present')
+        os.rename(state/'RECOVERY_LIFECYCLE_TRANSITION.json',state/'RECOVERY_ONLY.json');sync(state)
+        validate_context(state,boot.SERIAL,context)
+        return context
+
+def validate_context(state,serial,context):
+    """Called while transport lock is held; never clears a barrier."""
+    state=_directory(state)
+    require(state==state_path() and serial==boot.SERIAL,'fixed recovery state path/serial')
+    require(not (state/'RECOVERY_LIFECYCLE_TRANSITION.json').exists() and not (state/'RECOVERY_LIFECYCLE_TRANSITION.json').is_symlink(),'unfinished recovery transition')
+    _closure_api().transport_gate(state,ledger_path(),serial,context['boot_id'],context['txid'])
+    grant=json.loads(read(state/'RECOVERY_ONLY.json'))
+    require(grant['schema']=='e5-recovery-only-v3' and grant['serial']==serial and grant['context']==context,'recovery context mismatch')
+    require(set(context)=={'request_sha256','txid','boot_id'} and boot.valid_sha(context['request_sha256']),'invalid recovery context')
+    require(now()<dt.datetime.fromisoformat(grant['expires_at']),'recovery context expired')
+    require(grant['allowed_mutations']==['write-boot_b','write-misc32'] and grant['automatic_resume'] is False,'recovery scope changed')
+    bundle=json.loads(read(grant['bundle_path'],grant['bundle_sha256']))
+    require(bundle['context']==context and bundle['markers']==grant['markers'],'archived grant binding changed')
+    for name in MARKERS:
+        expected=grant['markers'][name]
+        require(marker_hash(Path(grant['archive'])/name)==expected,'old uncertainty evidence changed')
+    return grant
+
+def finish(state,context,result_path,result_sha):
+    """Only a full original-B/misc verified result releases recovery-only state."""
+    with locked(state):
+        grant=validate_context(state,boot.SERIAL,context)
+        require(all(marker_hash(Path(state)/n)==ABSENT for n in ('ACTIVE.json','UNCERTAIN.json')),'recovery has unresolved operation')
+        result=json.loads(read(result_path,result_sha));p=boot.profile()
+        require(result['schema']=='e5-bounded-boot-result-v3' and result['txid']==context['txid'] and
+            result['request_sha256']==context['request_sha256'] and result['complete'] is True and
+            result['boot_b_sha256']==p['original_boot_b_sha256'] and result['misc_sha256']==p['original_misc_sha256'] and
+            result['reboot_performed'] is False and result['boot_a_written'] is False,'original recovery not proven')
+        out=Path(result_path).parent
+        read(out/'boot_b.readback.bin',p['original_boot_b_sha256'],boot.BOOT_BYTES)
+        read(out/'misc.readback.bin',p['original_misc_sha256'],boot.MISC_BYTES)
+        ledger=_ledger()
+        require(not ledger.poisoned() and ledger.rows and ledger.rows[-1]['txid']==context['txid'] and
+            ledger.rows[-1]['result_sha256']==result_sha,'recovery ledger not complete')
+        archive=Path(grant['archive'])
+        save(archive/'RECOVERY_COMPLETED.json',{'context':context,'result_path':str(result_path),'result_sha256':result_sha,'ledger_head':ledger.head})
+        os.rename(Path(state)/'RECOVERY_ONLY.json',archive/'COMPLETED_RECOVERY_ONLY.json');sync(archive);sync(Path(state))
+
+
+# Fixed host-only closure support. This gate never clears an operation marker.
+def _closure_api():
+    import hashlib as _h, stat as _s, types as _t
+    _p = Path('/REDACTED_HOST_PATH')
+    if _p.is_symlink() or any(x.is_symlink() for x in _p.parents):
+        raise RuntimeError('unsafe fixed closure source')
+    _before = _p.stat(); _raw = _p.read_bytes(); _after = _p.stat()
+    _identity = lambda s: (s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+    if not (_s.S_ISREG(_before.st_mode) and _before.st_nlink == 1 and
+            _identity(_before) == _identity(_after) and _h.sha256(_raw).hexdigest() == '0000000000000000000000000000000000000000000000000000000000000000'):
+        raise RuntimeError('fixed closure source pin changed')
+    _m = _t.ModuleType('_e5_fixed_readonly_closure'); _m.__file__ = str(_p)
+    exec(compile(_raw,str(_p),'exec'),_m.__dict__)
+    return _m
+
+if __name__=='__main__':
+    raise SystemExit('Preparation-only library; no device operations or CLI enable switch.')

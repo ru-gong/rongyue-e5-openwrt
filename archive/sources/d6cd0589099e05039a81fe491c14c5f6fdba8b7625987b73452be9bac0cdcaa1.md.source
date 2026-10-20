@@ -1,0 +1,9 @@
+# 修复交付：仅离线准备
+
+已完成目标进程 starttime=0 的通用解析修复、自身正值独立约束和 subphase/detail 诊断。原35测试方法未改，新增22项；57项在Mac与Linux HOST_TEST均通过，独立审阅者另重跑57项Mac测试并核对ARM产物/构建证据，没有阻断发现。
+
+本目录提供默认禁用、静态AArch64的 `native_occupancy_scanner.aarch64.DISABLED`（640120B，SHA256 `0000000000000000000000000000000000000000000000000000000000000000`）。文件权限0644，未运行此交付副本。生产gate仍0；优化后的禁用binary可能省去不可达扫描逻辑，disabled拒绝只证明门有效，实际逻辑由HOST_TEST测试，不能当作实机扫描成功。
+
+完整源/测试/补丁/说明在本目录；逐项来源、ARM构建与两份独审绑定在DELIVERY.json。SOURCE_MANIFEST保留较早“ARM/review pending”时点，最终状态以DELIVERY为准。构建用本机Colima已恢复Stopped。没有生成live版本，没有操作手机/USB/ADB/phoneSSH，没有改旧冻结材料、已上传助手或UNKNOWN标记。
+
+现场PID1原stat未留存，最初失败原因仍未唯一确诊。真实Android全扫描耗时、进程变化、取消遇到不可中断内核调用均未验证。部署前仍须受控启用/上传更新方案、完整读回以及已有UNKNOWN状态处理；本交付不执行或授权刷机、目录改名、B/misc写入或清除barrier。

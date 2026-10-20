@@ -1,0 +1,46 @@
+# 新候选首启：只读验收采集器（默认禁用）
+
+固定候选为 `materials/openwrt-no-auto-fsck-20261015/candidate.json`，SHA `0000000000000000000000000000000000000000000000000000000000000000`；boot 为 `0000000000000000000000000000000000000000000000000000000000000000`。这是固定作者 569 源码的本地构建，加已披露诊断长度限制和禁自动 fsck 补丁，不能称原作者发布二进制。
+
+本包从旧只读 collector 独立复制，没有修改旧文件。`collect.py` 和 `collect.sh` 内嵌 Python 完全相同，`DEVICE_IO_DISABLED = True` 在平台/设备读取前拒绝。没有 SSH、ADB、网络连接、文件上传或启用参数；未来须独立 gate-only 启用副本、重新封存 SHA 并审阅。本轮没有 E5/USB/设备 SSH/AT，也没有运行 VM。
+
+## 更新和实物来源
+
+CONTRACT 绑定新 candidate、boot 全长/56 MiB 头/60 MiB 起尾部、真实当前 device-profile 的 13 保护哈希、GPT 与几何、九 NV 物理分区。Android major/minor 不沿用到 Linux；Linux 要根据当前 sysfs 与实际块设备 rdev 匹配。
+
+新候选仍用原相同 pristine rootfs。此次在 Mac 将固定 gzip 解压到临时普通文件，完整核验 2 GiB SHA `0000000000000000000000000000000000000000000000000000000000000000`，用现成只读 ext4 reader 提取并核验实际三件 runtime 脚本和 image identity。见 `runtime-provenance.json`、`runtime-selected/`；没有 mount、journal replay 或镜像修改。
+
+实际三脚本 SHA 保持：
+
+- `/opt/e5/e5-next-boot`：`0000000000000000000000000000000000000000000000000000000000000000`
+- `/opt/e5/t551m-nv-prepare`：`0000000000000000000000000000000000000000000000000000000000000000`
+- `/opt/e5/t551m-nv-verify`：`0000000000000000000000000000000000000000000000000000000000000000`
+
+只允许执行通过哈希门的 `e5-next-boot status` 和 `python3 -B .../t551m-nv-verify`，以及固定 logread/dmesg/busybox applet 查询。**不会执行 prepare、refresh、linux/android 切换、AT、频段设置、SIM 切换、短信、重启或修复。** `-B` 与 `PYTHONDONTWRITEBYTECODE=1` 避免 Python cache 写入。
+
+## 输出与实际通过条件
+
+只向 stdout 输出 JSONL，逐项带开始/结束时间、ok/错误及实际只读观测。失败保留，不伪造通过。关键项：
+
+- `gpt-prefix`、`map:*`、`protected:*`：GPT、几何及13项完整哈希。
+- `misc-outside32-and-CRC`：完整 misc 哈希，BC32 CRC，与原件的窗外哈希。
+- `bootB-outside-diagnostic`：新候选 0–56 MiB 和 60–64 MiB 匹配；56–60 MiB 是允许变化诊断窗口。这里不声称整个 B 不变。
+- `runtime-script:*`、`release-image`：实际执行源/image identity；`next-boot-status` 应由主机核实 `default boot: android` 和预期返回 Android 的状态，非 status exit0 就算系统验收。
+- `NV-upstream-verify`：固定上游只读 verifier 返回和 stdout/stderr。
+- `NV-this-boot-source`：本 boot prepare 从物理分区记录的9项 SHA。
+- `NV-working-copy-origin`：`/opt/e5/nv/factory-sha256.json` 的9项原始来源哈希，与本 boot source 是否相同。`origin_matches_this_boot_source=false` 会保留“来源变更后保留已有隔离副本”的事实，不能冒充 fresh 安装；首个干净启动必须由主机要求这一项为 true。
+- `NV-first:<name>` / `NV-second:<name>`：九物理 NV 两遍实际 SHA、内核 ro=1、只读 ioctl、各逻辑别名指向 loop 且 backing 为 `/opt/e5/nv/<name>`。不输出 NV 原始内容、IMSI、ICCID。
+
+**必须在 Mac 把上述九项两遍 SHA、当前 boot source、首个干净启动的 origin，与紧邻写 B 之前新采的 Android 九 NV 基线逐项比较。** 历史备份、过去 Linux 的 factory manifest、collector 内置常量均不能替代这份 fresh 基线。主机还须绑定新基线的实际原始请求、当前 boot/tx、结果 SHA 和安装请求来源。collector 输出明确 `HOST_REQUIRED_NOT_PERFORMED_HERE`，不独立宣称完成此比较。
+
+已知旧环境 `/bin/busybox --list` 可能非零，这仍如实记录。任何允许的非关键诊断例外必须由主机单独说明；绝不能借此忽略保护分区、B 窗外、misc、物理 NV、来源、脚本或映射失败。JSONL summary 也明确不构成双卡/联网/SMS/长时间 F2FS 稳定性验收。
+
+本工具继承旧 collector 的固定读取与子进程行为，子进程超时为 120 秒，文本截取上限2MiB；块读取依赖实际内核返回，不宣称 D-state 可取消或断连后必已停止。由唯一主线程在已确认的新 Linux 会话中受控使用；异常应保存已返回 JSONL 并停止后续配置/试验。
+
+## SSH 身份与凭据边界
+
+干净 rootfs 初次启动可能重新生成 SSH host key。旧 `known_hosts` 的 pin、旧 root 密码/热点配置和过去 IP **都不能未经检查直接当作新会话认证事实**。host key 不匹配时停止，利用已批准可信本机/USB渠道另行核对新指纹；不得 `StrictHostKeyChecking=no`、删旧 key 接受未知 key、反复猜密码或自动复用凭据。本包不包含连接代码或密码。
+
+## 离线验证
+
+`python3 -B tools/e5_next_acceptance_prepare_20261015/test_collect.py` 21项通过：默认禁用、旧 boot 拒绝、新 boot实际字节与profile、窗外变更、CRC、origin/retained区分、源码只读、AT/prepare/refresh/reboot拒绝、脚本实物哈希和shell嵌入一致。测试在导入前拒绝全部外部进程和网络，实际命令用 mock；没有 Linux 硬件验收。

@@ -1,0 +1,192 @@
+"""Host-only four-package copy/reseal; default plan, never invokes a runtime entry."""
+import sys
+def sentinel(event, args):
+    if event.startswith(('subprocess.', 'socket.', 'os.exec', 'os.spawn', 'os.posix_spawn')) or event == 'os.system':
+        raise RuntimeError('external process/network forbidden in bundle builder')
+sys.addaudithook(sentinel)
+import ast, copy, difflib, hashlib, importlib.util, json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+BUILDER = ROOT/'tools/e5_activation_prepare_20261015/activation.py'
+BUILDER_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+BASE = ROOT/'tools/e5_activation_bundle_69b2a5b04287f071/RESULT.json'
+BASE_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+INPUTS = HERE/'INPUTS.json'
+INPUTS_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+DEST = {g:ROOT/'tools'/name for g,name in {
+    'core':'e5_nextphase_core_new_slot_prepare_v2_20261019',
+    'recovery':'e5_next_recovery_new_slot_prepare_v2_20261019',
+    'scanner':'e5_scanner_deploy_new_slot_prepare_v2_20261019',
+    'acceptance':'e5_next_acceptance_new_slot_prepare_v2_20261019'}.items()}
+GATES = {
+ 'core/android_directory_adapter.py':'DEVICE_IO_DISABLED',
+ 'core/bounded_boot_control.py':'DEVICE_IO_DISABLED',
+ 'core/uncertainty_recovery.py':'RECOVERY_TRANSITION_DISABLED',
+ 'core/directory_session.py':'DEVICE_SESSION_DISABLED',
+ 'core/bounded_stage.py':'STAGE_IO_DISABLED',
+ 'core/probe_host.py':'PROBE_IO_DISABLED',
+ 'core/workflow.py':'WORKFLOW_IO_DISABLED',
+ 'core/nv_baseline.py':'NV_IO_DISABLED',
+ 'recovery/recovery.py':'RECOVERY_IO_DISABLED',
+ 'recovery/rearm.py':'REARM_IO_DISABLED',
+ 'scanner/runner.py':'DEVICE_IO_DISABLED',
+ 'scanner/stage2_deploy.py':'DEVICE_IO_DISABLED',
+ 'acceptance/collect.py':'DEVICE_IO_DISABLED'}
+sha=lambda raw:hashlib.sha256(raw).hexdigest()
+if sha(BUILDER.read_bytes()) != BUILDER_SHA: raise RuntimeError('fixed Builder drift')
+spec=importlib.util.spec_from_file_location('_tmpfix_fixed_builder',BUILDER)
+a=importlib.util.module_from_spec(spec);spec.loader.exec_module(a)
+
+def bound(item):
+    return a.read(item['path'],item['sha256'],item.get('bytes'))
+
+def load_inputs():
+    a.need(INPUTS_SHA!='0'*64,'overlay inputs not frozen')
+    cfg=json.loads(a.read(INPUTS,INPUTS_SHA))
+    a.need(cfg['schema']=='e5-fd-object-copy-inputs-v1','input schema')
+    base=json.loads(a.read(BASE,BASE_SHA))
+    a.need(set(cfg['overlay'])=={'core/bounded_transport.py','core/bounded_boot_control.py','core/workflow.py','core/uncertainty_recovery.py','recovery/common.py','scanner/stage2_deploy.py','core/phase_evidence.py','recovery/recovery.py','core/bounded_stage.py'},'fixed nine consumer overlay files')
+    original={k:bound(v) for k,v in base['files'].items()}
+    a.need(len(original)==28,'fixed original source set')
+    files=copy.deepcopy(original)
+    for key,item in cfg['overlay'].items():
+        a.need(key in original and key.endswith('.py'),'overlay fixed Python target')
+        a.need(item['base_sha256']==sha(original[key]),'overlay base drift')
+        files[key]=bound(item)
+    for item in cfg['evidence_inputs'].values():bound(item)
+    bound(cfg['closure']);bound(cfg['closure_case'])
+    for key,relative in [('archiver_enabled','lock_archive.aarch64.ENABLED'),('scanner_enabled','native_occupancy_scanner.aarch64.ENABLED')]:
+        binary=bound(cfg[key])
+        a.need(binary[:4]==b'\x7fELF','Android ELF material required')
+        files['scanner/build/'+relative]=binary
+    a.need(b'855ae61b90f0f332' in files['scanner/build/lock_archive.aarch64.ENABLED'] and b'171634616886fc1a' not in files['scanner/build/lock_archive.aarch64.ENABLED'],'native archive fixed owner mismatch')
+    for key in ('scanner/stage2_deploy.py','core/phase_evidence.py'):
+        a.need(a.assignment(files[key],'OLD_TX')[0]=='855ae61b90f0f332','fixed successful-deployment owner required')
+    a.need(a.assignment(files['scanner/stage2_deploy.py'],'OLD_BOOT')[0]=='00000000-0000-4000-8000-000000000001','fixed stopped boot required')
+    # The reviewed Python metadata correction must be present in the overlay.
+    a.need("('tmp',2000,2000,'771')" in files['scanner/stage2_deploy.py'].decode().replace(' ',''),
+           'exact local tmp UID/GID/mode contract required')
+    a.need(files['recovery/observe.py']==original['recovery/observe.py'] and
+           files['recovery/evidence_contract.py']==original['recovery/evidence_contract.py'],
+           'cold producer and directory policy must remain byte identical')
+    return cfg,base,original,files
+
+def reseal(files,base,dest,cfg,*,disabled):
+    """Only gates, package paths, pins and manifests; behavior is supplied by pinned overlay."""
+    b=a.Builder(files,dest)
+    for key,name in GATES.items():
+        old=a.assignment(b.files[key],name)[0]
+        a.need(type(old) is bool,'literal execution gate')
+        if old!=disabled:b.set(key,name,old,disabled)
+    oldcore='tools/'+Path(base['directories']['core']).name
+    oldrec='tools/'+Path(base['directories']['recovery']).name
+    for key in ('recovery/common.py','scanner/runner.py','scanner/stage2_deploy.py'):
+        b.exact(key,oldcore,'tools/'+dest['core'].name)
+    for key in ('core/cold_bridge.py','scanner/runner.py','scanner/stage2_deploy.py'):
+        b.exact(key,oldrec,'tools/'+dest['recovery'].name)
+    for key in ('core/bounded_stage.py','core/probe_host.py'):
+        for variable,target in [('ADAPTER_SHA','android_directory_adapter'),('TRANSPORT_SHA','bounded_transport')]:
+            b.set(key,variable,a.assignment(b.files[key],variable)[0],b.digest('core/'+target+'.py'))
+    oldpins=a.assignment(b.files['recovery/common.py'],'PINS')[0]
+    pins={name:b.digest('core/'+name+'.py') for name in oldpins}
+    b.set('recovery/common.py','PINS',oldpins,pins)
+    rm=b.files_manifest('recovery/MANIFEST.json','recovery')
+    rm.update(runtime_directory=str(dest['core']),runtime_pins=pins,
+              device_io_enabled=not disabled,default_disabled=False,
+              enabled=['observe_historical_producer'] if disabled else ['observe','recovery','rearm'],
+              status='PREPARED_WRITERS_DISABLED_OBSERVER_UNCHANGED' if disabled else 'RESEALED_COPY_PENDING_REVIEW',
+              source_base_manifest=base['files']['recovery/MANIFEST.json'],
+              closure=cfg['closure'],closure_case=cfg['closure_case'],
+              field_approval_created=False,device_io_performed=False)
+    b.put('recovery/MANIFEST.json',rm)
+    b.set('core/cold_bridge.py','SOURCE_SHA256',a.assignment(b.files['core/cold_bridge.py'],'SOURCE_SHA256')[0],b.digest('recovery/evidence_contract.py'))
+    b.set('core/cold_bridge.py','DEPENDENCIES',a.assignment(b.files['core/cold_bridge.py'],'DEPENDENCIES')[0],{n:b.digest('recovery/'+n) for n in ('common.py','observe.py')})
+    sm=b.obj('scanner/ARTIFACT_MANIFEST.json')
+    sm.update(host_execution_disabled=disabled,host_source_sha256=b.digest('scanner/stage2_deploy.py'),
+              runner_source_sha256=b.digest('scanner/runner.py'),closure=cfg['closure'],closure_case=cfg['closure_case'],
+              fd_object_build=cfg['evidence_inputs']['arm_build_manifest'],
+              source_base_manifest=base['files']['scanner/ARTIFACT_MANIFEST.json'])
+    sm['source_native_build']=sm.get('source_native_build',sm['native_build'])
+    sm['native_build']=cfg['evidence_inputs']['arm_build_manifest']
+    sm['core']={n:b.binding('core/'+n) for n in sm['core']}
+    sm['cold_contract']=b.binding('recovery/evidence_contract.py')
+    sm['cold_dependencies']={n:b.binding('recovery/'+n) for n in sm['cold_dependencies']}
+    for name,relative in [('archiver','build/lock_archive.aarch64.ENABLED'),('scanner','build/native_occupancy_scanner.aarch64.ENABLED')]:
+        sm['artifacts'][name]=b.binding('scanner/'+relative,True)
+    if 'independent_review' in sm:sm['source_independent_review']=sm.pop('independent_review')
+    b.put('scanner/ARTIFACT_MANIFEST.json',sm)
+    b.exact('acceptance/collect.sh',files['acceptance/collect.py'].decode(),b.files['acceptance/collect.py'].decode())
+    am=b.files_manifest('acceptance/MANIFEST.json','acceptance')
+    am.update(default_disabled=disabled,source_base_manifest=base['files']['acceptance/MANIFEST.json'])
+    b.put('acceptance/MANIFEST.json',am)
+    cm=b.obj('core/SOURCE_MANIFEST.json')
+    cm['modules']={n:b.digest('core/'+n+'.py') for n in cm['modules']}
+    cm['deployment_manifest']=b.binding('scanner/ARTIFACT_MANIFEST.json')
+    cm['recovery_manifest']=b.binding('recovery/MANIFEST.json')
+    cm['nv_geometry']=b.binding('core/nv_geometry.json')
+    cm['artifacts']['scanner']=copy.deepcopy(sm['artifacts']['scanner'])
+    cm['closure']=cfg['closure'];cm['closure_case']=cfg['closure_case']
+    b.put('core/SOURCE_MANIFEST.json',cm)
+    b.set('core/workflow.py','MANIFEST_SHA',a.assignment(b.files['core/workflow.py'],'MANIFEST_SHA')[0],b.digest('core/SOURCE_MANIFEST.json'))
+    for key,raw in b.files.items():
+        if key.endswith('.py'):ast.parse(raw,filename=key)
+    for key in ('recovery/observe.py','recovery/evidence_contract.py','core/nv_geometry.json','acceptance/contract.json'):
+        a.need(b.files[key]==files[key],'immutable producer/policy/geometry/contract drift')
+    a.need(b.files['acceptance/collect.sh'].count(b.files['acceptance/collect.py'])==1,'embedded collector gate mismatch')
+    for key,name in GATES.items():a.need(a.assignment(b.files[key],name)[0] is disabled,'execution gate mismatch')
+    return b
+
+def publish(b,original,control,result_extra):
+    """Exclusive copies only; partial failure is preserved and marked STOP, never cleaned up."""
+    for p in [control,*b.dest.values()]:
+        a.need(not p.exists() and not p.is_symlink(),'fresh sibling output required')
+    try:
+        a.mkdir(control)
+        for p in b.dest.values():a.mkdir(p)
+        for key,raw in sorted(b.files.items()):
+            path=Path(b.path(key));parents=[];p=path.parent
+            while p not in b.dest.values() and not p.exists():parents.append(p);p=p.parent
+            for p in reversed(parents):a.mkdir(p)
+            a.write_new(path,raw)
+        for key,raw in b.files.items():a.read(b.path(key),sha(raw),len(raw))
+        diffs=[]
+        for key,raw in sorted(b.files.items()):
+            if original[key]==raw:continue
+            if key.endswith('.ENABLED'):
+                diffs.append('Binary '+key+': '+sha(original[key])+' -> '+sha(raw)+'\n')
+            else:diffs.extend(difflib.unified_diff(original[key].decode().splitlines(True),raw.decode().splitlines(True),fromfile='source/'+key,tofile='new/'+key))
+        a.write_new(control/'CHANGES.patch',''.join(diffs).encode())
+        a.write_new(control/'EDITS.json',a.encode(b.edits))
+        result={'schema':'e5-fd-object-bundle-v1','directories':{k:str(v) for k,v in b.dest.items()},
+                'files':{k:b.binding(k,True) for k in sorted(b.files)},
+                'base_result':{'path':str(BASE),'sha256':BASE_SHA},
+                'inputs':{'path':str(INPUTS),'sha256':INPUTS_SHA},
+                'device_io_performed':False,'runtime_entry_executed':False,'field_evidence_created':False,
+                'shared_state_or_ledger_modified':False,'independent_review_required':True,**result_extra}
+        a.write_new(control/'RESULT.json',a.encode(result))
+        a.write_new(control/'COMPLETE.json',a.encode({'schema':'e5-host-copy-complete-v1','result_sha256':sha(a.encode(result)),'device_execution_authorized':False}))
+        return result
+    except BaseException as exc:
+        if control.is_dir() and not (control/'STOP.json').exists():
+            a.write_new(control/'STOP.json',a.encode({'error':repr(exc),'partial_copies_invalid':True,'no_cleanup_or_retry':True}))
+        raise
+
+def build_prepare():
+    cfg,base,original,files=load_inputs()
+    b=reseal(files,base,DEST,cfg,disabled=True)
+    a.need(load_inputs()[2:]==(original,files),'inputs changed before publication')
+    # Control already contains generator/source bindings. Copies use a separate fresh receipt folder.
+    result=publish(b,original,HERE/'prepared',{'host_writes_disabled':True,'observer_bytes_preserved_enabled_not_invoked':True})
+    a.need(load_inputs()[2:]==(original,files),'inputs changed during publication')
+    return {'result':str(HERE/'prepared/RESULT.json'),'sha256':sha(a.encode(result)),'files':len(b.files)}
+
+def main(argv=None):
+    args=sys.argv[1:] if argv is None else argv
+    if args in ([],['plan']):return {'status':'PLAN_ONLY','sources_frozen':INPUTS_SHA!='0'*64,'copies_created':False,'device_io':False,'closure_not_executed':True}
+    if args==['verify-inputs']:
+        cfg,base,original,files=load_inputs();return {'verified':len(files),'copies_created':False,'device_io':False}
+    if args==['prepare']:return build_prepare()
+    raise SystemExit('plan | verify-inputs | prepare')
+if __name__=='__main__':print(json.dumps(main(),ensure_ascii=False,sort_keys=True))

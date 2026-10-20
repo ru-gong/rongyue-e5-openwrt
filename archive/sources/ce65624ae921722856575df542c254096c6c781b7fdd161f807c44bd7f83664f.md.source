@@ -1,0 +1,44 @@
+# WAN 迟到注册候选：仅离线准备
+
+这是针对第二次试启中“120 秒注册超时后，MM 才变为 home/attached，而 WAN 保持 autostart=false”的**有限恢复候选**，不是已证实的基带修复。没有设备、SSH、ADB、USB、VM 或安装入口；没有构建镜像或修改冻结原件。当前 Android 又出现 native-hang 风险，明日首先完成主代理的 Android 稳定性/恢复准入，本文不授予切系统或写入许可。
+
+## 交付和来源
+
+- [候选完整 proto（硬禁用）](/REDACTED_HOST_PATH B，SHA256 `0000000000000000000000000000000000000000000000000000000000000000`。
+- [单文件 diff](/REDACTED_HOST_PATH `0000000000000000000000000000000000000000000000000000000000000000`。
+- [实际原件](/REDACTED_HOST_PATH B，SHA256 `0000000000000000000000000000000000000000000000000000000000000000`。仅接受此 SHA；不能套用仓库模板、不同 release 或以后改过的文件。
+- 原件来自本机已有 `existing-linux-files-snapshot/e5linux.tar` 中已使用的 2 GiB `openwrt.ext4`，完整 raw SHA 为 `0000000000000000000000000000000000000000000000000000000000000000`。[提取记录](/REDACTED_HOST_PATH tar seek＋ext4 inode/extent 静态解析，未挂载、回放日志或运行目标程序。网络配置只记录 SHA，没有另导出明文。
+- [固定来源清单](/REDACTED_HOST_PATH 包模板、官方 MM 与 netifd C 源。
+
+## 修改契约
+
+仅替换 `/lib/netifd/proto/modemmanager.sh` 的 `modemmanager_set_plmn()`，在同文件前加入三个小辅助函数和硬禁用门。其他字节，尤其 APN、频段/SIM 选择、MM 二进制、原有最多三次 PDP error 28 connect 重试、bearer/IP/路由验收，都保持原件。D1 低轮询候选不合并。
+
+1. 仅 `device=unisoc-sipc`、自动 PLMN、非 `force_connection=1` 情况预读一次 D-Bus 缓存；必须只有一个 modem、plugin=unisoc、解锁状态 none、有效 modem/SIM 路径及 SIM 槽 1/2。
+2. 原有注册请求仍只执行一次，仍用 120 秒；保留完整 stdout/stderr 文本（合并后打印）与退出码。直接成功沿原路径继续。手动 PLMN/其他设备/force_connection 模式保留原失败处理。
+3. 只有非零退出且包含实际见到的 `couldn't register the modem: … Timeout was reached` 才进入迟到观察。其他错误，包括不同格式的 serial timeout，不擅自归类。
+4. 最多 12 轮，每轮只读 modem 列表与属性；间隔 5 秒，并在读取前后检查 `/proc/uptime` 的 60 秒准入窗口。命令使用 `--timeout 5`。这不是进程硬杀/硬实时上限；D-Bus 初始化、调度或阻塞可能让退出晚于窗口，不会在窗口外接受成功。未来 host 必须监督独立总截止；超时即停止后续动作并保存已有日志，不能自动重拨；停止主机命令不保证设备端进程已退出。
+5. 每次读都必须单 modem、同一 modem/SIM 路径及 primary slot；只接受 enabled/searching/registered 和 idle/searching/home、attached/detached 已知组合。读错、字段缺失/重复、未知、failed、locked、denied、roaming、多设备或身份变化立即退出 fallback。连续两次、至少间隔一次 5 秒睡眠的 `registered+home+attached` 才返回原连接流程；中间退回搜索/未附着会清零稳定计数。
+6. 观察阶段不发送 Register、AT、CFUN、reset、频段、APN 或 SIM 操作；失败仍发原 `MM_3GPP_OPERATOR_REGISTRATION_FAILED` 并 block_restart。成功只允许原流程尝试 bearer，**不声明 WAN up**，也不主动生成路由或跳过 IP 检查。
+
+缓存可能在 CP 出错后短暂滞后；同路径也不能识别每一种 MM/CP 重启。候选不读取/清除 CP 错误、不自动 reset、不屏蔽内核/SIPA/assert 日志，因此不等于检测或排除 assert。明日若有新的 DIE/assert、MM invalid、连续 AT 超时、panic 或保护异常，应停止试验并按独立准入处理，不能靠此候选继续循环连接。
+
+## 实际测试
+
+`python3 -B test_candidate.py` 运行**生成后的真实 shell 函数**，stub `mmcli`、时钟、sleep 和 netifd 通知。20 个测试通过，覆盖实际迟到轨迹、持续搜索超限、附着不足、状态回退、消失/failed/锁卡/多 modem/身份变化、读取错误、其他错误、直接成功、force/manual 原语义、deadline 与字节边界。测试没有调用真实 mmcli；子进程白名单仅主机 `/bin/sh`，它的 PATH 只有测试专用 host awk；网络 API 被 audit hook 拒绝。完整 disabled proto 退出 126，早于任何目标文件检查。独立审核另行记录。
+
+未做 native BusyBox ash/awk、实际 MM D-Bus 响应、完整 netifd 事务或蜂窝硬件验证。主机 `/bin/sh`＋awk 测试不能代替目标运行。新增样本前的两次缓存读会带来少量启动延迟；本候选也没有减少原屏幕/call/QoS 轮询。
+
+## 明日最小试验与回滚范围（设计，非执行器）
+
+优先保留已有完整 rootfs，不重擦 userdata、metadata，不换 super、内核、boot/initramfs 或 NV。经独立准入后，可将核过 hash 的**启用副本**放在独占 RAM 目录，单文件 bind 覆盖 proto 路径；只影响下一次 script 进程。源码显示 netifd 每次 setup 按 script_name 启动进程，接口显式 up 会重置 autostart；同名协议参数没变，不需要重启 MM、整个 network 或重新探测 modem。此结论来自 OpenWrt 25.12.5 netifd 源，尚未在本机验证 bind 后执行行为。
+
+必须先确认旧 setup/teardown 已结束、当前 WAN down 且无活动 bearer，保存原文件 hash/模式与挂载状态，再考虑一次显式 setup。覆盖不会改变已经运行的 shell；在 setup 尚在进行时换文件会使解释混乱，不能据 mount 成功就认定候选被执行。硬门 `E5_WAN_CANDIDATE_EXECUTION_ENABLED=0` 不能由环境覆盖，启用需独立复制、仅改 0→1、重新 hash/审阅；本目录没有自动启用程序或设备挂载命令。
+
+**对照解释必须保留：** 若迟到注册已经稳定，原 MM 的下一次注册会检查“already registered automatically”，可能直接成功。因此“覆挂后单次 ifup 通了”不证明本补丁有效；必须见原始 Timeout 和 `E5 late registration:` 两样本日志才算命中候选分支。建议先由主代理决定是否把原版的一次显式 setup 作为诊断对照，不能同时合并 D1 或改 APN/频段。
+
+一次 setup 仍执行原协议中的 enable、旧 bearer cleanup、既有配置处理和实际 simple-connect，可能发送 AT/建立数据连接。只有**新增观察部分**是缓存只读；RAM 覆盖并不使整次 ifup 无副作用。成功门仍是 connected bearer、有效 IP、WAN up、默认路由、热点客户端经蜂窝互联网验证及足够被动 CP 日志；registered/attached 不代替这些门。
+
+停止后仅在脚本不活动时解除该文件 bind，核原件 SHA 恢复；下次脚本自然使用原版。若已经开始 bearer，停止网络会有原 teardown 的断链动作，也需在批准的实验范围。重启会丢失 RAM 覆盖，但不得为了清覆盖自动重启；回 Android 的原 B＋misc32 恢复属于主代理的独立方案，不能由本工具触发。rootfs/NV 工作副本与日志保留，不把它们当成静态只读数据或擅自回滚。
+
+主机复现仅可用：`python3 -B prepare_candidate.py --out <不存在的本地目录>`。输出是 mode 0600、硬禁用的审阅文件；它不是可安装成品。

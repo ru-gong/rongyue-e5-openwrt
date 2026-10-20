@@ -1,0 +1,159 @@
+"""Host-only settlement interruption and refusal regressions."""
+import contextlib
+import copy
+import hashlib
+import json
+import shutil
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+def audit(event,args):
+    if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.fork'):
+        raise AssertionError(event)
+sys.addaudithook(audit)
+import closure as c
+
+
+def write(p,value):
+    p.parent.mkdir(parents=True,exist_ok=True)
+    p.write_bytes(c.encoded(value) if not isinstance(value,bytes) else value)
+def pin(p):return {'bytes':p.stat().st_size,'sha256':c.sha(p.read_bytes())}
+
+
+@contextlib.contextmanager
+def fixture():
+    root=Path(tempfile.mkdtemp(prefix='e5-lineage-test-')).resolve()
+    state=root/'state';state.mkdir();(state/'completed').mkdir()
+    op=root/'run/transport/000001-test';op.mkdir(parents=True)
+    (state/'PRIOR.json').write_bytes(b'prior\n')
+    boot='00000000-0000-4000-8000-000000000001';tx='9787380bd3b8610e'
+    begin={'serial':'DEVICE_SERIAL_REDACTED','txid':tx,'boot_id':boot,'op_id':'test','label':'hash-chunk',
+           'mutating':False,'payload_bytes':0,'payload_sha256':c.sha(b''),'automatic_retry':False,
+           'reconciliation_only':False,'recovery_context':None,'status':'IN_FLIGHT','deadline_seconds':8}
+    raw=b'known\n'
+    write(op/'IN_FLIGHT.json',begin)
+    write(op/'stdout.bin',raw);write(op/'stderr.bin',b'')
+    write(op/'COMPLETE.json',dict(begin,status='COMPLETE',validated=True,stdout_sha256=c.sha(raw)))
+    shutil.copyfile(op/'COMPLETE.json',state/'completed/test.json')
+    write(op/'transport-result.json',{'returncode':0,'failure':None,'host_child_reaped':True,
+           'stdin_bytes_sent':0,'stderr_bytes':0,'stdout_bytes':len(raw),'stdout_sha256':c.sha(raw),'elapsed_seconds':0.2})
+    write(state/'UNCERTAIN.json',{'status':'UNCERTAIN','txid':tx,'boot_id':boot,'serial':'DEVICE_SERIAL_REDACTED',
+          'reason':'stage2: Refusal: retained current owner/time: old_lock/mtime','automatic_retry':False,'remote_completion_proven':False})
+    write(root/'run/STOP.json',{'error':'Refusal','no_cleanup':True,'no_retry':True,'reason':'retained current owner/time: old_lock/mtime'})
+    row={'seq':0,'previous':'0'*64,'event':'COMPLETE'};row['chain_sha256']=c.sha(c.canonical(row));write(root/'ledger.jsonl',row)
+    s={'txid':tx,'boot_id':boot,'archive_rel':'archive/'+tx,'transport':'run/transport','stop':'run/STOP.json',
+       'operations':[{'folder':str(op.relative_to(root)),'op_id':'test','label':'hash-chunk'}],
+       'files':{str(p.relative_to(root)):pin(p) for p in (root/'run').rglob('*') if p.is_file()},
+       'completed_baseline':{'test.json':pin(state/'completed/test.json')},'marker':pin(state/'UNCERTAIN.json'),
+       'ledger':pin(root/'ledger.jsonl'),'fixture_barriers':{'PRIOR.json':'prior\n'}}
+    case={'state':'state','ledger':'ledger.jsonl','global_lock':'global.lock','serial':'DEVICE_SERIAL_REDACTED',
+          'current_lock_lineage':{'historical_probe':'pinned fixture'},'readonly_lock_stop':s}
+    prior={'schema':'e5-newslot-stage-stop-closure-view-v1','serial':case['serial'],'retired_txids':['855ae61b90f0f332'],
+           'excluded_boot_ids':[],'barrier':{'path':str(state/'PRIOR.json'),'sha256':c.sha(b'prior\n')}}
+    actor=c._Case(root,case,'f'*64,fixture=True,prior_view=prior)
+    try:yield actor,op
+    finally:shutil.rmtree(root)
+
+
+def repin(actor):
+    s=actor.s
+    s['files']={str(p.relative_to(actor.root)):pin(p) for p in (actor.root/'run').rglob('*') if p.is_file()}
+    s['completed_baseline']={p.name:pin(p) for p in (actor.state/'completed').iterdir()}
+    s['marker']=pin(actor.state/'UNCERTAIN.json')
+
+
+class Tests(unittest.TestCase):
+    def test_complete_readonly_stop_is_preserved_and_closed(self):
+        with fixture() as (a,op):
+            before=(a.state/'UNCERTAIN.json').read_bytes();a.close()
+            self.assertEqual((a.archive/'UNCERTAIN.json').read_bytes(),before)
+            self.assertFalse((a.state/'UNCERTAIN.json').exists())
+            self.assertTrue((a.root/'run/STOP.json').exists())
+            self.assertFalse(a.closed()['freshness_or_execution_authority'])
+
+    def test_default_gate_disabled(self):
+        self.assertFalse(c.HOST_CLOSURE_ENABLED)
+
+    def test_duplicate_close_not_replayed(self):
+        with fixture() as (a,op):
+            a.close()
+            with self.assertRaises(c.Refusal):a.close()
+
+    def test_interruptions_require_explicit_resume_and_preserve_markers(self):
+        for point in ('barrier_durable','prefix_durable','marker_archived','final_directories_synced','receipt_durable'):
+            with self.subTest(point=point),fixture() as (a,op):
+                a.fault=lambda name: (_ for _ in ()).throw(RuntimeError('interrupt')) if name==point else None
+                with self.assertRaises(RuntimeError):a.close()
+                a.fault=None
+                with self.assertRaises(c.Refusal):a.close()
+                a.close(resume=True);self.assertEqual(a.closed()['retired_txid'],a.s['txid'])
+
+    def test_missing_ack_cannot_close(self):
+        with fixture() as (a,op):
+            (op/'COMPLETE.json').unlink();repin(a)
+            with self.assertRaises(Exception):a.close()
+
+    def test_timeout_cannot_close_even_with_complete_summary(self):
+        with fixture() as (a,op):
+            v=json.loads((op/'transport-result.json').read_bytes());v['failure']='timeout';write(op/'transport-result.json',v);repin(a)
+            with self.assertRaises(c.Refusal):a.close()
+
+    def test_mutation_cannot_close(self):
+        with fixture() as (a,op):
+            for p in (op/'IN_FLIGHT.json',op/'COMPLETE.json',a.state/'completed/test.json'):
+                v=json.loads(p.read_bytes());v['mutating']=True;write(p,v)
+            repin(a)
+            with self.assertRaises(c.Refusal):a.close()
+
+    def test_payload_cannot_close(self):
+        with fixture() as (a,op):
+            for p in (op/'IN_FLIGHT.json',op/'COMPLETE.json',a.state/'completed/test.json'):
+                v=json.loads(p.read_bytes());v['payload_bytes']=1;write(p,v)
+            repin(a)
+            with self.assertRaises(c.Refusal):a.close()
+
+    def test_raw_drift_cannot_close(self):
+        with fixture() as (a,op):
+            write(op/'stdout.bin',b'drift\n');repin(a)
+            with self.assertRaises(c.Refusal):a.close()
+
+    def test_new_activity_rejected(self):
+        with fixture() as (a,op):
+            write(a.state/'completed/foreign.json',{} )
+            with self.assertRaises(c.Refusal):a.close()
+
+    def test_active_or_recovery_marker_rejected(self):
+        for name in ('ACTIVE.json','RECOVERY_ONLY.json',c.TRANSITION):
+            with self.subTest(name=name),fixture() as (a,op):
+                write(a.state/name,{})
+                with self.assertRaises(c.Refusal):a.close()
+
+    def test_foreign_barrier_not_overwritten(self):
+        with fixture() as (a,op):
+            write(a.state/c.PENDING,b'foreign\n')
+            with self.assertRaises(c.Refusal):a.close(resume=True)
+            self.assertEqual((a.state/c.PENDING).read_bytes(),b'foreign\n')
+
+    def test_prior_barrier_changes_rejected(self):
+        with fixture() as (a,op):
+            write(a.state/'PRIOR.json',b'drift\n')
+            with self.assertRaises(c.Refusal):a.close()
+
+    def test_interrupted_closure_has_no_committed_receipt(self):
+        with fixture() as (a,op):
+            a.fault=lambda name: (_ for _ in ()).throw(OSError('fsync failure')) if name=='final_directories_synced' else None
+            with self.assertRaises(OSError):a.close()
+            self.assertFalse((a.archive/c.RECEIPT).exists())
+
+    def test_transport_view_can_track_subsequent_start_without_grant(self):
+        with fixture() as (a,op):
+            a.close();rows=(a.ledger).read_bytes();last=json.loads(rows.splitlines()[-1])
+            row={'seq':1,'previous':last['chain_sha256'],'event':'START'};row['chain_sha256']=c.sha(c.canonical(row))
+            a.ledger.write_bytes(rows+c.encoded(row))
+            self.assertEqual(a.closed()['current_ledger_last_event'],'START')
+
+
+if __name__=='__main__':unittest.main(verbosity=2)

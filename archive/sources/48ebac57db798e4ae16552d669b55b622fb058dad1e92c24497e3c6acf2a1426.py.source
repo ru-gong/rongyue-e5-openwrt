@@ -1,0 +1,107 @@
+"""Host evidence and immutable v3 bindings; no device operation on import."""
+import datetime as dt
+import hashlib, importlib.util, json, os, re, sys, uuid
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+LIVE=ROOT/'tools/e5_nextphase_core_prepare_20261015'
+NATIVE_LOCAL=ROOT/'tools/e5_clean_author_live_v3_20261014/native_io.aarch64.ENABLED'
+SERIAL='DEVICE_SERIAL_REDACTED'
+STATE=ROOT/('evidence/e5-clean-v3-device-state-'+SERIAL)
+LEDGER=ROOT/('evidence/.bounded-boot-v3-'+SERIAL)/'ledger.jsonl'
+HOST_LOCK=ROOT/('evidence/.e5-clean-directory-'+SERIAL+'.lock')
+PINS={'bounded_transport':'0000000000000000000000000000000000000000000000000000000000000000','bounded_boot_control':'0000000000000000000000000000000000000000000000000000000000000000','uncertainty_recovery':'0000000000000000000000000000000000000000000000000000000000000000','android_directory_adapter':'0000000000000000000000000000000000000000000000000000000000000000'}
+ADB=Path('/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb')
+ADB_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+NATIVE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+ORIGINAL_B=ROOT/'evidence/stage2-execution-20261013/android-install-01/boot_b.before.bin'
+ORIGINAL_MISC=ROOT/'evidence/stage2-execution-20261013/android-install-01/misc.before.bin'
+MARKERS=('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','RECOVERY_PENDING.json')
+class Refusal(RuntimeError):pass
+def require(ok,why):
+ if not ok:raise Refusal(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def canonical(x):return json.dumps(x,sort_keys=True,separators=(',',':')).encode()
+def now():return dt.datetime.now(dt.timezone.utc)
+def timestamp(s):
+ v=dt.datetime.fromisoformat(s);require(v.tzinfo is not None,'timezone required');return v
+def validsha(s):return isinstance(s,str) and re.fullmatch('[0-9a-f]{64}',s) is not None
+def validboot(s):
+ require(isinstance(s,str) and str(uuid.UUID(s))==s,'boot UUID');return s
+def validtx(s):require(isinstance(s,str) and re.fullmatch('[0-9a-f]{16}',s),'tx16');return s
+def read(p,digest=None,size=None):
+ p=Path(p);require(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe path')
+ st=p.stat();require(p.is_file() and st.st_nlink==1,'single regular file required');raw=p.read_bytes()
+ require((digest is None or sha(raw)==digest) and (size is None or len(raw)==size),'hash/length differs');return raw
+def binding(p):p=Path(p);return {'path':str(p),'sha256':sha(read(p))}
+def obj(b):
+ require(isinstance(b,dict) and set(b)=={'path','sha256'} and validsha(b['sha256']),'binding fields')
+ require(Path(b['path']).stat().st_size<=4<<20,'metadata cap');return json.loads(read(b['path'],b['sha256']))
+def sync(p):
+ fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:os.fsync(fd)
+ finally:os.close(fd)
+def output(p):
+ p=Path(p);require(p.is_absolute() and p.is_relative_to(ROOT/'evidence') and not p.exists() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'new evidence output required');p.mkdir(mode=0o700);sync(p.parent);return p
+def save(p,value):
+ p=Path(p);raw=value if isinstance(value,bytes) else canonical(value)+b'\n';fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+ sync(p.parent);return binding(p)
+def ledger_rows():
+ if not LEDGER.exists():require(not LEDGER.is_symlink(),'dangling ledger');return [],'0'*64,'ABSENT'
+ raw=read(LEDGER);require(raw.endswith(b'\n') or not raw,'torn ledger');head='0'*64;rows=[]
+ for line in raw.splitlines():
+  row=json.loads(line);v=dict(row);digest=v.pop('chain_sha256');require(v['seq']==len(rows) and v['previous']==head and sha(canonical(v))==digest,'ledger chain');head=digest;rows.append(row)
+ return rows,head,sha(raw)
+def state_snapshot():
+ require(STATE.is_dir() and not STATE.is_symlink() and all(not p.is_symlink() for p in STATE.parents),'fixed shared state')
+ statebinding=obj(binding(STATE/'STATE_BINDING.json'));require(statebinding=={'schema':'e5-transport-state-v1','serial':SERIAL},'state serial')
+ markers={};boots=set();txs=set()
+ for name in MARKERS:
+  p=STATE/name
+  if not p.exists():require(not p.is_symlink(),'dangling marker');markers[name]='ABSENT';continue
+  b=binding(p);v=obj(b);require(v.get('serial')==SERIAL,'marker serial');markers[name]=b
+  boot=v.get('boot_id') or v.get('context',{}).get('boot_id');tx=v.get('txid') or v.get('context',{}).get('txid')
+  require(boot is not None,'marker missing boot');boots.add(validboot(boot))
+  if tx is not None:txs.add(validtx(tx))
+ rows,head,digest=ledger_rows();starts=[x for x in rows if x['event']=='START']
+ if starts:boots.add(validboot(starts[-1]['boot_id']))
+ txs.update(validtx(x['txid']) for x in rows if 'txid' in x)
+ return {'schema':'e5-next-state-v1','serial':SERIAL,'state_path':str(STATE),'state_binding':binding(STATE/'STATE_BINDING.json'),'markers':markers,'ledger_sha256':digest,'ledger_head':head,'ledger_rows':len(rows),'ledger_last_event':rows[-1]['event'] if rows else None,'previous_boots':sorted(boots),'used_txids':sorted(txs)}
+def assert_state(snapshot):require(snapshot==state_snapshot(),'shared state/ledger changed')
+def marker_hashes(snapshot):return {n:(snapshot['markers'][n] if snapshot['markers'][n]=='ABSENT' else snapshot['markers'][n]['sha256']) for n in MARKERS[:3]}|{'boot_ledger':snapshot['ledger_sha256']}
+def normal_state(s):
+ require(all(v=='ABSENT' for v in s['markers'].values()) and s['ledger_last_event'] in (None,'COMPLETE'),'ordinary path blocked by unresolved state')
+def recovery_state(s):require(s['markers']['RECOVERY_PENDING.json']=='ABSENT','torn transition requires separate manual reconciliation')
+def load_runtime():
+ for name,digest in PINS.items():read(LIVE/(name+'.py'),digest)
+ modules={}
+ for name in ('bounded_transport','bounded_boot_control','uncertainty_recovery'):
+  p=LIVE/(name+'.py');old=sys.modules.get(name)
+  if old is not None:require(Path(old.__file__).resolve()==p,'module conflict');module=old
+  else:
+   spec=importlib.util.spec_from_file_location(name,p);module=importlib.util.module_from_spec(spec);sys.modules[name]=module;spec.loader.exec_module(module)
+  modules[name]=module
+ return modules
+def material_check(b):
+ p=b.profile();read(ORIGINAL_B,p['original_boot_b_sha256'],b.BOOT_BYTES);read(ORIGINAL_MISC,p['original_misc_sha256'],b.MISC_BYTES);read(NATIVE_LOCAL,NATIVE_SHA);read(ADB,ADB_SHA);return p
+def backend(m,boot,tx,evidence,cancel,helper_tx,readonly=False,context=None):
+ validtx(helper_tx);t=m['bounded_transport'].BoundedTransport(evidence,STATE,SERIAL,boot,tx,cancel_event=cancel,recovery_context=context,reconciliation_only=readonly,recovery_source_sha=PINS['uncertainty_recovery'] if readonly or context else None)
+ pins={'adb':ADB_SHA,'bounded_transport':PINS['bounded_transport'],'bounded_boot_control':PINS['bounded_boot_control'],'native_sha256':NATIVE_SHA,'directory_adapter':PINS['android_directory_adapter'],'uncertainty_recovery':PINS['uncertainty_recovery']}
+ return m['bounded_boot_control'].NativeBackend(t,ADB,'/data/local/tmp/e5-clean-io.'+helper_tx,NATIVE_SHA,tx,boot,pins)
+def remaining(rec,at=None):
+ age=((at or now())-timestamp(rec['captured_at'])).total_seconds();require(0<=age<900,'fresh raw snapshot required');return 900-age
+
+def sibling(name):
+ key='_e5_next_'+name;path=HERE/(name+'.py')
+ if key in sys.modules:
+  module=sys.modules[key];require(Path(module.__file__).resolve()==path,'sibling module conflict');return module
+ spec=importlib.util.spec_from_file_location(key,path);module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module);return module
+
+def verify_manifest(expected_sha):
+ require(validsha(expected_sha),'explicit tool-manifest SHA required')
+ manifest=obj({'path':str(HERE/'MANIFEST.json'),'sha256':expected_sha})
+ require(manifest.get('schema')=='e5-next-recovery-tools-v1','tool manifest schema')
+ for name,item in manifest['files'].items():
+  require(Path(name).name==name,'manifest filename');read(HERE/name,item['sha256'],item['bytes'])
+ return manifest

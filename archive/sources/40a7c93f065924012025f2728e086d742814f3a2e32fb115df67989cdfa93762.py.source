@@ -1,0 +1,37 @@
+import datetime as dt,hashlib,importlib.util,json,tempfile,unittest
+from pathlib import Path
+from unittest.mock import patch
+import resume as r
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.t=tempfile.TemporaryDirectory();self.addCleanup(self.t.cleanup);self.p=Path(self.t.name).resolve()/'approval';self.end=dt.datetime.now(dt.timezone.utc)+dt.timedelta(hours=2)
+  self.v={'schema':'e5-fixed-stage-resume-approval-v1','case_sha256':r.CASE_SHA256,'scope':r.SCOPE,'user_confirmed':True,'confirmed_by':'user actual reply','expires_at':self.end.isoformat(),'total_seconds':3600}
+ def binding(self):self.p.write_text(json.dumps(self.v));return {'path':str(self.p),'sha256':hashlib.sha256(self.p.read_bytes()).hexdigest()}
+ def check(self):
+  with patch.object(r,'expires',return_value=self.end):return r.approval(self.binding(),object())
+ def test_disabled_continue_before_setup(self):
+  with patch.object(r,'setup',side_effect=AssertionError('must not load real case')):
+   with self.assertRaisesRegex(RuntimeError,'DISABLED'):r.execute({})
+ def test_bound_approval(self):self.assertEqual(self.check()['total_seconds'],3600)
+ def test_wrong_case(self):
+  self.v['case_sha256']='0'*64
+  with self.assertRaises(RuntimeError):self.check()
+ def test_not_confirmed(self):
+  self.v['user_confirmed']=False
+  with self.assertRaises(RuntimeError):self.check()
+ def test_wrong_scope(self):
+  self.v['scope']='WRITE_ARBITRARY'
+  with self.assertRaises(RuntimeError):self.check()
+ def test_expired(self):
+  self.v['expires_at']=(self.end-dt.timedelta(hours=3)).isoformat()
+  with self.assertRaises(RuntimeError):self.check()
+ def test_budget_too_long(self):
+  self.v['total_seconds']=5401
+  with self.assertRaises(RuntimeError):self.check()
+ def test_phase_outlives_lease(self):
+  self.v['expires_at']=(dt.datetime.now(dt.timezone.utc)+dt.timedelta(seconds=100)).isoformat()
+  with self.assertRaises(RuntimeError):self.check()
+ def test_unexpected_fields_refused(self):
+  self.v['skip_checks']=True
+  with self.assertRaises(RuntimeError):self.check()
+if __name__=='__main__':unittest.main(verbosity=2)

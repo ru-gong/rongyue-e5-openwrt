@@ -1,0 +1,109 @@
+"""Host-only copy/reseal of the fixed 208 family with lock-lineage settlement.
+
+No runtime entry, cleanup, device subprocess, network, or source overwrite.
+"""
+import sys
+def audit(event,args):
+    if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':
+        raise RuntimeError(event)
+sys.addaudithook(audit)
+import ast
+import copy
+import hashlib
+import importlib.util
+import json
+import secrets
+from pathlib import Path
+
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+GEN=ROOT/'tools/e5_new_slot_bundle_prepare_v2_20261019/build_bundle.py'
+GEN_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+BASE=ROOT/'tools/e5_activation_bundle_20890624cf33b6b6/RESULT.json'
+BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+NEW_CLOSURE=ROOT/'tools/e5_lock_lineage_stop_live_20261020/closure.py'
+OLD_CLOSURE=ROOT/'tools/e5_new_slot_stop_live_20261019/closure.py'
+OLD_CLOSURE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+OLD_CASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+INPUTS_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+sha=lambda raw:hashlib.sha256(raw).hexdigest()
+if sha(GEN.read_bytes())!=GEN_SHA:raise RuntimeError('fixed resealer source drift')
+spec=importlib.util.spec_from_file_location('_lineage_resealer',GEN)
+b=importlib.util.module_from_spec(spec);spec.loader.exec_module(b)
+a=b.a
+
+
+def load():
+    cfg=json.loads(a.read(HERE/'INPUTS.json',INPUTS_SHA))
+    base=json.loads(a.read(BASE,BASE_SHA))
+    originals={k:a.read(v['path'],v['sha256'],v['bytes']) for k,v in base['files'].items()}
+    files=copy.deepcopy(originals)
+    for key in ('closure','closure_case'):a.read(cfg[key]['path'],cfg[key]['sha256'],cfg[key]['bytes'])
+    changed={}
+    for key,raw in originals.items():
+        if not key.endswith('.py'):continue
+        new=raw
+        for old,value in ((str(OLD_CLOSURE),str(NEW_CLOSURE)),
+                          (OLD_CLOSURE_SHA,cfg['closure']['sha256']),
+                          (str(OLD_CLOSURE.parent/'CASE.json'),cfg['closure_case']['path']),
+                          (OLD_CASE_SHA,cfg['closure_case']['sha256'])):
+            new=new.replace(old.encode(),value.encode())
+        if key=='recovery/common.py':
+            value=a.assignment(new,'MARKERS')[0]
+            # Builder.set performs a parsed literal assignment, preserving all
+            # other functions. This local Builder has no publication or runtime.
+            temp=a.Builder({key:new},{'recovery':ROOT/'tools/_not_published_lineage'})
+            if 'RECOVERY_LOCK_LINEAGE_REPAIR_TRANSITION.json' not in a.assignment(new,'MARKERS')[0]:
+                temp.set(key,'MARKERS',value,value+('RECOVERY_LOCK_LINEAGE_REPAIR_TRANSITION.json',));new=temp.files[key]
+        if key=='core/uncertainty_recovery.py':
+            new=new.replace(b'RECOVERY_NEW_SLOT_REPAIR_TRANSITION.json',b'RECOVERY_LOCK_LINEAGE_REPAIR_TRANSITION.json')
+        files[key]=new
+        if new!=raw:changed[key]=sha(new)
+    a.need(set(changed)=={'core/bounded_transport.py','core/bounded_boot_control.py','core/workflow.py',
+                          'core/uncertainty_recovery.py','core/phase_evidence.py','recovery/common.py','scanner/stage2_deploy.py'},
+           'exact seven mechanical closure/case consumers')
+    for key in ('recovery/observe.py','recovery/evidence_contract.py','core/bounded_stage.py','core/nv_geometry.json',
+                'core/nv_baseline.py','acceptance/collect.py','acceptance/collect.sh','acceptance/contract.json'):
+        a.need(files[key]==originals[key],'unrelated behavior changed '+key)
+    for key in ('scanner/build/lock_archive.aarch64.ENABLED','scanner/build/native_occupancy_scanner.aarch64.ENABLED'):
+        a.need(files[key]==originals[key],'native binary changed')
+    return cfg,base,originals,files,changed
+
+
+def prepare():
+    cfg,base,original,files,changed=load()
+    dest={g:ROOT/'tools'/('e5_lock_lineage_'+g+'_prepare_20261020') for g in base['directories']}
+    built=b.reseal(files,base,dest,cfg,disabled=True)
+    result=b.publish(built,original,HERE/'prepared',{'host_writes_disabled':True,'lineage_overlay':changed})
+    return {'result':str(HERE/'prepared/RESULT.json'),'sha256':sha(a.encode(result))}
+
+
+def enable():
+    cfg,base,original,files,changed=load()
+    tests=(HERE/'TESTS.log').read_text()
+    a.need('Ran 10 tests' in tests and '\nOK\n' in tests,'copy tests')
+    a.need(json.loads((HERE/'PREPARED_SMOKE.json').read_bytes())['material_contracts']=='PASS','prepared smoke')
+    ident=secrets.token_hex(8)
+    prepared=json.loads((HERE/'prepared/RESULT.json').read_bytes())
+    copies={k:a.read(v['path'],v['sha256'],v['bytes']) for k,v in prepared['files'].items()}
+    dest={g:ROOT/'tools'/(a.DEST_STEMS[g]+ident) for g in prepared['directories']}
+    built=b.reseal(copies,prepared,dest,cfg,disabled=False)
+    review={'schema':'e5-lock-lineage-copy-review-v1','reviewer':'Primary Codex source/raw review; no separate reviewer claimed',
+            'authorization':'User: 遇到异常就修复，直至完全修复好，不要通知我。 Continue existing Mac/noTF author install within original B64MiB+misc32, retained-directory and rollback scope.',
+            'scope_unchanged':True,'prepared_result':{'path':str(HERE/'prepared/RESULT.json'),'sha256':sha((HERE/'prepared/RESULT.json').read_bytes())},
+            'only_gates_paths_pins_changed_in_enabled_copy':True,'device_io':False}
+    a.write_new(HERE/'ENABLE_REVIEW.json',a.encode(review))
+    result=b.publish(built,copies,ROOT/'tools'/('e5_activation_bundle_'+ident),
+                     {'activation_id':ident,'host_writes_disabled':False,'preparation_result':review['prepared_result'],
+                      'preparation_review':{'path':str(HERE/'ENABLE_REVIEW.json'),'sha256':sha(a.encode(review))}})
+    output={'activation_id':ident,'result':{'path':str(ROOT/'tools'/('e5_activation_bundle_'+ident)/'RESULT.json'),'sha256':sha(a.encode(result))},
+            'directories':result['directories'],'device_io':False}
+    a.write_new(HERE/'ENABLED_COPY.json',a.encode(output));return output
+
+
+if __name__=='__main__':
+    action=sys.argv[1] if len(sys.argv)>1 else 'plan'
+    if action=='plan':print(json.dumps({'device_io':False,'copies_created':False}))
+    elif action=='prepare':print(json.dumps(prepare()))
+    elif action=='enable':print(json.dumps(enable()))
+    else:raise SystemExit('plan | prepare | enable')

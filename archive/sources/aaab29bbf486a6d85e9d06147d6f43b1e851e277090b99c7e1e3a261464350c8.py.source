@@ -1,0 +1,81 @@
+import copy
+import importlib.util
+import json
+import unittest
+import build as g
+
+
+def load(name,path):
+    s=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(s);s.loader.exec_module(m);return m
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg,cls.base,cls.original,cls.files,cls.changed=g.load()
+        cls.prepared=json.loads((g.HERE/'prepared/RESULT.json').read_bytes())
+        cls.dirs={k:g.Path(v) for k,v in cls.prepared['directories'].items()}
+        cls.stage=load('_lineage_stage_guard_test',cls.dirs['scanner']/'stage2_deploy.py')
+        cls.phase=load('_lineage_phase_guard_test',cls.dirs['core']/'phase_evidence.py')
+        cls.case=cls.stage._closure_api()._load().c
+
+    def test_exact_28_files(self):self.assertEqual(len(self.prepared['files']),28)
+
+    def test_all_prepared_sources_pinned(self):
+        for item in self.prepared['files'].values():self.assertEqual(len(g.a.read(item['path'],item['sha256'],item['bytes'])),item['bytes'])
+
+    def test_all_thirteen_gates_disabled(self):
+        for key,name in g.b.GATES.items():
+            item=self.prepared['files'][key];self.assertIs(g.a.assignment(g.Path(item['path']).read_bytes(),name)[0],True)
+
+    def test_both_consumers_use_corrected_history(self):
+        expected=self.case['retained_device_state']['current_lock']
+        self.assertEqual(expected['new_lock']['mtime'],'1783278244')
+        self.assertEqual(expected['new_owner']['mtime'],'1783277865')
+        before={}
+        for role,key in (('old_lock','new_lock'),('old_owner','new_owner')):
+            before[role]=dict(expected[key],mode_bits=int(expected[key]['mode_bits'],16))
+        actor=self.stage.Stage2Deploy.__new__(self.stage.Stage2Deploy)
+        items={x['label']:x for x in self.case['retained_read_items']}
+        actor._request=lambda label,script,**kw:kw['validator'](('\n'.join(items[label]['expected_lines'])+'\n').encode())
+        records=actor._preserved_partial(before);self.assertEqual(len(records),30)
+        group=[{'begin':{'label':x['label'],'mutating':False,'payload_bytes':0,'payload_sha256':self.phase.sha(b'')},
+                'raw':('\n'.join(x['expected_lines'])+'\n').encode()} for x in self.case['retained_read_items']]
+        rows=group+[{'begin':{'label':'stage2-upload-archiver','mutating':True},'raw':b''},
+                    {'begin':{'label':'occupancy','mutating':False},'raw':b''}]+copy.deepcopy(group)
+        manifest=json.loads((self.dirs['core']/'SOURCE_MANIFEST.json').read_bytes())
+        self.assertEqual(self.phase.partial_retained_proof(rows,{'partial_deployment_preserved':records},before,manifest),records)
+
+    def test_new_snapshot_transition_is_included(self):
+        raw=self.prepared['files']['recovery/common.py'];markers=g.a.assignment(g.Path(raw['path']).read_bytes(),'MARKERS')[0]
+        self.assertEqual(len(markers),11)
+        self.assertIn('RECOVERY_NEW_SLOT_REPAIR_TRANSITION.json',markers)
+        self.assertIn('RECOVERY_LOCK_LINEAGE_REPAIR_TRANSITION.json',markers)
+
+    def test_recovery_uses_new_temporary_marker(self):
+        source=g.Path(self.prepared['files']['core/uncertainty_recovery.py']['path']).read_text()
+        self.assertEqual(source.count('RECOVERY_LOCK_LINEAGE_REPAIR_TRANSITION.json'),6)
+        self.assertNotIn('RECOVERY_NEW_SLOT_REPAIR_TRANSITION.json',source)
+
+    def test_native_payloads_unchanged(self):
+        for key in ('scanner/build/lock_archive.aarch64.ENABLED','scanner/build/native_occupancy_scanner.aarch64.ENABLED'):
+            self.assertEqual(self.original[key],g.Path(self.prepared['files'][key]['path']).read_bytes())
+
+    def test_cold_nv_and_acceptance_contracts_unchanged(self):
+        for key in ('recovery/observe.py','recovery/evidence_contract.py','core/nv_geometry.json','acceptance/contract.json'):
+            self.assertEqual(self.original[key],g.Path(self.prepared['files'][key]['path']).read_bytes())
+
+    def test_writer_logic_changes_are_only_closure_binding(self):
+        for key in ('core/bounded_boot_control.py','core/bounded_transport.py','scanner/stage2_deploy.py'):
+            expected=self.original[key].replace(str(g.OLD_CLOSURE).encode(),str(g.NEW_CLOSURE).encode()).replace(g.OLD_CLOSURE_SHA.encode(),self.cfg['closure']['sha256'].encode())
+            self.assertEqual(self.files[key],expected)
+
+    def test_retired_transaction_blocked(self):
+        c=self.stage._closure_api();v=c.normal_gate(g.ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED',g.ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl')
+        # The immutable parent parser is loaded into a new module per call;
+        # require its semantic refusal, not one particular module's class object.
+        with self.assertRaisesRegex(RuntimeError,'retired boot or transaction'):
+            c.assert_new_identity(v,'00000000-0000-4000-8000-000000000001','9787380bd3b8610e')
+
+
+if __name__=='__main__':unittest.main(verbosity=2)

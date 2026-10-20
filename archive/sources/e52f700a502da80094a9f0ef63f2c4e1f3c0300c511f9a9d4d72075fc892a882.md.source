@@ -1,0 +1,17 @@
+# 下一工具族 SIM 机械重绑定生成器（未绑定、禁用）
+
+本工具只处理 Mac 本地源文件。`COPY_DISABLED=True`，默认 `plan`，无设备或网络入口；没有新 SIM 副本、最终绑定或现场批准。旧 b56c SIM 准备目录和真实 state/ledger 均未修改。
+
+未来输入严格为四字段 JSON：schema=`e5-sim-lifecycle-rebind-input-v1`、`result`（最终四族 enabled RESULT.json 的 path/SHA）、`closure_manifest`（本次固定 lifecycle closure 清单 path/SHA）、`output_name`。输出目录必须与 RESULT 的 16hex activation_id 一致：tools/e5_sim_rearm_<id>_prepare_20261016。当前缺最终 RESULT，因此 INPUTS.UNBOUND.example.json 不可执行；不能用旧 b56c 代替。
+
+plan 验证实际 28 文件大小/SHA、四目录、core 四原语及 manifest、五份 noSIM 历史源、closure/CASE。新 common 必须含第三永久 RECOVERY_REPAIR_TRANSITION 和新临时 RECOVERY_LIFECYCLE_TRANSITION；四个状态函数 AST 必须与已审 lifecycle overlay 完全相同。observer/policy、NV geometry、acceptance contract 不允许漂移。
+
+机械输出只更新 common 的 LIVE/PINS/DEPENDENCIES_SHA、MARKERS、state_snapshot/normal_state/recovery_state/_closure_api；依赖清单从精确输入生成。八份 SIM/NV/BC32 算法文件逐字节复制 b56c，READY/LOADED、600秒/900秒和单请求6/8秒限制保持。所有设备gate继续禁用；generic restore不可用；未来唯一分区写仍p3 offset2048 32B，不写B/rootfs/NV。新closure凭据不授予现场准入。
+
+生成器开关只限制host copy；未来如经主线程批准机械启用，会新建目录，不覆盖旧目录，不自动清理/续传。manifest最后发布；失败目录不能直接当成功副本。正式生成后必须重新独审实际源差异并运行81项原业务/closure测试和本机material smoke；本次内存fixture通过不提前代替它们。
+
+现有70项回归（三份测试）输出保持原字节，11项closure/binding测试模板仅适配第三层历史和动态固定源族。`host_material_smoke.template.py`禁止外部进程、网络和真实state/ledger读写；仅导入固定材料校验，不构造backend。首次真正install/NV来源、整体无卡验收仍待现场，不生成替代凭据。
+
+本次22项host内存家族测试覆盖旧b56c拒绝、缺第三门/临时门、函数AST/pin/path漂移、八算法字节、禁用copy在校验前拒绝、最终依赖和scope。所有测试导入前禁用process/socket/真实state。tests-02.log保留早期literal空格识别错误，现改AST精确布尔读取后tests-final.log通过；tests-01.log为首次测试文件位置错误导致导入失败。没有为了测试运行实际设备程序。
+
+可只读执行 `python3 -B rebind.py plan`。测试：`python3 -B -m unittest -v test_rebind.py`。后续最终输入/独审结果请单独DELIVERY绑定，不回写本准备清单的待完成历史字段。

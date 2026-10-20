@@ -1,0 +1,201 @@
+"""Offline fixed-text/semantic tests. Never run any device artifact as a program."""
+import ast
+import copy
+import json
+from pathlib import Path
+import socket
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+NODE = '/opt/homebrew/bin/node'
+ALLOWED_NODE = [NODE, '--input-type=commonjs']
+PROCESS_EVENTS = []
+
+
+def deny_external(event, args):
+    if event.startswith('socket.') or event in {'os.system', 'os.exec', 'os.posix_spawn', 'pty.spawn'}:
+        raise AssertionError('external operation forbidden: ' + event)
+    if event.startswith('subprocess.'):
+        if event != 'subprocess.Popen' or args[0] != NODE or args[1] != ALLOWED_NODE:
+            raise AssertionError('process forbidden: ' + str(args[:2]))
+        PROCESS_EVENTS.append({'executable': args[0], 'argv': args[1], 'purpose': 'local JS semantic fixture only'})
+
+
+sys.addaudithook(deny_external)
+import prepare_candidate as c
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.inputs = c.load_inputs()
+        cls.out, cls.deletions = c.transform(cls.inputs)
+
+    def fixture(self, root):
+        for rel, data in self.inputs.items():
+            p = root / 'inputs' / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_bytes(data)
+        (root / 'source-extraction.json').write_bytes((c.HERE / 'source-extraction.json').read_bytes())
+
+    def test_exact_output_set_and_symlink_intent(self):
+        self.assertEqual(set(self.out), {c.LOADER, c.ATD, c.API, c.UI})
+        self.assertEqual(len(self.deletions), 1)
+        d = self.deletions[0]
+        self.assertEqual(d['path'], c.START_LINK)
+        self.assertEqual(d['kind'], 'symlink')
+        self.assertEqual(d['target'], '../init.d/t551m-sim-status')
+        self.assertNotIn(c.START_LINK, self.out)
+
+    def test_loader_exact_two_changes(self):
+        self.assertEqual(self.out[c.LOADER].replace(b'tx_gap_ms=300', b'tx_gap_ms=100'), self.inputs[c.LOADER])
+        self.assertEqual(self.out[c.LOADER].count(b'tx_gap_ms=300'), 2)
+        self.assertNotIn(b'tx_gap_ms=100', self.out[c.LOADER])
+
+    def test_atd_default_and_three_actual_channel_entrypoints(self):
+        changed = self.out[c.ATD]
+        self.assertEqual(changed.replace(b'gap=0.3', b'gap=0.1'), self.inputs[c.ATD])
+        tree = ast.parse(changed)
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'Channel')
+        init = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == '__init__')
+        self.assertEqual(init.args.defaults[0].value, 0.3)
+        channels = next(n for n in tree.body if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name) and n.targets[0].id == 'CHANNELS')
+        self.assertEqual(ast.literal_eval(channels.value), (2, 6, 7))
+        calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'Channel']
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([ast.unparse(a) for a in calls[0].args], ['fd'])
+        self.assertFalse(calls[0].keywords)
+
+    def test_api_changes_only_three_selected_functions(self):
+        old, new = self.inputs[c.API].decode(), self.out[c.API].decode()
+        for name in ('modem_status', 'cells', 'card_modem'):
+            new = new.replace(c.function_text(new, name), c.function_text(old, name))
+        self.assertEqual(new, old)
+        self.assertEqual(c.function_text(self.out[c.API].decode(), 'qos_status'), c.function_text(old, 'qos_status'))
+
+    def test_no_engineering_call_in_api_and_basic_getters_remain(self):
+        new = self.out[c.API]
+        self.assertNotIn(b'--get-cell-info', new)
+        self.assertIn(b'mmcli -J -m any --timeout=5 2>/dev/null', new)
+        self.assertIn(b'mmcli -J -m any --timeout=5 --signal-get', new)
+        modem = c.function_text(new.decode(), 'modem_status')
+        self.assertEqual(modem.count("'modem-d1'"), 3)
+        self.assertNotIn("'modem'", modem)
+
+    def test_ui_only_one_line_changes(self):
+        old, new = self.inputs[c.UI].decode().splitlines(), self.out[c.UI].decode().splitlines()
+        changes = [(a, b) for a, b in zip(old, new) if a != b]
+        self.assertEqual(len(old), len(new))
+        self.assertEqual(len(changes), 1)
+        self.assertIn("setText('sg-nb'", changes[0][1])
+        self.assertIn('暂停采集', changes[0][1])
+
+    def test_actual_modified_function_semantics_with_local_node(self):
+        api = self.out[c.API].decode()
+        functions = '\n'.join(c.function_text(api, name) for name in ('modem_status', 'cells', 'card_modem'))
+        ui_line = next(line for line in self.out[c.UI].decode().splitlines() if "setText('sg-nb'" in line)
+        fixture = r'''
+const assert = require('node:assert/strict');
+let calls=[], store={}, cached=null;
+const MODEM_TTL=10;
+function state_get(k, ttl) { assert.equal(k,'modem-d1'); return cached; }
+function state_put(k,v) { assert.equal(k,'modem-d1'); store[k]=v; }
+function sh_json(cmd) {
+  calls.push(cmd);
+  if (cmd === 'mmcli -J -m any --timeout=5 2>/dev/null') return {modem:{generic:{state:'connected','power-state':'on','access-technologies':['5gnr'],'signal-quality':{value:83},sim:'sim0'},'3gpp':{'operator-name':'Test carrier','registration-state':'home'}}};
+  if (cmd === 'mmcli -J -m any --timeout=5 --signal-get 2>/dev/null') return {modem:{signal:{'5g':{rsrp:-81,rsrq:-8,snr:14}}}};
+  throw Error('unexpected shell query: '+cmd);
+}
+function mm_val(v){return v??null;}
+function mm_num(v){return v==null?null:Number(v);}
+function sim_card(){return 0;}
+function readfile(){throw Error('stale path should not read per-SIM detail');}
+'''
+        assertions = r'''
+let m=modem_status();
+assert.equal(m.state,'connected'); assert.equal(m.tech,'5gnr'); assert.equal(m.registration,'home');
+assert.equal(m.signal.rsrp,-81); assert.equal(m.quality,83);
+assert.equal(m.cell,null); assert.equal(m.neighbours,null); assert.equal(m.cell_collection.enabled,false);
+assert.equal(calls.length,2); assert.deepEqual(cells(),[]); assert.equal(calls.length,2);
+const card=card_modem(m,[{stale:true,registration:'unknown',signal:{}},{}]);
+assert.equal(card.state,'connected'); assert.equal(card.tech,'5gnr'); assert.equal(card.registration,'home');
+assert.equal(card.signal.rsrp,-81); assert.equal(card.quality,83);
+assert.equal(card.status_source,'modemmanager-cache'); assert.equal(card.per_sim_status,'disabled-d1');
+cached=m; assert.equal(modem_status(),m); assert.equal(calls.length,2);
+let lang='zh', rendered=null;
+function setText(id,value){assert.equal(id,'sg-nb');rendered=value;}
+__UI__
+assert.equal(rendered,'暂停采集');
+lang='en';
+__UI__
+assert.equal(rendered,'Paused');
+m={present:false};
+__UI__
+assert.equal(rendered,'--');
+console.log('PASS: cached status, no engineering query, stale fallback and paused UI');
+'''.replace('__UI__', ui_line)
+        r = subprocess.run(ALLOWED_NODE, input=fixture+'\n'+functions+'\n'+assertions, text=True, capture_output=True, timeout=10)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('PASS:', r.stdout)
+
+    def test_every_modified_or_missing_input_is_rejected(self):
+        for key in self.inputs:
+            with self.subTest(key=key):
+                items=dict(self.inputs); items[key]+=b'\n'
+                with self.assertRaises(ValueError): c.transform(items)
+                del items[key]
+                with self.assertRaises(ValueError): c.transform(items)
+        items=dict(self.inputs); items['etc/extra']=b'anything'
+        with self.assertRaises(ValueError): c.transform(items)
+
+    def test_symlink_input_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve(); self.fixture(root)
+            p=root/'inputs'/c.LOADER; p.unlink(); p.symlink_to(c.HERE/'inputs'/c.LOADER)
+            with patch.object(c,'HERE',root), self.assertRaises(ValueError): c.load_inputs()
+
+    def test_extra_file_and_changed_provenance_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve(); self.fixture(root)
+            extra=root/'inputs'/'extra'; extra.write_bytes(b'x')
+            with patch.object(c,'HERE',root), self.assertRaises(ValueError): c.load_inputs()
+            extra.unlink(); (root/'source-extraction.json').write_bytes(b'{}')
+            with patch.object(c,'HERE',root), self.assertRaises(ValueError): c.load_inputs()
+
+    def test_offline_publish_existing_refusal_and_pinned_source_unchanged(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve(); self.fixture(root)
+            with patch.object(c,'HERE',root):
+                out=c.prepare('test-d1')
+                manifest=json.loads((out/'PREPARED.json').read_text())
+                self.assertFalse(manifest['device_entrypoint'])
+                self.assertEqual(len(manifest['replacements']),4)
+                self.assertEqual(len(manifest['deletion_intents']),1)
+                for entry in manifest['replacements']:
+                    p=out/'files'/entry['path']
+                    self.assertEqual(c.digest(p.read_bytes()),entry['sha256'])
+                    self.assertEqual(p.stat().st_mode&0o777,0o644)
+                with self.assertRaises(ValueError): c.prepare('test-d1')
+                for rel,data in self.inputs.items(): self.assertEqual((root/'inputs'/rel).read_bytes(),data)
+
+    def test_path_escape_and_results_symlink_rejected(self):
+        for name in ('../x','/tmp/x','x/y','a;true','', 'a'*49):
+            with self.assertRaises(ValueError): c.prepare(name)
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp).resolve();self.fixture(root);(root/'results').symlink_to(root/'inputs')
+            with patch.object(c,'HERE',root),self.assertRaises(ValueError): c.prepare('test')
+
+    def test_production_has_no_process_socket_device_deployment_api(self):
+        source=Path(c.__file__).read_text();tree=ast.parse(source)
+        imports={n.name.split('.')[0] for s in ast.walk(tree) if isinstance(s,(ast.Import,ast.ImportFrom)) for n in (s.names if isinstance(s,ast.Import) else [])}
+        self.assertFalse(imports&{'socket','subprocess','os','pty','serial','usb','paramiko','requests'})
+        attrs={n.func.attr for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)}
+        self.assertFalse(attrs&{'system','exec','spawn','Popen','connect','send','sendall','run','ioctl'})
+        self.assertNotIn('/dev/',source.replace('/dev/null', ''))
+
+
+if __name__=='__main__':
+    unittest.main(verbosity=2)

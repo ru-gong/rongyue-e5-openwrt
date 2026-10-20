@@ -1,0 +1,38 @@
+# 首个 OpenWrt 会话的只读证据采集
+
+仅供主代理在独立审查通过、实际进入本次 OpenWrt 后执行。这里没有连接设备的实现。此代理未运行 SSH/ADB、没有联网或启动 VM。
+
+`collect.sh` 内嵌与 `collect.py` 完全相同的 Python，通过 `/usr/bin/python3 -B -` 从 stdin 执行；无需上传临时脚本。只向 stdout 输出 JSONL，错误逐项保留，独立检查继续执行。脚本没有设备文件写入、块写、BLKROSET、配置、修复、服务重启、短信、网络设置或 reboot 命令。系统和厂商服务自身的正常后台活动不由采集器冻结。
+
+准备条件及路径：
+
+- 固定源码 `packages.list` 包含 bash/python3；实际已提取固件的 NV verify/prepare 和 next-boot 文件 SHA 是本脚本硬编码依赖，调用前再次校验。NV prepare **只作为 runpy 依赖导入**；其 main/refresh 不会执行，`__name__` 为 `<run_path>`。
+- 固定构建脚本将完整版 BusyBox 放在 `/opt/e5/bin/busybox`；OpenWrt 基础 BusyBox 为 `/bin/busybox`。采集记录两者 `--list`，随后用基础 BusyBox 的 `dmesg` applet。日志入口 `/sbin/logread`。缺文件/缺 applet/非零退出一律记失败，不下载补工具或改 PATH 配置。
+- 此处没有额外解包核这两个 BusyBox 可执行文件；路径来自固定构建源码，存在与可用性须本机实际采集确认。Python 根入口不存在时 shell 输出明确 fatal JSON 并退出 2。
+- Linux 必须 `aarch64` 且 uid 0，否则输出 fatal 并不读设备。Android 固定 serial 在报告标为“预期绑定”，不伪装成原生 Linux 实时属性。
+
+经独审通过后，主代理在 Mac 通过已确认的管理连接运行，stdout/stderr 保存到**新的主机文件**。示例（主代理控制身份验证，不在命令中写密码）：
+
+```sh
+umask 077
+ssh -T root@192.0.2.1 'sh -s' < /REDACTED_HOST_PATH > /REDACTED_HOST_PATH 2> /REDACTED_HOST_PATH
+```
+
+以上只是待执行命令；本子任务没有执行它。避免覆盖既有证据文件。记录 SSH 命令退出码；标准输出必须有完整最后一条 `id=summary`，且 expected 63 个检查记录全部出现。缺末条表示采集不完整，不能称通过；JSONL 中任何 `ok=false` 都保留实际错误、必要的观测值和起止时间。对命令失败保留 stdout/stderr/exit_code；无自动重试。
+
+采集与判定顺序：
+
+1. `uname`（Python os.uname）、OpenWrt/os-release、image-version/profile/form、cmdline、全部 mounts、kernel boot_id；本次 image-version 必须 `569f13d-dirty`、profile `e5`。mounts 由 `/proc/mounts` 读取，不调用任何挂载动作。
+2. 原始 eMMC GPT 前 32 KiB 必须与本机冻结摘要匹配；13 保护分区、misc、boot_b、userdata 的 PARTNAME、分区序号、start、size 和 BLKGETSIZE64 均匹配。Linux major/minor 可能与 Android 不同，核节点 rdev 与**本次 Linux sysfs dev**一致，不沿用 Android dev 值。
+3. 13 项保护分区（已包含 boot_a）按物理节点完整 SHA 比冻结 profile；boot_b `[0,56 MiB)` 与 `[60,64 MiB)` 比固定最终 boot，诊断 `[56,60 MiB)` 只记录 SHA、容许后台变化；不要求整个 boot_b 静态不变。
+4. misc 全长读取 1 MiB：前 2048 B 与 2080 B 后分别比本机原件 SHA，32 B 的 magic/slot/version/CRC 必须有效。记录整个 misc SHA 和 BC hex，不写任何字节。
+5. 实际 `/opt/e5/e5-next-boot` SHA 必须匹配，`/run/e5linux/misc-dev` 必须指向已验证物理 p3，才执行固定 `status` 分支。**只记录**默认/下次目标；主代理应结合当前阶段判断首次应是 Android 或最终应是 Linux。
+6. 固定 NV verify 和 prepare 两份 SHA 先验，再运行 `/usr/bin/python3 -B /opt/e5/t551m-nv-verify` 并记录退出。另读取 `/run/t551m-nv-source-sha256.json`。
+7. 九个物理 NV 独立匹配 GPT、sysfs、大小、`ro=1` 与 BLKROGET=1；`/dev/block/by-name` 必须各自指向 block loop，loop 的 rdev 对应 sysfs，backing file 精确为本机 `/opt/e5/nv/<分区名>`。物理全 SHA 读两遍，要求稳定并与本次 prepare baseline 相同。不会把逻辑 loop 当成物理 NV。
+8. `logread`、不带 `-c` 的 `dmesg`、pstore 文件只读。每类命令输出/文件最多记录 2 MiB并明确 truncated；不清日志。日志可能包含本机标识，作为私有证据保存。
+
+还需主机单独完成的比对：将 JSONL 的九项 `NV-first:<name>` / `NV-second:<name>` data.sha256 与**最近一次 Android 去加密后、入 Linux 前**基线 `read_nv_baseline.py` 的 rows 中 sha256_first/sha256_second 逐项比较，并固定那份基线文件 SHA。这里尚没有未知未来基线输入，也未假造结论。若跨重启不同，记录不同并停止进一步持久默认设置，先区分 Android 关机更新与 Linux 行为，不能自动认定哪方写坏或恢复 NV。
+
+采集全通过仍不是 USB/热点/蜂窝/双卡/短信验收，也不是长期 F2FS 稳定或回退已证实。将它与 [首启操作卡](/REDACTED_HOST_PATH 一起使用；本工具从不发送短信或主动触发蜂窝/网络连接。
+
+本地测试：`python3 -B test_collect.py`。14 项字节/源码/mocked-command 测试，实际本地固定 boot/misc 作为参考，审计钩子拒绝外部进程和网络。没有运行 ARM64 固件程序。

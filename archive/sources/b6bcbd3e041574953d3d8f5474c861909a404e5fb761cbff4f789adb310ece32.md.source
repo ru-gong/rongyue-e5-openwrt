@@ -1,0 +1,40 @@
+# CP 通知只接收观察器：准备版
+
+本目录只准备候选诊断代码与离线测试，不是蜂窝修复，也未获设备部署/试启准入。没有 ADB/SSH/USB/上传/开机自启入口。Python 3 标准库；当前运行快照中有效解释器为 `/usr/bin/python3` → `python3.13`，**`/opt/e5/bin/python3` 不存在**。未来如单独获批，可由调用方采用 `/usr/bin/python3 -B -` 将固定源码通过标准输入在内存中运行，stdout 回传主机；本轮没有部署或执行此设备入口。
+
+2026-10-13 收尾状态：Android 日志已有完整 RF/CP assert 新证据，D0/D1 均后置暂缓；本观察器不是当前优先试启建议，也不因完成离线测试取得实机授权。
+
+`observer.py` 固定 `AF_UNIX/SOCK_STREAM` 的 Linux abstract 地址 `b'\0modemd'`（显示为 `@modemd`）。连接之后只 `recv`；没有 send/sendall/sendmsg、AT、CP reset、DUMP COMPLETE、blocked 回执、socket file wrapper 或 socket shutdown。关闭连接只调用 close。收到任何关键字都仅作为不透明原始字节记录，不据其触发命令。
+
+**`DEVICE_EXECUTION_ENABLED=False` 硬禁 CLI 连接。** 默认只打印合同；显式 `observe` 也在创建 socket 前返回 `PREPARATION_HARD_DISABLED`、exit 2。环境变量和 CLI 没有绕过开关。独立审查及未来明确部署批准之前保持此状态；不能把内置 engine 的 mock 测试称为实机采集成功。
+
+## 输出与边界
+
+观察 engine 的 stdout 是 JSONL，每条含 `schema`、连续 `seq`、UTC `time_utc`、`monotonic_ns` 和 `event`。`recv` 记录另有 `bytes`、`total_raw_bytes`、`base64`。**一个 recv 块不是一条完整 CP 消息**：按 seq 将 base64 解码结果串接，即得到实际接收的原始字节流，保留跨包、NUL、换行和非 UTF-8；没有 strip、文本解码、消息拼接推断或丢弃 NUL。
+
+默认接收 180 秒、最多 131,072 原始字节、stdout 最多 262,144 字节。可调整上限分别为 600 秒、1,048,576 原始字节、2,097,152 stdout 字节；stdout 最小预算 4,096 字节。历史异常约在 319 秒出现，180 秒默认值不足以覆盖该窗口；未来若重新批准 D0，应显式绑定 600 秒并检查实际 end.reason/退出时长，不能将提前达到字节上限称为完整 600 秒观察。最后一条 end 有保留预算，接收前按剩余输出预算收窄 recv 长度，不能先接收再静默丢失无法记录的字节。
+
+连接建立前最多 5 次尝试，相邻失败等待最多 0.5 秒；connect/recv 每次最多等待 1 秒且受总 deadline 限制。连接一旦成功，EOF/读取异常/取消/预算终止均关闭并退出，**不重新连接、不无限重启**。连接操作本身会让服务端看到新客户端，不能把“零发送 payload”声称为服务端绝无任何可见行为；接受此观察客户端前仍需确认 modemd 的客户端广播/资源行为。
+
+stdout 由未来调用方重定向到主机证据流；本程序不打开手机文件、不写日志文件，不解析/导入现有 e5-modemd 服务。调用方必须及时排空管道：时间门限制 socket 等待和循环，不是能中断任意卡死 stdout/底层系统调用的硬实时 watchdog。管道断开/短写使采集失败并关闭连接，不伪造完整结束。
+
+exit 0 仅表示一次有限采集正常终止（包括时长/字节预算），**不是 modem 健康**。end.reason 区分 `eof`、`duration_limit`、`raw_limit`、`output_limit`。连接用尽 exit 3，已连接读取错误 exit 4，stdout/OSError exit 5，取消 exit 130；没有 end 的截断输出不得标为完整采集。该通道可能不产生事件；没有通知也不等于没有 CP 故障。
+
+## 可执行的本地离线检查
+
+```sh
+cd /REDACTED_HOST_PATH
+python3 -B observer.py contract
+python3 -B -m unittest -v test_observer
+```
+
+测试在导入观察器前设置 Python audit hook，禁止所有真实 `socket.*`、subprocess/system/exec/pty 操作。使用 fake transport 检验 0 个发送字节、固定地址/类型、分片/NUL/非 UTF-8 恢复、连接失败上限与重试后成功、EOF/读取错误不重连、接收量/总输出/时间门、取消、stdout 中断和硬禁 CLI。AST 再限定 socket 方法为 connect/settimeout/recv/close。
+
+本机 macOS 的原测试为 mock/静态验证。随后独立代理在已启动的隔离 Linux VM 内完成了**真实 abstract socket＋假服务端**集成：[测试证据](/REDACTED_HOST_PATH `0000000000000000000000000000000000000000000000000000000000000000`。固定 `@modemd` 服务发送 59 字节、5 片，含 NUL/非 UTF-8，observer 解码全 SHA 相同；服务端记录客户端 payload 为 0 字节、单次连接、EOF 正常；CLI 禁用门仍为 False/exit 2，observer 源码没有变更。**没有连接实际设备或 vendor modemd**；真实服务的客户端广播、并发及连接副作用仍未验证。
+
+## 接入候选前仍需审查
+
+1. 只解除单独审过副本的硬禁；pin observer 文件 SHA 和解释器路径，禁止任意 socket 地址/发送模式/文件输出参数。
+2. 主代理明确进程启动、stdout 主机保全、最长寿命和停止方法；不配无限重启服务，不让观察器替代已审启动/恢复路径。
+3. 与 modem/MM/内核日志按 monotonic 时间、实际启动 boot ID 对齐；观察器本身不读取 boot ID，外部采集合同应绑定。
+4. 独立审查文件指纹和测试证据后才考虑设备部署。接收到 CP assert 通知是新证据，不自动授权 CP reset、锁频、NV 改写、重新试刷或重启。

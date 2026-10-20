@@ -1,0 +1,29 @@
+import copy,json,unittest
+import case as c
+class Tests(unittest.TestCase):
+ def setUp(self):
+  folder=sorted((c.RUN/'resume-stage-execution/transport').glob('*stage-combined-preflight*'))[-1]
+  self.b=c.obj(folder/'IN_FLIGHT.json');self.t=c.obj(folder/'transport-result.json');self.rows=[c.obj(c.HERE/'CASE.json')['native_failure_preserved']]
+ def test_exact_ack_refusal(self):self.assertTrue(c.classify(self.b,self.t,self.rows,b''))
+ def test_mutation_payload_or_other_action_rejected(self):
+  for k,v in [('mutating',True),('payload_bytes',1),('label','write-stage-chunk'),('automatic_retry',True)]:
+   b=copy.deepcopy(self.b);b[k]=v
+   with self.subTest(k=k),self.assertRaises(RuntimeError):c.classify(b,self.t,self.rows,b'')
+ def test_timeout_cancel_or_unreaped_rejected(self):
+  for k,v in [('failure','timeout'),('returncode',124),('returncode',None),('host_child_reaped',False),('stdin_bytes_sent',1),('elapsed_seconds',9)]:
+   t=copy.deepcopy(self.t);t[k]=v
+   with self.subTest(k=k),self.assertRaises(RuntimeError):c.classify(self.b,t,self.rows,b'')
+ def test_other_unknowns_rejected(self):
+  for k,v in [('reason','occupied'),('detail','fd-object-identity-drift'),('errno',16),('complete',True),('cancel_signal',15),('unknown',['other']),('fd_closed_rejected',1),('fd_diff_records_omitted',1)]:
+   rows=copy.deepcopy(self.rows);rows[-1][k]=v
+   with self.subTest(k=k),self.assertRaises(RuntimeError):c.classify(self.b,self.t,rows,b'')
+ def test_target_inode_difference_rejected(self):
+  rows=copy.deepcopy(self.rows);rows[-1]['fd_differences'][0]['old_dev']=66367
+  with self.assertRaises(RuntimeError):c.classify(self.b,self.t,rows,b'')
+ def test_boot_or_nonce_drift_rejected(self):
+  for k,v in [('boot_id','other'),('opid','other'),('txid','other')]:
+   rows=copy.deepcopy(self.rows);rows[-1][k]=v
+   with self.subTest(k=k),self.assertRaises(RuntimeError):c.classify(self.b,self.t,rows,b'')
+ def test_stderr_rejected(self):
+  with self.assertRaises(RuntimeError):c.classify(self.b,self.t,self.rows,b'unknown')
+if __name__=='__main__':unittest.main(verbosity=2)

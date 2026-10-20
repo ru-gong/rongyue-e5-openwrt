@@ -1,0 +1,209 @@
+"""Run the actual generated shell functions, with no real mmcli/device capability."""
+from pathlib import Path
+import hashlib
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+
+ROOT = Path(__file__).resolve().parent
+def audit(event, args):
+    if event.startswith('socket.') or event in ('os.system', 'os.exec', 'os.posix_spawn'):
+        raise RuntimeError('test forbids network/other process API: '+event)
+    if event == 'subprocess.Popen' and args[0] != '/bin/sh':
+        raise RuntimeError('test permits only fixed host /bin/sh')
+sys.addaudithook(audit)
+spec = importlib.util.spec_from_file_location('prepare', ROOT/'prepare_candidate.py')
+prepare = importlib.util.module_from_spec(spec); spec.loader.exec_module(prepare)
+ORIGINAL = (ROOT/'actual/lib/netifd/proto/modemmanager.sh').read_bytes()
+PAYLOAD = (ROOT/'late-registration.functions.sh').read_bytes()
+CANDIDATE = prepare.transform(ORIGINAL, PAYLOAD)
+START = CANDIDATE.index(b'# e5-wan-late-registration-v1:')
+END = CANDIDATE.index(b'\n# unisoc-pdp-connect-retry:', START)
+REAL_FUNCTIONS = CANDIDATE[START:END].decode()
+PATH0 = '/org/freedesktop/ModemManager1/Modem/0'
+SIM0 = '/org/freedesktop/ModemManager1/SIM/0'
+
+def sample(state='searching', reg='searching', packet='detached', **kw):
+    result = {'modem-list.length':'1', 'modem-list.value[1]':PATH0,
+              'modem.dbus-path':PATH0, 'modem.generic.sim':SIM0,
+              'modem.generic.primary-sim-slot':'1', 'modem.generic.plugin':'unisoc',
+              'modem.generic.unlock-required':'none', 'modem.generic.state':state,
+              'modem.3gpp.registration-state':reg, 'modem.3gpp.packet-service-state':packet}
+    result.update(kw)
+    return result
+
+READY = sample('registered', 'home', 'attached')
+TIMEOUT = "error: couldn't register the modem: 'Timeout was reached'"
+FAKE = r'''
+# None of these stubs can access a device. The only external command is host awk.
+e5_wan_uptime() { read -r n < "$T/clock"; printf '%s\n' "$n"; }
+advance() { read -r n < "$T/clock"; printf '%s\n' "$((n+$1))" > "$T/clock"; }
+sleep() { printf 'sleep %s\n' "$*" >> "$T/calls"; advance "$1"; }
+dump() { while IFS= read -r row; do printf '%s\n' "$row"; done < "$1"; }
+mmcli() {
+ printf 'mmcli %s\n' "$*" >> "$T/calls"
+ case "$*" in
+ '--timeout 5 --list-modems --output-keyvalue')
+  read -r i < "$T/index"; i=$((i+1)); printf '%s\n' "$i" > "$T/index"
+  [ -f "$T/list-$i" ] || return 90
+  read -r delay < "$T/list-delay"; advance "$delay"
+  [ ! -f "$T/list-fail-$i" ] || return 1
+  dump "$T/list-$i" ;;
+ '--timeout 5 --modem=unisoc-sipc --output-keyvalue')
+  read -r i < "$T/index"
+  read -r delay < "$T/status-delay"; advance "$delay"
+  [ ! -f "$T/status-fail-$i" ] || return 1
+  dump "$T/status-$i" ;;
+ '--modem=unisoc-sipc --timeout 120 --3gpp-register-in-operator='|\
+ '--modem=unisoc-sipc --timeout 120 --3gpp-register-in-operator=46001'|\
+ '--modem=other --timeout 120 --3gpp-register-in-operator=')
+  dump "$T/register-output"; read -r rc < "$T/register-rc"; return "$rc" ;;
+ *) printf 'FORBIDDEN mmcli\n' >&2; return 99 ;;
+ esac
+}
+proto_notify_error() { printf 'error %s\n' "$*" >> "$T/calls"; }
+proto_block_restart() { printf 'block %s\n' "$*" >> "$T/calls"; }
+modemmanager_set_plmn "$DEVICE" wan "$PLMN" "$FORCE"
+result=$?
+printf 'RESULT=%s\n' "$result"
+exit 0
+'''
+
+class CandidateTests(unittest.TestCase):
+    def run_case(self, samples, rc=1, output=TIMEOUT, device='unisoc-sipc', plmn='', force='',
+                 list_fail=(), status_fail=(), duplicate=None, delay=(0,0)):
+        with tempfile.TemporaryDirectory(prefix='e5-wan-fake-') as d:
+            t=Path(d); (t/'bin').mkdir(); (t/'bin/awk').symlink_to('/usr/bin/awk')
+            for k,v in {'clock':'0','index':'0','register-rc':str(rc),'register-output':output,
+                        'list-delay':str(delay[0]),'status-delay':str(delay[1])}.items():
+                (t/k).write_text(v+'\n')
+            for i,s in enumerate(samples,1):
+                for prefix in ('list','status'):
+                    text=''.join(f'{k:<48} : {v}\n' for k,v in s.items() if k.startswith('modem-list') == (prefix=='list'))
+                    if duplicate == (i,prefix): text+='modem.generic.state : registered\n'
+                    (t/f'{prefix}-{i}').write_text(text)
+            for i in list_fail:(t/f'list-fail-{i}').touch()
+            for i in status_fail:(t/f'status-fail-{i}').touch()
+            env={'PATH':str(t/'bin'),'T':str(t),'LC_ALL':'C','DEVICE':device,'PLMN':plmn,'FORCE':force}
+            proc=subprocess.run(['/bin/sh','-s'],input=REAL_FUNCTIONS+'\n'+FAKE,text=True,env=env,capture_output=True,timeout=10)
+            self.assertEqual(proc.returncode,0,proc.stderr)
+            self.assertNotIn('FORBIDDEN',proc.stderr)
+            calls=(t/'calls').read_text().splitlines()
+            register=[c for c in calls if '--3gpp-register-in-operator=' in c]
+            self.assertEqual(len(register),1)  # Never repeat Register.
+            for c in calls:
+                self.assertTrue(c.startswith(('mmcli --timeout 5 --list-modems --output-keyvalue',
+                    'mmcli --timeout 5 --modem=unisoc-sipc --output-keyvalue',
+                    'mmcli --modem=', 'sleep 5', 'error wan ', 'block wan')),c)
+                self.assertNotIn('--simple-connect',c)
+                self.assertNotIn('--command',c)
+            return proc.stdout,proc.stderr,calls,int((t/'clock').read_text())
+
+    def assert_failure(self, result):
+        out,err,calls,_=result
+        self.assertIn('RESULT=1',out)
+        self.assertIn('error wan MM_3GPP_OPERATOR_REGISTRATION_FAILED',calls)
+        self.assertIn('block wan',calls)
+
+    def test_direct_registration_success_unchanged(self):
+        out,err,calls,n=self.run_case([sample()],rc=0,output='successfully registered the modem')
+        self.assertIn('RESULT=0',out); self.assertEqual(n,0); self.assertFalse(any(x.startswith('block') for x in calls))
+
+    def test_actual_late_trace_home_detached_flap_then_attached(self):
+        sequence=[sample(),sample('enabled','idle'),sample('registered','home'),sample('registered','home'),
+                  sample(),READY,READY]
+        out,err,calls,n=self.run_case(sequence)
+        self.assertIn(TIMEOUT,out); self.assertIn('RESULT=0',out); self.assertEqual(n,25)
+        self.assertIn('not WAN success',out); self.assertFalse(any(x.startswith('block') for x in calls))
+
+    def test_searching_bounded(self):
+        r=self.run_case([sample()]*13); self.assert_failure(r)
+        self.assertEqual(r[2].count('mmcli --timeout 5 --list-modems --output-keyvalue'),13)
+        self.assertEqual(r[3],55); self.assertIn('expired',r[1])
+
+    def test_home_without_attach_never_accepted(self):
+        self.assert_failure(self.run_case([sample()]+[sample('registered','home')]*12))
+
+    def test_attachment_alone_never_accepted(self):
+        self.assert_failure(self.run_case([sample()]+[sample('searching','searching','attached')]*12))
+
+    def test_state_regression_resets_stability(self):
+        out,err,calls,n=self.run_case([sample(),READY,sample(),READY,READY])
+        self.assertIn('RESULT=0',out); self.assertEqual(n,15)
+
+    def test_modem_disappearance_stops(self):
+        self.assert_failure(self.run_case([sample(),READY,sample(**{'modem-list.length':'0'})]))
+
+    def test_failed_and_locked_states_stop(self):
+        for state in ('failed','locked','disabled','unknown','initializing','connected'):
+            with self.subTest(state=state): self.assert_failure(self.run_case([sample(),sample(state)]))
+
+    def test_sim_pin_and_unknown_lock_stop(self):
+        for lock in ('sim-pin','sim-puk','unknown','--'):
+            with self.subTest(lock=lock): self.assert_failure(self.run_case([sample(),sample(**{'modem.generic.unlock-required':lock})]))
+
+    def test_read_error_stops(self):
+        self.assert_failure(self.run_case([sample(),READY],list_fail=(2,)))
+        self.assert_failure(self.run_case([sample(),READY],status_fail=(2,)))
+
+    def test_multiple_modems_and_duplicate_keys_stop(self):
+        self.assert_failure(self.run_case([sample(),READY|{'modem-list.length':'2'}]))
+        self.assert_failure(self.run_case([sample(),READY],duplicate=(2,'status')))
+
+    def test_identity_change_stops(self):
+        cases=[{'modem.dbus-path':PATH0+'1','modem-list.value[1]':PATH0+'1'},
+               {'modem.generic.sim':SIM0+'1'},{'modem.generic.primary-sim-slot':'2'}]
+        for changes in cases:
+            with self.subTest(changes=changes): self.assert_failure(self.run_case([sample(),READY|changes]))
+
+    def test_unknown_reg_packet_roaming_denied_fail_closed(self):
+        for changes in ({'modem.3gpp.registration-state':'denied'}, {'modem.3gpp.registration-state':'roaming'},
+                        {'modem.3gpp.packet-service-state':'unknown'}, {'modem.generic.plugin':'generic'}):
+            self.assert_failure(self.run_case([sample(),READY|changes]))
+
+    def test_non_timeout_error_no_wait(self):
+        for message in ('permission denied',"error: couldn't register the modem: 'Network not allowed'",'Timeout was reached'):
+            r=self.run_case([sample()],output=message); self.assert_failure(r); self.assertEqual(r[3],0)
+
+    def test_other_device_manual_plmn_no_new_reads(self):
+        for kwargs in ({'device':'other'},{'plmn':'46001'}):
+            r=self.run_case([],**kwargs); self.assert_failure(r)
+            self.assertFalse(any('--output-keyvalue' in x for x in r[2]))
+
+    def test_force_restart_mode_preserved(self):
+        out,err,calls,n=self.run_case([],force='1')
+        self.assertIn('RESULT=1',out); self.assertIn('error wan MM_INTERFACE_RESTART',calls)
+        self.assertNotIn('block wan',calls); self.assertFalse(any('--output-keyvalue' in x for x in calls))
+
+    def test_invalid_seed_disables_only_fallback(self):
+        r=self.run_case([sample()],list_fail=(1,)); self.assert_failure(r)
+        self.assertEqual(r[3],0)
+        r=self.run_case([sample()],list_fail=(1,),rc=0,output='success')
+        self.assertIn('RESULT=0',r[0])
+
+    def test_deadline_checks_time_spent_reading(self):
+        # Each cache sample costs ten fake seconds. Never accept after 60-second window.
+        r=self.run_case([sample()]*6+[READY,READY],delay=(5,5)); self.assert_failure(r)
+        self.assertLessEqual(r[3],80)  # Includes the initial seed outside late window.
+
+    def test_payload_and_single_file_boundaries(self):
+        start=ORIGINAL.index(b'modemmanager_set_plmn() {\n'); end=ORIGINAL.index(b'\n# unisoc-pdp-connect-retry:',start)
+        ungated=CANDIDATE.replace(prepare.GATE.encode(),b'',1)
+        self.assertEqual(ungated[:start],ORIGINAL[:start]); self.assertTrue(ungated.endswith(ORIGINAL[end:]))
+        for forbidden in (b'--command',b'CFUN',b'reset',b'ifup',b'ifdown',b'--simple-connect',b'--set-primary-sim',b'--set-allowed',b'/dev/'):
+            self.assertNotIn(forbidden,PAYLOAD)
+        self.assertNotIn(b'proto_send_update',PAYLOAD)
+
+    def test_bad_original_rejected_and_gate_before_any_target_check(self):
+        with self.assertRaises(ValueError):prepare.transform(ORIGINAL+b'\n',PAYLOAD)
+        self.assertLess(CANDIDATE.index(b'exit 126'),CANDIDATE.index(b'[ -x /usr/bin/mmcli ]'))
+        # Disabled full candidate must stop before all original absolute paths.
+        p=subprocess.run(['/bin/sh','-s'],input=CANDIDATE,text=False,env={'PATH':'/nonexistent'},capture_output=True,timeout=2)
+        self.assertEqual(p.returncode,126)
+
+if __name__=='__main__':
+    unittest.main(verbosity=2)

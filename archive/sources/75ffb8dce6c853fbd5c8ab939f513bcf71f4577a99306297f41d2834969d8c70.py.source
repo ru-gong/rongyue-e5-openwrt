@@ -1,0 +1,15 @@
+"""Host evidence observation only; no device operations."""
+from pathlib import Path
+from collections import Counter
+import datetime as dt,json
+R=Path(__file__).resolve().parents[2]/'evidence/author-closed-fd-install-20261019'
+for phase in ('resume-stage','activate','install'):
+ r=R/(phase+'-execution')
+ if not r.exists():continue
+ ops=[]
+ for q in (r/'transport').rglob('IN_FLIGHT.json'):
+  b=json.loads(q.read_bytes());ops.append((q.stat().st_mtime_ns,q.parent,b))
+ completed=[x for x in ops if (x[1]/'COMPLETE.json').exists()]
+ out={'utc':dt.datetime.now(dt.timezone.utc).isoformat(),'phase':phase,'requests':len(ops),'completed':len(completed),'labels':dict(Counter(x[2]['label'] for x in completed)),'acknowledged_write_payload_bytes':sum(x[2]['payload_bytes'] for x in completed if x[2]['mutating']),'last':[{'label':b['label'],'operation':p.name,'complete':(p/'COMPLETE.json').exists()} for _,p,b in sorted(ops)[-1:]],'phase_complete':(r/'COMPLETE.json').exists(),'stop':(r/'STOP.json').exists()}
+ if out['stop']:out['stop_detail']=json.loads((r/'STOP.json').read_bytes())
+ print(json.dumps(out,sort_keys=True))

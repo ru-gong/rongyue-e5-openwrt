@@ -1,0 +1,14 @@
+import importlib.util,unittest
+from unittest.mock import patch
+from pathlib import Path
+import closure as c
+from test_closure import Fixture
+class Tests(unittest.TestCase):
+ def setUp(self):self.f=Fixture();self.addCleanup(self.f.tmp.cleanup);self.e=self.f.make();self.v=self.e.close();self.v['current_ledger_last_event']='COMPLETE'
+ def test_previous_consumer_is_permanently_blocked(self):
+  p=c.ROOT/'tools/e5_closed_fd_stop_live_20261019/closure.py';sp=importlib.util.spec_from_file_location('_old_consumer',p);m=importlib.util.module_from_spec(sp);sp.loader.exec_module(m)
+  with patch.object(m,'validate_closed',return_value=self.v):
+   with self.assertRaises(m.Refusal):m.normal_gate(self.f.state,self.e.ledger)
+ def test_successor_checks_receipt_then_allows_new_identity(self):
+  with patch.object(c,'validate_closed',return_value=self.v):self.assertEqual(c.normal_gate(self.f.state,self.e.ledger,self.f.case['boot_id'],'f'*16),self.v)
+if __name__=='__main__':unittest.main(verbosity=2)

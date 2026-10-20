@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""One host-only integration of frozen b7 runtime and reviewed boot-lineage repair.
+No runtime module is imported, no field request/review is created, no device call.
+"""
+import ast,copy,difflib,hashlib,importlib.util,json,sys
+from pathlib import Path
+from datetime import datetime,timezone
+
+def deny_external(event,args):
+    if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':
+        raise RuntimeError('external process/socket forbidden: '+event)
+sys.addaudithook(deny_external)
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+ID='176656abb97d4b2c'
+BASE=ROOT/'tools/e5_activation_bundle_b7b4ea5324174ae2/RESULT.json'
+BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+REPAIR=ROOT/'tools/e5_boot_lineage_repair_prepare_20261015'
+REPAIR_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+FFEC=ROOT/'tools/e5_boot_lineage_recovery_live_ffec9bc637b44850'
+FFEC_OBSERVER='0000000000000000000000000000000000000000000000000000000000000000'
+HELPER=ROOT/'tools/e5_activation_prepare_20261015/activation.py'
+HELPER_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+sha=lambda b:hashlib.sha256(b).hexdigest()
+assert sha(HELPER.read_bytes())==HELPER_SHA
+spec=importlib.util.spec_from_file_location('_e5_host_copy_builder',HELPER)
+a=importlib.util.module_from_spec(spec);spec.loader.exec_module(a)
+DEST={g:ROOT/'tools'/(stem+ID) for g,stem in a.DEST_STEMS.items()}
+
+def binding(path):
+    raw=a.read(path)
+    return {'path':str(path),'bytes':len(raw),'sha256':sha(raw)}
+
+def main():
+    assert HERE.name=='e5_activation_bundle_'+ID
+    for p in DEST.values():assert not p.exists() and not p.is_symlink()
+    assert not (HERE/'RESULT.json').exists() and not (HERE/'STOP.json').exists()
+    base=json.loads(a.read(BASE,BASE_SHA))
+    complete=json.loads(a.read(BASE.with_name('COMPLETE.json')))
+    assert complete['result_sha256']==BASE_SHA and not BASE.with_name('STOP.json').exists()
+    assert len(base['files'])==28
+    original={k:a.read(v['path'],v['sha256'],v['bytes']) for k,v in base['files'].items()}
+    prep_raw=a.read(REPAIR/'MANIFEST.json',REPAIR_SHA);prep=json.loads(prep_raw)
+    for name,item in prep['files'].items():a.read(REPAIR/name,item['sha256'],item['bytes'])
+    files=copy.deepcopy(original);provenance=copy.deepcopy(base['files'])
+    five=('common.py','observe.py','evidence_contract.py','recovery.py','rearm.py')
+    for name in five:
+        item=prep['files'][name];files['recovery/'+name]=a.read(REPAIR/name,item['sha256'],item['bytes'])
+        provenance['recovery/'+name]=binding(REPAIR/name)
+    files['recovery/MANIFEST.json']=prep_raw;provenance['recovery/MANIFEST.json']=binding(REPAIR/'MANIFEST.json')
+    ffec_observe=a.read(FFEC/'observe.py',FFEC_OBSERVER)
+    ffec_common=a.read(FFEC/'common.py')
+    # Revalidate fixed external materials, without importing any device-capable source.
+    catalog_path=HELPER.with_name('SOURCE_CATALOG.json')
+    catalog=json.loads(a.read(catalog_path,a.CATALOG_SHA))
+    for item in catalog['external_inputs']:a.verify_stream(item)
+    b=a.Builder(files,DEST)
+    b.set('recovery/observe.py','DEVICE_IO_ENABLED',False,True)
+    b.set('recovery/recovery.py','RECOVERY_IO_DISABLED',True,False)
+    b.set('recovery/rearm.py','REARM_IO_DISABLED',True,False)
+    b.exact('recovery/common.py','tools/e5_nextphase_core_prepare_20261015','tools/'+DEST['core'].name)
+    pins={name:b.digest('core/'+name+'.py') for name in a.assignment(b.files['recovery/common.py'],'PINS')[0]}
+    assert pins==a.assignment(ffec_common,'PINS')[0]
+    b.set('recovery/common.py','PINS',a.assignment(b.files['recovery/common.py'],'PINS')[0],pins)
+    old_core=Path(base['directories']['core']).name;old_rec=Path(base['directories']['recovery']).name
+    b.exact('core/cold_bridge.py','tools/'+old_rec+'/evidence_contract.py','tools/'+DEST['recovery'].name+'/evidence_contract.py')
+    for key in ('scanner/runner.py','scanner/stage2_deploy.py'):
+        b.exact(key,'tools/'+old_core,'tools/'+DEST['core'].name)
+    b.exact('scanner/runner.py','tools/'+old_rec,'tools/'+DEST['recovery'].name)
+    b.exact('scanner/stage2_deploy.py','tools/'+old_rec+'/evidence_contract.py','tools/'+DEST['recovery'].name+'/evidence_contract.py')
+    assert b.files['recovery/observe.py']==ffec_observe
+    assert a.assignment(b.files['recovery/observe.py'],'PINS')[0]==a.assignment(ffec_observe,'PINS')[0]
+    rm=b.files_manifest('recovery/MANIFEST.json','recovery')
+    rm['preparation_tests']=rm.pop('tests')
+    rm.update(default_disabled=False,device_io_enabled=True,enabled=['observe','recovery','rearm'],
+        runtime_directory=str(DEST['core']),runtime_pins=pins,
+        preparation_manifest=binding(REPAIR/'MANIFEST.json'),
+        base_activation={'path':str(BASE),'sha256':BASE_SHA},
+        preparation_independent_review=binding(ROOT/'research/audit/boot-lineage-repair-independent-review-20261015.json'),
+        status='ENABLED_INTEGRATED_HOST_COPY_PENDING_INDEPENDENT_REVIEW',
+        independent_enabled_copy_review_required=True,production_approval_generated=False,
+        activation_does_not_authorize_device_execution=True)
+    b.put('recovery/MANIFEST.json',rm)
+    b.set('core/cold_bridge.py','SOURCE_SHA256',a.assignment(b.files['core/cold_bridge.py'],'SOURCE_SHA256')[0],b.digest('recovery/evidence_contract.py'))
+    b.set('core/cold_bridge.py','DEPENDENCIES',a.assignment(b.files['core/cold_bridge.py'],'DEPENDENCIES')[0],{n:b.digest('recovery/'+n) for n in ('common.py','observe.py')})
+    sm=b.obj('scanner/ARTIFACT_MANIFEST.json')
+    sm['host_source_sha256']=b.digest('scanner/stage2_deploy.py');sm['runner_source_sha256']=b.digest('scanner/runner.py')
+    sm['core']={n:b.binding('core/'+n) for n in sm['core']}
+    sm['cold_contract']=b.binding('recovery/evidence_contract.py')
+    sm['cold_dependencies']={n:b.binding('recovery/'+n) for n in sm['cold_dependencies']}
+    for name in ('archiver','scanner'):
+        old=sm['artifacts'][name];key='scanner/'+Path(old['path']).relative_to(base['directories']['scanner']).as_posix()
+        assert sha(original[key])==old['sha256'] and len(original[key])==old['bytes']
+        sm['artifacts'][name]=b.binding(key,True)
+    sm['integration_base_manifest']=base['files']['scanner/ARTIFACT_MANIFEST.json']
+    b.put('scanner/ARTIFACT_MANIFEST.json',sm)
+    # Acceptance Python/shell/contract bytes are untouched; only inventory paths move.
+    am=b.files_manifest('acceptance/MANIFEST.json','acceptance')
+    am['integration_base_manifest']=base['files']['acceptance/MANIFEST.json'];b.put('acceptance/MANIFEST.json',am)
+    cm=b.obj('core/SOURCE_MANIFEST.json')
+    cm['modules']={n:b.digest('core/'+n+'.py') for n in cm['modules']}
+    cm['deployment_manifest']=b.binding('scanner/ARTIFACT_MANIFEST.json')
+    cm['recovery_manifest']=b.binding('recovery/MANIFEST.json')
+    cm['nv_geometry']=b.binding('core/nv_geometry.json')
+    cm['artifacts']['scanner']=copy.deepcopy(sm['artifacts']['scanner'])
+    b.put('core/SOURCE_MANIFEST.json',cm)
+    b.set('core/workflow.py','MANIFEST_SHA',sha(original['core/SOURCE_MANIFEST.json']),b.digest('core/SOURCE_MANIFEST.json'))
+    # Mechanical-only invariants and all14 final gates.
+    recipe=json.loads(a.read(ROOT/'tools/e5_nextphase_core_prepare_20261015/ACTIVATION_RECIPE.json','0000000000000000000000000000000000000000000000000000000000000000'))
+    for key,value in recipe['literal_gates'].items():
+        left,right=value.split(' -> ');name=left.split('=')[0].strip()
+        assert a.assignment(b.files[key],name)[0] is ast.literal_eval(right.strip())
+    for name in pins:assert b.files['core/'+name+'.py']==original['core/'+name+'.py']
+    for name in ('collect.py','collect.sh','contract.json'):assert b.files['acceptance/'+name]==original['acceptance/'+name]
+    allowed_changed={'core/cold_bridge.py','core/workflow.py','core/SOURCE_MANIFEST.json',
+        'recovery/common.py','recovery/observe.py','recovery/recovery.py','recovery/rearm.py','recovery/MANIFEST.json',
+        'scanner/runner.py','scanner/stage2_deploy.py','scanner/ARTIFACT_MANIFEST.json','acceptance/MANIFEST.json'}
+    assert {k for k in files if files[k]!=b.files[k]}==allowed_changed
+    for k,v in b.files.items():
+        if k.endswith('.py'):ast.parse(v.decode(),filename=k)
+        if k.endswith('.ENABLED'):assert v==original[k]
+    assert set(b.files)==set(original)
+    # No runtime-bound old package paths remain. Historical JSON provenance is retained.
+    for k,v in b.files.items():
+        if k.endswith('.py'):
+            assert old_core.encode() not in v and old_rec.encode() not in v
+    for key,item in provenance.items():assert a.read(item['path'],item['sha256'],item['bytes'])==files[key]
+    inputs={'schema':'e5-mechanical-integration-inputs-v1','base_result':binding(BASE),
+        'repair_manifest':binding(REPAIR/'MANIFEST.json'),'sources':provenance,
+        'copy_builder':binding(HELPER),'external_catalog':binding(catalog_path),
+        'external_inputs':catalog['external_inputs'],'ffec_observer':binding(FFEC/'observe.py'),
+        'ffec_common':binding(FFEC/'common.py'),'shared_state_touched':False,
+        'field_request_review_or_approval_created':False}
+    a.write_new(HERE/'INPUTS.json',a.encode(inputs))
+    for p in DEST.values():a.mkdir(p)
+    for key,raw in sorted(b.files.items()):
+        path=Path(b.path(key));missing=[];parent=path.parent
+        while parent not in DEST.values() and not parent.exists():missing.append(parent);parent=parent.parent
+        for q in reversed(missing):a.mkdir(q)
+        a.write_new(path,raw)
+    for k,v in b.files.items():a.read(b.path(k),sha(v),len(v))
+    for key,item in provenance.items():assert a.read(item['path'],item['sha256'],item['bytes'])==files[key]
+    for key,item in base['files'].items():a.read(item['path'],item['sha256'],item['bytes'])
+    diffs=[];base_diffs=[]
+    for key in sorted(files):
+        if files[key]!=b.files[key]:diffs.extend(difflib.unified_diff(files[key].decode().splitlines(True),b.files[key].decode().splitlines(True),fromfile='reviewed-input/'+key,tofile='integrated/'+key))
+        if original[key]!=b.files[key]:
+            base_diffs.extend(difflib.unified_diff(original[key].decode().splitlines(True),b.files[key].decode().splitlines(True),fromfile='b7/'+key,tofile='integrated/'+key))
+    a.write_new(HERE/'CHANGES.patch',''.join(diffs).encode())
+    a.write_new(HERE/'B7_TO_INTEGRATED.patch',''.join(base_diffs).encode())
+    a.write_new(HERE/'EDITS.json',a.encode(b.edits))
+    result={'schema':'e5-host-integrated-activation-result-v1','activation_id':ID,'created_at':datetime.now(timezone.utc).isoformat(),
+        'base_result':binding(BASE),'repair_manifest':binding(REPAIR/'MANIFEST.json'),
+        'directories':{k:str(v) for k,v in DEST.items()},'files':{k:b.binding(k,True) for k in sorted(b.files)},
+        'input_catalog':binding(HERE/'INPUTS.json'),'diff':binding(HERE/'CHANGES.patch'),
+        'base_diff':binding(HERE/'B7_TO_INTEGRATED.patch'),'edits':binding(HERE/'EDITS.json'),
+        'integration_script':binding(Path(__file__).resolve()),
+        'compatibility':{'observer_byte_identical_to_ffec':True,'observer_sha256':FFEC_OBSERVER,'four_primitive_hashes_unchanged':pins,
+            'cold_records_converted':False,'actual_complete_cold_validated':False,'acceptance_runtime_byte_identical':True},
+        'mechanical_assertions':{'all28_files_verified':True,'all14_gates_enabled':True,'external_materials_verified':len(catalog['external_inputs']),
+            'original_sources_unchanged':True,'runtime_paths_rebased':True,'python_ast_parse_passed':True},
+        'device_io_performed':False,'copies_imported_or_executed':False,'field_request_review_or_approval_created':False,
+        'shared_state_or_ledger_modified':False,'phase_execution_authorized_by_this_result':False,
+        'independent_enabled_copy_review_required':True,'status':'HOST_INTEGRATED_COPY_PENDING_INDEPENDENT_REVIEW'}
+    a.write_new(HERE/'RESULT.json',a.encode(result))
+    a.write_new(HERE/'COMPLETE.json',a.encode({'schema':'e5-host-integration-complete-v1','result_sha256':sha(a.encode(result)),
+        'device_execution_authorized_by_this_receipt':False,'independent_review_required':True}))
+    print(json.dumps({'result':binding(HERE/'RESULT.json'),'directories':result['directories']}))
+
+if __name__=='__main__':
+    try:main()
+    except BaseException as exc:
+        try:a.write_new(HERE/'STOP.json',a.encode({'error':type(exc).__name__+': '+str(exc),'all_partial_copies_invalid':True,
+            'automatic_retry_cleanup':False,'device_io_performed':False}))
+        except BaseException:pass
+        raise

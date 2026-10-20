@@ -1,0 +1,71 @@
+"""Host evidence indexing only. Produces CASE in this new prepare directory; no state writes."""
+import hashlib,json,shlex
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent
+sha=lambda b:hashlib.sha256(b).hexdigest()
+enc=lambda x:json.dumps(x,sort_keys=True,separators=(',',':')).encode()+b'\n'
+run=ROOT/'evidence/author-lifecycle-install-20261016';state=ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+def pin(p):
+ assert p.is_file() and not p.is_symlink()
+ b=p.read_bytes();return {'bytes':len(b),'sha256':sha(b)}
+def rel(p):return str(p.relative_to(ROOT))
+def obj(p):return json.loads(p.read_bytes())
+def operation(p):
+ b=obj(p/'IN_FLIGHT.json');s=shlex.split(b['argv'][-1]);assert s[:2]==['/debug_ramdisk/su','-c'] and len(s)==3
+ op={'folder':rel(p),'script_sha256':sha(s[2].encode()),**{k:b[k] for k in ('op_id','label','argv_sha256','mutating','payload_bytes','payload_sha256')}}
+ op['completed']=(p/'COMPLETE.json').exists();op['parts']=[operation(q) for q in sorted(p.glob('part-*'))]
+ return op
+
+def main():
+ dest=HERE/'CASE.json';assert not dest.exists(),'CASE is immutable; never overwrite'
+ dep=run/'scanner-execution';probe=run/'probe-execution';ledger=ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+ rows=[json.loads(x) for x in ledger.read_bytes().splitlines()]
+ review=run/'STOP_INDEPENDENT_REVIEW_441F.json';r=obj(review)
+ family=ROOT/'tools/e5_activation_bundle_441f60bc8933be12/RESULT.json';family_obj=obj(family)
+ sm=ROOT/'tools/e5_scanner_deploy_next_live_441f60bc8933be12/ARTIFACT_MANIFEST.json';sm_obj=obj(sm)
+ files={rel(p):pin(p) for base in (dep,probe) for p in sorted(base.rglob('*')) if p.is_file()}
+ for p in [review,family,*[Path(x['path']) for x in family_obj['files'].values()],*[Path(x['path']) for x in sm_obj['artifacts'].values()],ROOT/'tools/e5_lifecycle_stop_recovery_prepare_20261016/closure.py',ROOT/'tools/e5_lifecycle_stop_recovery_prepare_20261016/CASE.json']:
+  files[rel(p)]=pin(p)
+ result=obj(dep/'result/RESULT.json')
+ c={'schema':'e5-fixed-postdeployment-probe-stop-case-v1','serial':r['serial'],'txid':r['txid'],'boot_id':r['boot_id'],
+ 'state':rel(state),'global_lock':'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock','ledger':rel(ledger),
+ 'execution':rel(probe),'deployment_execution':rel(dep),'archive_rel':'postdeployment-probe-stop-closures/'+r['txid'],
+ 'ledger_bytes':ledger.stat().st_size,'ledger_sha256':sha(ledger.read_bytes()),'ledger_rows':len(rows),'ledger_head':rows[-1]['chain_sha256'],
+ 'files':files,'completed_baseline':{p.name:pin(p) for p in sorted((state/'completed').iterdir())},
+ 'markers':{n:pin(state/n) for n in ('ACTIVE.json','UNCERTAIN.json')},
+ 'prior_closure_source':{'path':str(ROOT/'tools/e5_lifecycle_stop_recovery_prepare_20261016/closure.py'),**pin(ROOT/'tools/e5_lifecycle_stop_recovery_prepare_20261016/closure.py')},
+ 'review':{'path':rel(review),'sha256':sha(review.read_bytes())},
+ 'source_family':{'path':rel(family),'sha256':sha(family.read_bytes())},
+ 'source_artifacts':sm_obj['artifacts'],
+ 'deployment_complete':{'path':rel(dep/'result/COMPLETE.json'),'sha256':sha((dep/'result/COMPLETE.json').read_bytes())},
+ 'deployment_result':{'path':rel(dep/'result/RESULT.json'),'sha256':sha((dep/'result/RESULT.json').read_bytes())},
+ 'operations':[operation(p) for p in sorted((probe/'transport').iterdir()) if p.is_dir()],
+ 'deployment_operations':[operation(p) for p in sorted((dep/'transport').iterdir()) if p.is_dir()],
+ 'failed_scanner_result':r['probe']['failed_result'],'expected_error':'TransportError: transport failed/uncertain',
+ 'retained_device_state':{'status':'LAST_OBSERVED_DURING_SUCCESSFUL_DEPLOYMENT_NOT_FRESH_POSTSTOP',
+ 'current_owner_txid':r['txid'],'lock':result['lock'],'uploads':result['uploads'],'archive':result['archive'],
+ 'prior_retained':result['partial_deployment_preserved'],'device_state_modified_by_closure':False}}
+ prior_case=obj(ROOT/'tools/e5_lifecycle_stop_recovery_prepare_20261016/CASE.json')
+ def statline(row):
+  return '|'.join([format(row['mode_bits'],'x'),*[str(row[k]) for k in ('dev','inode','bytes','mode','uid','gid','nlink','mtime','ctime','mtime_text','ctime_text','rdev_major','rdev_minor')]])
+ retained=[]
+ for row in prior_case['retained_read_items']:
+  item=dict(row);item['label']=item['label'].replace('retained-latest-','retained-previous-');retained.append(item)
+ archived=result['archive']
+ retained.extend([{'kind':'archive_dir','label':'stage2-retained-latest-archive-old_lock','path':archived,'expected_lines':[statline(result['lock']['old_lock']),archived+'/owner']},
+ {'kind':'archive_owner','label':'stage2-retained-latest-archive-old_owner','path':archived+'/owner','expected_lines':[statline(result['lock']['old_owner']),'722b7e1f5956cc07']}])
+ for key,a in sorted(result['uploads'].items()):
+  line=statline(a['remote_metadata']);retained.append({'kind':'program','label':'stage2-retained-latest-program-'+key,'path':a['remote_path'],'expected_lines':[line,a['artifact']['sha256']+'  '+a['remote_path'],line]})
+ c['retained_read_items']=retained
+ c['retained_device_state']['current_lock']={key:dict(row,mode_bits=format(row['mode_bits'],'x')) for key,row in result['lock'].items() if isinstance(row,dict)}
+ assert len(retained)==18 and len({x['label'] for x in retained})==18
+ c['mutations']=[{k:op[k] for k in ('label','op_id','payload_bytes','payload_sha256')} for op in c['deployment_operations'] if op['mutating']]
+ assert len(c['deployment_operations'])==177 and len(c['operations'])==65 and len(c['mutations'])==6
+ for k,a in c['source_artifacts'].items():
+  m=next(x for x in c['mutations'] if x['label']=='stage2-upload-'+k)
+  assert m['payload_bytes']==a['bytes'] and m['payload_sha256']==a['sha256']
+ raw=enc(c);dest.write_bytes(raw)
+ source=HERE/'closure.py';s=source.read_text();old="CASE_SHA256 = '"+'0'*64+"'";assert s.count(old)==1
+ source.write_text(s.replace(old,"CASE_SHA256 = '"+sha(raw)+"'"))
+ print(json.dumps({'case_sha256':sha(raw),'files':len(files),'completed_baseline':len(c['completed_baseline']),'total_pinned_bytes':sum(x['bytes'] for x in files.values())}))
+if __name__=='__main__':main()

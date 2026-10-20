@@ -1,0 +1,282 @@
+"""Host-only settlement of the exact completed-readonly lock-time STOP.
+
+Preserve the stopped run and its UNCERTAIN marker. Old consumers are blocked
+permanently; new operations need a new transaction and fresh source-bound
+observation. This grants no device operation and cannot settle a lost ACK.
+"""
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+HOST_CLOSURE_ENABLED = False
+CASE_SHA256 = '0000000000000000000000000000000000000000000000000000000000000000'
+PENDING = 'RECOVERY_NEW_SLOT_REPAIR_TRANSITION.json'
+TRANSITION = 'RECOVERY_LOCK_LINEAGE_REPAIR_TRANSITION.json'
+RECEIPT = 'LOCK_LINEAGE_READONLY_STOP_ARCHIVED_NOT_READY.json'
+MARKERS = ('UNCERTAIN.json',)
+PARENT = ROOT/'tools/e5_new_slot_stop_live_20261019/closure.py'
+PARENT_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+
+
+def prior_api():
+    raw = PARENT.read_bytes()
+    if hashlib.sha256(raw).hexdigest() != PARENT_SHA:
+        raise RuntimeError('immutable prior closure changed')
+    spec = importlib.util.spec_from_file_location('_e5_lineage_prior', PARENT)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+_prior = prior_api()
+for _name in ('need','sha','canonical','encoded','exists','safe_path','read','obj',
+              'sync','directory','noreplace','durable','cancelled_signals'):
+    globals()[_name] = getattr(_prior, _name)
+Refusal = _prior.Refusal
+
+
+class _Case:
+    def __init__(self, root, case, digest, *, fixture=False, prior_view=None, fault=None):
+        self.root = directory(root)
+        self.c, self.case_sha = case, digest
+        self.s = case['readonly_lock_stop']
+        self.fixture, self.prior_view, self.fault = fixture, prior_view, fault
+        if fixture:
+            need(self.root.parent == Path(tempfile.gettempdir()).resolve() and
+                 self.root.name.startswith('e5-lineage-test-') and self.root != ROOT,
+                 'fixture root restriction')
+        else:
+            need(self.root == ROOT and digest == CASE_SHA256, 'fixed production case')
+        self.state = directory(self.path(case['state']))
+        self.ledger = self.path(case['ledger'])
+        self.archive = self.state/self.s['archive_rel']
+
+    def path(self, rel):
+        need(isinstance(rel,str) and not Path(rel).is_absolute() and '..' not in Path(rel).parts,
+             'relative case path')
+        return safe_path(self.root/rel)
+
+    def tick(self, name):
+        if self.fault: self.fault(name)
+
+    def prior(self):
+        if self.fixture:
+            need(self.prior_view is not None, 'fixture prior required')
+            for name, raw in self.s['fixture_barriers'].items():
+                need(read(self.state/name) == raw.encode(), 'prior fixture barrier changed')
+            return self.prior_view
+        return prior_api().validate_closed(self.state,self.ledger)
+
+    def ledger_check(self):
+        raw = read(self.ledger, cap=16<<20)
+        pin = self.s['ledger']
+        n = pin['bytes']
+        need(len(raw)>=n and sha(raw[:n])==pin['sha256'] and raw.endswith(b'\n'), 'ledger prefix')
+        head = '0'*64
+        rows = []
+        for line in raw.splitlines():
+            row = json.loads(line); value = dict(row); digest = value.pop('chain_sha256')
+            need(value['seq']==len(rows) and value['previous']==head and sha(canonical(value))==digest,
+                 'ledger chain')
+            rows.append(row); head=digest
+        need(rows, 'empty ledger')
+        return raw,head,rows[-1]['event']
+
+    def receipt(self):
+        return {'schema':'e5-lock-lineage-stop-closure-v1','status':'READONLY_HOST_VALIDATION_STOP_ARCHIVED_NOT_READY',
+                'serial':self.c['serial'],'boot_id':self.s['boot_id'],'txid':self.s['txid'],
+                'case_sha256':self.case_sha,'request_count':len(self.s['operations']),
+                'remote_requests_all_completed':True,'mutations_dispatched':0,
+                'retained_lock_metadata_source':self.c['current_lock_lineage'],
+                'marker':self.s['marker'],'ledger_prefix':self.s['ledger'],
+                'new_device_operation_authorized':False,'same_boot_refresh_permitted':True}
+
+    def barrier(self):
+        return {'schema':'e5-lock-lineage-stop-barrier-v1','serial':self.c['serial'],
+                'boot_id':self.s['boot_id'],'txid':self.s['txid'],'case_sha256':self.case_sha,
+                'archive_rel':self.s['archive_rel'],'receipt_sha256':sha(encoded(self.receipt())),
+                'status':'BLOCK_PREVIOUS_CONSUMERS_PERMANENTLY'}
+
+    def marker(self):
+        candidates=[self.state/'UNCERTAIN.json',self.archive/'UNCERTAIN.json']
+        need(sum(exists(p) for p in candidates)==1, 'marker exactly once')
+        p=next(p for p in candidates if exists(p));read(p,self.s['marker']);return p
+
+    def verify(self):
+        self.prior()
+        need(not exists(self.state/'ACTIVE.json') and not exists(self.state/'RECOVERY_ONLY.json') and
+             not exists(self.state/TRANSITION), 'unresolved operation or recovery')
+        for rel,pin in self.s['files'].items():
+            if pin['bytes']>(16<<20)+65536:prior_api().verify_large(self.path(rel),pin)
+            else:read(self.path(rel),pin)
+        uncertainty=obj(self.marker())
+        need(uncertainty['status']=='UNCERTAIN' and uncertainty['txid']==self.s['txid'] and
+             uncertainty['boot_id']==self.s['boot_id'] and uncertainty['serial']==self.c['serial'] and
+             uncertainty['reason']=='stage2: Refusal: retained current owner/time: old_lock/mtime' and
+             uncertainty['automatic_retry'] is False and uncertainty['remote_completion_proven'] is False,
+             'exact host validation refusal only')
+        stopped=obj(self.path(self.s['stop']))
+        need(stopped=={'error':'Refusal','no_cleanup':True,'no_retry':True,
+                      'reason':'retained current owner/time: old_lock/mtime'}, 'exact deployment stop')
+        transport=self.path(self.s['transport'])
+        actual=sorted(p.name for p in transport.iterdir() if p.is_dir())
+        need(actual==[Path(x['folder']).name for x in self.s['operations']], 'exact operation set')
+        completed=directory(self.state/'completed')
+        need({p.name for p in completed.iterdir()}==set(self.s['completed_baseline']), 'new completion activity')
+        for name,pin in self.s['completed_baseline'].items():read(completed/name,pin)
+        labels=[]
+        for operation in self.s['operations']:
+            folder=self.path(operation['folder']);begin=obj(folder/'IN_FLIGHT.json')
+            done=obj(folder/'COMPLETE.json');result=obj(folder/'transport-result.json')
+            raw=read(folder/'stdout.bin');err=read(folder/'stderr.bin')
+            need(begin['op_id']==operation['op_id'] and begin['label']==operation['label'] and
+                 (begin['serial'],begin['txid'],begin['boot_id'])==
+                 (self.c['serial'],self.s['txid'],self.s['boot_id']), 'request identity')
+            need(begin['mutating'] is False and begin['payload_bytes']==0 and
+                 begin['payload_sha256']==sha(b'') and begin['automatic_retry'] is False and
+                 begin['reconciliation_only'] is False and begin['recovery_context'] is None,
+                 'readonly completed scope only')
+            need(done['status']=='COMPLETE' and done['validated'] is True and
+                 all(done.get(k)==v for k,v in begin.items() if k!='status') and
+                 done['stdout_sha256']==sha(raw) and read(folder/'COMPLETE.json')==read(completed/(begin['op_id']+'.json')),
+                 'request completion/shared receipt')
+            need(result['returncode']==0 and result['failure'] is None and result['host_child_reaped'] is True and
+                 result['stdin_bytes_sent']==0 and not err and result['stderr_bytes']==0 and
+                 result['stdout_bytes']==len(raw) and result['stdout_sha256']==sha(raw) and
+                 0<=result['elapsed_seconds']<=8 and 0<begin['deadline_seconds']<=8,
+                 'remote completion not proven')
+            need(not list(folder.glob('part-*')), 'unexpected mutation followup')
+            labels.append(begin['label'])
+        if not self.fixture:
+            from collections import Counter
+            need(Counter(labels)=={'hash-chunk':22,'read-chunk':22,'stage2-geometry':17,'stage2-state-old':1},
+                 'fixed 62-read scope')
+            p=self.path(self.s['repair_source']['path'])
+            raw=read(p,self.s['repair_source'])
+            spec=importlib.util.spec_from_file_location('_verified_lock_history_repair',p)
+            repair=importlib.util.module_from_spec(spec);spec.loader.exec_module(repair)
+            replay=repair.current_readonly_replay()
+            need(replay['proposed_current_lock']==self.c['retained_device_state']['current_lock'] and
+                 replay['old_case_refusal_reproduced'] is True and replay['current_mutations']==0,
+                 'fixed history repair proof')
+        ledger,_,event=self.ledger_check()
+        need(len(ledger)==self.s['ledger']['bytes'] and event=='COMPLETE', 'ledger advanced/unresolved before closure')
+        if exists(self.state/PENDING):need(read(self.state/PENDING)==encoded(self.barrier()), 'foreign new barrier')
+        return {'status':'VERIFIED_COMPLETED_READONLY_HOST_STOP','requests':len(labels),'device_writes':0}
+
+    @contextlib.contextmanager
+    def locks(self):
+        fds=[]
+        try:
+            for p in (self.path(self.c['global_lock']),self.state/'LOCK'):
+                fd=os.open(safe_path(p),os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600);fds.append(fd)
+                s=os.fstat(fd)
+                need(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==os.getuid(),'unsafe shared lock')
+                fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            yield
+        finally:
+            for fd in reversed(fds):os.close(fd)
+
+    def close(self, *, resume=False):
+        need(HOST_CLOSURE_ENABLED or self.fixture, 'host settlement disabled')
+        with self.locks(),cancelled_signals():
+            started=exists(self.state/PENDING) or exists(self.state/(PENDING+'.preparing')) or exists(self.archive)
+            need(resume if started else not resume, 'explicit exact resume required; duplicate close refused')
+            self.verify();self.tick('verified')
+            durable(self.state/PENDING,encoded(self.barrier()));self.tick('barrier_durable')
+            for p in (self.archive.parent,self.archive):
+                if not exists(p):p.mkdir(mode=0o700);sync(p.parent)
+                directory(p);need(p.stat().st_dev==self.state.stat().st_dev,'archive filesystem')
+            allowed={'UNCERTAIN.json',RECEIPT,RECEIPT+'.preparing','ledger-prefix.jsonl','ledger-prefix.jsonl.preparing'}
+            need(all(p.name in allowed for p in self.archive.iterdir()), 'foreign archive entry')
+            durable(self.archive/'ledger-prefix.jsonl',read(self.ledger));self.tick('prefix_durable')
+            marker=self.marker()
+            if marker.parent==self.state:noreplace(marker,self.archive/'UNCERTAIN.json')
+            self.tick('marker_archived');self.verify()
+            for p in (self.archive,self.archive.parent,self.state):sync(p)
+            self.tick('final_directories_synced')
+            durable(self.archive/RECEIPT,encoded(self.receipt()));self.tick('receipt_durable')
+            return self.closed()
+
+    def closed(self):
+        prior=self.prior()
+        need(read(self.state/PENDING)==encoded(self.barrier()) and not exists(self.state/(PENDING+'.preparing')),
+             'closure barrier absent/partial')
+        need({p.name for p in directory(self.archive).iterdir()}=={'UNCERTAIN.json',RECEIPT,'ledger-prefix.jsonl'},
+             'closure archive incomplete')
+        read(self.archive/'UNCERTAIN.json',self.s['marker'])
+        need(read(self.archive/RECEIPT)==encoded(self.receipt()), 'closure receipt differs')
+        read(self.archive/'ledger-prefix.jsonl',self.s['ledger'])
+        _,head,event=self.ledger_check()
+        return {'schema':'e5-lock-lineage-stop-closure-view-v1','serial':self.c['serial'],
+                'retired_txid':self.s['txid'],'case_sha256':self.case_sha,'prior_closure':prior,
+                'retired_txids':sorted(set(prior['retired_txids'])|{self.s['txid']}),
+                'excluded_boot_ids':prior['excluded_boot_ids'],'same_boot_refresh_candidate':self.s['boot_id'],
+                'barrier':{'path':str(self.state/PENDING),'sha256':sha(encoded(self.barrier()))},
+                'receipt':{'path':str(self.archive/RECEIPT),'sha256':sha(encoded(self.receipt()))},
+                'current_ledger_head':head,'current_ledger_last_event':event,
+                'freshness_or_execution_authority':False}
+
+
+def _load():
+    raw=read(HERE/'CASE.json');need(sha(raw)==CASE_SHA256,'fixed case pin')
+    return _Case(ROOT,json.loads(raw),sha(raw))
+def verify_case():return _load().verify()
+def close_case():return _load().close()
+def resume_case():return _load().close(resume=True)
+def validate_closed(state,ledger):
+    c=_load();need(Path(state)==c.state and Path(ledger)==c.ledger,'fixed state/ledger');return c.closed()
+def assert_new_identity(view,boot_id,txid):return prior_api().assert_new_identity(view,boot_id,txid)
+def barrier_bindings(view):return prior_api().barrier_bindings(view)
+def stable_view(view):return prior_api().stable_view(view)
+def transport_gate(state,ledger,serial,boot_id,txid):
+    v=validate_closed(state,ledger);need(v['serial']==serial,'serial');assert_new_identity(v,boot_id,txid)
+    need(not exists(Path(state)/TRANSITION),'unfinished recovery');return v
+def normal_gate(state,ledger,boot_id=None,txid=None):
+    v=validate_closed(state,ledger)
+    need(v['current_ledger_last_event']=='COMPLETE','latest boot transaction incomplete')
+    need(not any(exists(Path(state)/n) for n in ('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json',TRANSITION)),
+         'unresolved operation')
+    if boot_id is not None or txid is not None:assert_new_identity(v,boot_id,txid)
+    return v
+def augment_snapshot(snapshot,state,ledger):
+    v=validate_closed(state,ledger)
+    need(all(snapshot['markers'].get(k)==b for k,b in barrier_bindings(v).items()),'permanent barriers omitted')
+    need(snapshot['serial']==v['serial'] and snapshot['ledger_head']==v['current_ledger_head'] and
+         snapshot['ledger_last_event']==v['current_ledger_last_event'],'snapshot ledger/serial')
+    return dict(snapshot,readonly_abort_closure=v,
+                previous_boots=sorted(set(snapshot['previous_boots'])|set(v['excluded_boot_ids'])),
+                used_txids=sorted(set(snapshot['used_txids'])|set(v['retired_txids'])))
+def snapshot_gate(snapshot,state,ledger,*,normal=False):
+    saved=snapshot.get('readonly_abort_closure')
+    if isinstance(saved,dict) and saved.get('schema')!='e5-lock-lineage-stop-closure-view-v1':
+        need(snapshot['markers'].get(PENDING)=='ABSENT' and snapshot['markers'].get(TRANSITION,'ABSENT')=='ABSENT',
+             'historical snapshot contains new barrier')
+        return prior_api().snapshot_gate(snapshot,state,ledger,normal=normal)
+    v=validate_closed(state,ledger)
+    need(isinstance(saved,dict) and stable_view(saved)==stable_view(v),'closure snapshot identity')
+    need(saved['current_ledger_head']==snapshot['ledger_head'] and saved['current_ledger_last_event']==snapshot['ledger_last_event'],
+         'captured closure ledger')
+    need(all(snapshot['markers'].get(k)==b for k,b in barrier_bindings(v).items()) and
+         snapshot['markers'].get(TRANSITION)=='ABSENT','snapshot barriers/transition')
+    need(set(v['retired_txids'])<=set(snapshot['used_txids']) and set(v['excluded_boot_ids'])<=set(snapshot['previous_boots']),
+         'snapshot retired identity omitted')
+    if normal:
+        need(all(snapshot['markers'].get(k)=='ABSENT' for k in ('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json')) and
+             snapshot['ledger_last_event']=='COMPLETE','snapshot abnormal')
+    return v
+
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser();p.add_argument('mode',choices=('plan','close','resume'),nargs='?',default='plan');a=p.parse_args()
+    print(json.dumps({'plan':verify_case,'close':close_case,'resume':resume_case}[a.mode](),sort_keys=True))

@@ -1,0 +1,170 @@
+"""Disabled thin staging wrapper; fixed create-stage timeout and existing IO.
+
+No bootstrap, block writes, real-directory activation, retry or cleanup.
+"""
+import hashlib
+import json
+import os
+import stat
+from pathlib import Path
+import re
+import shlex
+import sys
+import uuid
+
+STAGE_IO_DISABLED = True
+ROOT=Path(__file__).resolve().parents[2]
+LIVE=Path(__file__).resolve().parent
+ADAPTER_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+TRANSPORT_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+BB='/data/adb/magisk/busybox'
+SERIAL='DEVICE_SERIAL_REDACTED'
+RAW_BYTES=2<<30
+RAW_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CHUNK=4<<20
+PINNED={
+ 'openwrt.ext4.gz':(149230668,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'device-files.tar':(60661760,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'openwrt-install.conf':(123,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'boot.img':(67108864,'0000000000000000000000000000000000000000000000000000000000000000'),
+ 'fscrypt-probe':(716192,'0000000000000000000000000000000000000000000000000000000000000000'),
+}
+
+class InputChanged(RuntimeError):
+ def __init__(self,message,details=None):super().__init__(message);self.details=details or {}
+FIELDS=('st_dev','st_ino','st_mode','st_nlink','st_uid','st_gid','st_size','st_mtime_ns','st_ctime_ns')
+def identity(s):return tuple(getattr(s,k) for k in FIELDS)
+def checked_path(path):
+ p=Path(path)
+ if not p.is_absolute() or '..' in p.parts or p.is_symlink() or any(q.is_symlink() for q in p.parents):raise InputChanged('unsafe input path')
+ s=p.lstat()
+ if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1:raise InputChanged('input must be a single regular file')
+ return p,s
+class PinnedInput:
+ def __init__(self,path,size,digest):
+  if type(size) is not int or not 0<=size<=16<<30 or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):raise InputChanged('input binding')
+  self.path,self.expected,self.digest=Path(path),size,digest;self.fd=None;self.count=0;self.hash=hashlib.sha256();self.finished=False
+ def __enter__(self):
+  p,s=checked_path(self.path);self.initial=identity(s)
+  if s.st_size!=self.expected:raise InputChanged('input size before read')
+  fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+  try:
+   if identity(os.fstat(fd))!=self.initial or identity(checked_path(p)[1])!=self.initial:raise InputChanged('input replaced during open')
+  except BaseException:os.close(fd);raise
+  self.fd=fd;return self
+ def read(self,n):
+  if self.fd is None or self.finished or type(n) is not int or n<=0:raise InputChanged('invalid input read')
+  b=os.read(self.fd,n);self.count+=len(b);self.hash.update(b)
+  if self.count>self.expected:raise InputChanged('input grew')
+  return b
+ def finish(self):
+  if self.fd is None or self.finished:raise InputChanged('input not active')
+  observed_fd=identity(os.fstat(self.fd));observed_path=identity(checked_path(self.path)[1])
+  trailing=os.read(self.fd,1)
+  if self.count!=self.expected or self.hash.hexdigest()!=self.digest or trailing or observed_fd!=self.initial or observed_path!=self.initial:
+   reason='input identity or stable metadata changed' if observed_fd!=self.initial or observed_path!=self.initial else 'input length or hash differs'
+   raise InputChanged(reason,{'path':str(self.path),'initial':dict(zip(FIELDS,self.initial)),'observed_fd':dict(zip(FIELDS,observed_fd)),'observed_path':dict(zip(FIELDS,observed_path)),'changed_fd_fields':[k for k,a,b in zip(FIELDS,self.initial,observed_fd) if a!=b],'changed_path_fields':[k for k,a,b in zip(FIELDS,self.initial,observed_path) if a!=b],'bytes_read':self.count,'hash_matches':self.hash.hexdigest()==self.digest,'length_matches':self.count==self.expected,'trailing_data':bool(trailing)})
+  self.finished=True
+ def __exit__(self,typ,value,tb):
+  try:
+   if typ is None and not self.finished:raise InputChanged('input was not fully verified')
+  finally:
+   if self.fd is not None:os.close(self.fd);self.fd=None
+
+class Refusal(RuntimeError):pass
+def require(ok,why):
+ if not ok:raise Refusal(why)
+def sha(data):return hashlib.sha256(data).hexdigest()
+def file_sha(p):
+ p=Path(p);require(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe source')
+ require(p.is_file() and p.stat().st_nlink==1,'source type/link');return sha(p.read_bytes())
+
+class BoundedStage:
+ def __init__(self,adapter):
+  self.a=adapter;self.used=False
+  require(re.fullmatch('[a-f0-9]{16}',adapter.txid) and re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',adapter.boot_id),'tx/boot')
+  self.path='/data/e5linux.stage.'+adapter.txid
+ def _contract(self,artifacts,raw_image):
+  require(file_sha(LIVE/'android_directory_adapter.py')==ADAPTER_SHA and file_sha(LIVE/'bounded_transport.py')==TRANSPORT_SHA,'frozen source changed')
+  module=sys.modules.get(type(self.a).__module__)
+  require(module is not None and Path(module.__file__).resolve()==LIVE/'android_directory_adapter.py' and type(self.a) is module.AndroidDirectoryAdapter,'exact real adapter required')
+  require(self.a.path('stage')==self.path and self.a._part is None,'fixed stage/no enclosing mutation')
+  require(all(type(item) is module.Artifact for item in [*artifacts.values(),raw_image]),'exact Artifact type')
+  transport=self.a._ensure_transport()
+  require(transport.recovery_context is None and transport.reconciliation_only is False,'normal-only stage')
+  require(transport.state==ROOT/('evidence/e5-clean-v3-device-state-'+SERIAL) and transport.serial==SERIAL and transport.boot_id==self.a.boot_id and transport.txid==self.a.txid,'shared state binding')
+  return module,transport
+ def _parents(self):
+  # Exact parent identities immediately surrounding exclusive stage creation.
+  paths=('/data',self.a.path('active'),self.a.lock);script=self.a._locked()
+  for path in paths:script+=f'test ! -L {path}; test -d {path}; test "$(readlink -f {path})" = {path}; stat -c "%d %i" {path}\n'
+  def parse(raw):
+   lines=raw.splitlines();require(len(lines)==3,'parent rows');rows=[]
+   for line in lines:
+    fields=line.split();require(len(fields)==2 and all(v.isdigit() and int(v)>0 for v in fields),'parent identity');rows.append(tuple(map(int,fields)))
+   require(len({x[0] for x in rows})==1,'parent filesystem changed');return rows
+  return self.a._request('bounded-stage-parents',script,limit=512,validator=parse)
+ def _create(self,required_kib):
+  before=self._parents();deadline=self.a._deadline();op=uuid.uuid4().hex
+  tick=f"awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime\n"
+  body=self.a._locked()+f'test ! -e {self.path}; test ! -L {self.path}\n'
+  body+=f'test "$(df -Pk /data | tail -n 1 | awk \'{{print $4}}\')" -ge {required_kib}\n'
+  for path,(dev,ino) in zip(('/data',self.a.path('active'),self.a.lock),before):
+   body+=f'test ! -L {path}; test -d {path}; test "$(readlink -f {path})" = {path}; test "$(stat -c \'%d %i\' {path})" = \'{dev} {ino}\'\n'
+  body+=tick+f'umask 077; mkdir {self.path}\n'+tick
+  script=BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote('set -eu\nset -o pipefail\nset -C\n'+body)
+  def empty(raw):require(raw==b'','unexpected create output');return None
+  def follow(ack):
+   require(self._parents()==before,'parent replaced during stage create')
+   check=self.a._locked()+f'test ! -L {self.path}; test -d {self.path}; test "$(readlink -f {self.path})" = {self.path}\n'
+   check+=f'test "$({BB} find {self.path} -mindepth 1 -maxdepth 1 -print0 | {BB} wc -c)" = 0\nstat -c "%d %i %u %g %a" {self.path}\n'
+   def parse(raw):
+    fields=raw.split();require(len(fields)==5 and all(x.isdigit() for x in fields),'stage stat')
+    dev,ino,uid,gid=int(fields[0]),int(fields[1]),int(fields[2]),int(fields[3])
+    require(dev==before[0][0] and ino>0 and uid==gid==0 and fields[4]==b'700','stage device/inode/owner/mode')
+    return (dev,ino)
+   identity=self.a._request('bounded-stage-readback',check,limit=256,validator=parse)
+   require(self._parents()==before,'parent changed after stage readback');return identity
+  return self.a._request('bounded-create-stage',script,limit=4096,mutating=True,validator=empty,followup=follow,op_id=op),op
+ def run(self,artifacts,raw_image):
+  require(not STAGE_IO_DISABLED,'STAGE_IO_DISABLED: prepared only')
+  require(not self.used,'no replay');self.used=True;transport=None
+  try:
+   module,transport=self._contract(artifacts,raw_image)
+   require(transport.recovery_context is None and transport.reconciliation_only is False,'normal-only stage')
+   require(set(artifacts)==set(PINNED),'exact five stage inputs')
+   for name,item in artifacts.items():require((item.size,item.sha256)==PINNED[name],'candidate changed');item.verify()
+   require((raw_image.size,raw_image.sha256)==(RAW_BYTES,RAW_SHA),'pristine raw binding');raw_image.verify()
+   fields=dict(re.findall(r"^(E5_[A-Z_]+)='([^'\r\n]*)'$",artifacts['openwrt-install.conf'].path.read_text(),re.M))
+   require(fields.get('E5_DEFAULT_BOOT')=='android','default must remain Android')
+   self.a.occupancy()
+   needed=(RAW_BYTES+sum(x.size for x in artifacts.values())+(1<<30)+1023)//1024
+   identity,create_op=self._create(needed)
+   inputs={**artifacts,'openwrt.ext4':raw_image}
+   for name,data in (('boot-os',b'openwrt\n'),('openwrt-default-boot',b'android\n')):
+    host=self.a.evidence_dir/(name+'.input');module.transport_api.save(host,data);inputs[name]=module.Artifact(host,len(data),sha(data))
+   for name in sorted(inputs):
+    item=inputs[name];item.verify();inode=0
+    with PinnedInput(item.path,item.size,item.sha256) as source:
+     for offset in range(0,item.size,CHUNK):
+      payload=source.read(min(CHUNK,item.size-offset));require(len(payload)==min(CHUNK,item.size-offset),'short host input')
+      ack=self.a._write_file_chunk(name,item,offset,payload,inode,identity);inode=ack['inode']
+     source.finish()
+   probe=self.path+'/fscrypt-probe'
+   for name in ('',*sorted(inputs)):
+    target=self.path+('/'+name if name else '')
+    self.a._request('fscrypt-check',f'test "$({probe} {target})" = unencrypted\nprintf "UNENCRYPTED\\n"\n',limit=128,
+     validator=lambda raw:raw if raw==b'UNENCRYPTED\n' else (_ for _ in ()).throw(Refusal('fscrypt policy')))
+   inventory=self.a.inspect('stage')
+   module.transport_api.save_json(self.a.evidence_dir/'BOUNDED_STAGE_RESULT.json',{'schema':'e5-bounded-stage-v1','serial':SERIAL,'txid':self.a.txid,'boot_id':self.a.boot_id,'create_op_id':create_op,'stage_identity':identity,'inventory':inventory,'activated':False,'block_writes':False,'default_boot':'android','requires_matching_transport_complete':True})
+   return inventory
+  except BaseException as exc:
+   if getattr(exc,'details',None):
+    try:module.transport_api.save_json(self.a.evidence_dir/'HOST_INPUT_FAILURE.json',exc.details)
+    except BaseException:pass
+   if transport is not None:
+    try:transport.mark_uncertain('bounded stage: '+type(exc).__name__+': '+str(exc))
+    except BaseException:pass
+   raise
+
+if __name__=='__main__':raise SystemExit('Prepared-only library; STAGE_IO_DISABLED; no device CLI.')

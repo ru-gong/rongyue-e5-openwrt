@@ -1,0 +1,138 @@
+"""Host-only data checks and extracted real shell function with builtin stubs.
+
+No init execution, mount, block, device, VM or network calls. The only spawned
+process is /bin/sh with a fixed test preamble; mount and every mutation action
+are functions. The sole path substitution is its log redirection into a private
+temporary host directory. An audit hook precedes importing the repacker.
+"""
+import hashlib
+import json
+from pathlib import Path
+import re
+import struct
+import subprocess
+import sys
+import tempfile
+import unittest
+
+def audit(event,args):
+    if event.startswith('socket.') or event in ('os.system','os.posix_spawn','os.exec','pty.spawn'):
+        raise AssertionError('forbidden process/network: '+event)
+    if event=='subprocess.Popen':
+        argv=args[1]
+        if not (len(argv)==3 and argv[0]=='/bin/sh' and argv[1]=='-c' and argv[2].startswith('# E5_HOST_ONLY_BUILTIN_FIXTURE\n')):
+            raise AssertionError('non-fixture subprocess')
+sys.addaudithook(audit)
+import prepare as p
+
+class CandidateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.old=(p.BASE/'boot.img').read_bytes();cls.new=(p.OUT/'files/boot.img').read_bytes()
+        cls.a=p.parse_boot(cls.old);cls.b=p.parse_boot(cls.new)
+        cls.ac=p.decompress_legacy(cls.a['ramdisk']);cls.bc=p.decompress_legacy(cls.b['ramdisk'])
+        cls.ar,_=p.parse_cpio(cls.ac);cls.br,_=p.parse_cpio(cls.bc)
+        cls.original=next(r['data'] for r in cls.ar if r['name']=='init')
+        cls.changed=next(r['data'] for r in cls.br if r['name']=='init')
+
+    def run_function(self,rc,caller=False):
+        with tempfile.TemporaryDirectory(prefix='e5-no-fsck-test-') as td:
+            # Redirection is the only fixture edit to the actual function bytes.
+            text=self.changed[self.changed.index(b'mount_userdata_root() {'):]
+            text=text[:text.index(b'\n}')+2].decode()
+            self.assertEqual(text.encode(),p.NEW_FUNCTION)
+            text=text.replace('/run/datamount.err',str(Path(td)/'mount.err'))
+            pre='''# E5_HOST_ONLY_BUILTIN_FIXTURE
+mount() { printf 'MOUNT|%s\\n' "$*"; return "$MOUNT_RC"; }
+log() { printf 'LOG|%s\\n' "$*"; }
+f2fs_repair_userdata() { printf 'FORBIDDEN|repair\\n'; exit 93; }
+write_misc_bc() { printf 'FORBIDDEN|bc\\n'; exit 93; }
+reboot() { printf 'FORBIDDEN|reboot\\n'; exit 93; }
+persist() { printf 'FORBIDDEN|persist\\n'; exit 93; }
+sync() { printf 'FORBIDDEN|sync\\n'; exit 93; }
+blockdev() { printf 'FORBIDDEN|blockdev\\n'; exit 93; }
+restore_slot_a() { printf 'FALLBACK_A\\n'; }
+data=/HOST_FIXTURE_USERDATA
+'''
+            action='if mount_userdata_root; then printf "ROOT_PATH\\n"; else restore_slot_a; fi' if caller else 'mount_userdata_root; rc=$?; printf "RC|%s\\n" "$rc"'
+            out=subprocess.run(['/bin/sh','-c',pre+f'MOUNT_RC={rc}\n'+text+'\n'+action+'\n'],capture_output=True,timeout=3)
+            self.assertEqual(out.returncode,0,out.stderr);self.assertEqual(out.stderr,b'')
+            return out.stdout.decode().splitlines()
+
+    def test_actual_boot_and_members_roundtrip(self):
+        audit=p.compare(self.old,self.new)
+        self.assertEqual(audit['changed_members'],['init']);self.assertEqual(audit['member_count_excluding_trailer'],75)
+    def test_change_confined_to_function(self):
+        self.assertEqual(self.changed,p.patch_init(self.original))
+        self.assertEqual(self.changed.replace(p.NEW_FUNCTION,p.OLD_FUNCTION),self.original)
+    def test_success_only_one_mount_no_repair(self):
+        self.assertEqual(self.run_function(0),['MOUNT|-t f2fs -o noatime,nodiratime /HOST_FIXTURE_USERDATA /data','RC|0'])
+    def test_mount_failure_no_repair_rearm_reboot(self):
+        for code in (1,2,32,124,137):
+            with self.subTest(code=code):
+                rows=self.run_function(code)
+                self.assertEqual(len([x for x in rows if x.startswith('MOUNT|')]),1)
+                self.assertEqual(rows[-1],'RC|1');self.assertFalse(any(x.startswith('FORBIDDEN') for x in rows))
+                self.assertIn('LOG|stage=data-mount-failed no-auto-fsck retaining-rescue-fallback',rows)
+    def test_caller_failure_selects_android_fallback(self):
+        self.assertEqual(self.run_function(1,True)[-1],'FALLBACK_A')
+    def test_caller_success_keeps_root_path(self):
+        self.assertEqual(self.run_function(0,True)[-1],'ROOT_PATH')
+    def test_no_source_or_invoke_repair_in_init(self):
+        for forbidden in (b'. /etc/f2fs-repair.sh',b'f2fs_repair_userdata',b'f2fs-repair-rearm',b'reboot-for-clean-firmware-load'):
+            self.assertNotIn(forbidden,self.changed)
+    def test_fallback_and_timer_unchanged(self):
+        for start,end in ((b'(sleep 600\n',b'timer_job=$!'),(b'log "stage=rootfs-unavailable',b'log "stage=ready standalone"')):
+            left=self.original[self.original.index(start):];left=left[:left.index(end)+len(end)]
+            self.assertIn(left,self.changed)
+        self.assertIn(b'else\n        restore_slot_a\n    fi',self.changed)
+    def test_no_new_mmc_writer_or_cellular_change(self):
+        left=self.original.replace(p.OLD_FUNCTION,b'');right=self.changed.replace(p.NEW_FUNCTION,b'')
+        self.assertEqual(left,right)
+        self.assertIsNone(re.search(rb'^\s*(?:dd|fsck(?:\.f2fs)?|reboot|write_misc_bc|f2fs_repair_userdata)\s',p.NEW_FUNCTION,re.M))
+    def test_diagnostic_bound_preserved(self):
+        self.assertIn(b'PERSIST_SEEK_BLOCKS=14336',self.changed)
+        self.assertIn(b'bs=4096 seek=$PERSIST_SEEK_BLOCKS count=1024 conv=notrunc',self.changed)
+        self.assertFalse(any(self.new[p.LOG_START:p.LOG_END]))
+        self.assertLess(self.b['vbmeta_offset']+self.b['vbmeta_size'],p.LOG_START)
+    def test_kernel_header_and_avb_blob_identity(self):
+        self.assertEqual(self.a['kernel'],self.b['kernel']);self.assertEqual(self.a['vbmeta'],self.b['vbmeta'])
+        before=bytearray(self.a['header']);after=bytearray(self.b['header']);before[12:16]=after[12:16];self.assertEqual(before,after)
+    def test_template_exact32_and_crc_preserved(self):
+        for name in ('etc/misc-bc-slot-a.bin','etc/misc-bc-slot-b-trial.bin'):
+            a=next(r['data'] for r in self.ar if r['name']==name);b=next(r['data'] for r in self.br if r['name']==name)
+            self.assertEqual(a,b);self.assertEqual(len(b),32);self.assertEqual(p.zlib.crc32(b[:28]),struct.unpack('<I',b[28:])[0])
+    def test_other_74_members_and_dormant_repair_preserved(self):
+        changed=[x['name'] for x,y in zip(self.ar,self.br) if x['raw']!=y['raw']]
+        self.assertEqual(changed,['init']);self.assertIn('repair/sbin/fsck.f2fs',[r['name'] for r in self.br])
+    def test_old_init_drift_rejected(self):
+        with self.assertRaises(p.Rejected):p.patch_init(self.original+b'\n')
+    def test_bad_lz4_and_cpio_rejected(self):
+        for data in (b'',b'wrong',bytes.fromhex('02214c18')+b'\xff'*4):
+            with self.assertRaises(p.Rejected):p.decompress_legacy(data)
+        with self.assertRaises(p.Rejected):p.parse_cpio(b'070701'+b'0'*20)
+    def test_payload_over_log_limit_rejected(self):
+        bad=bytearray(self.new);struct.pack_into('<I',bad,12,p.LOG_START)
+        with self.assertRaises(p.Rejected):p.parse_boot(bytes(bad))
+    def test_dirty_diagnostic_preimage_refused(self):
+        bad=bytearray(self.new);bad[p.LOG_START]=1
+        with self.assertRaises(p.Rejected):p.parse_boot(bytes(bad))
+    def test_existing_output_cannot_be_rebuilt_or_overwritten(self):
+        with self.assertRaises(p.Rejected):p.build()
+    def test_seven_files_unchanged_and_candidate_not_approved(self):
+        old=json.loads(p.OLD_CANDIDATE.read_text());new=json.loads((p.OUT/'candidate.json').read_text())
+        for name,record in old['outer_file_set'].items():
+            if name=='boot.img':continue
+            path=p.OUT/'files'/name
+            self.assertEqual(path.stat().st_size,record['bytes']);self.assertEqual(p.file_sha(path),record['sha256'])
+            self.assertEqual(new['outer_file_set'][name],record)
+        self.assertFalse(new['approved_for_device_execution']);self.assertTrue(new['independent_review_pending'])
+    def test_boot_region_hashes_bind_actual_output(self):
+        a=json.loads((p.OUT/'boot-content-audit.json').read_text())
+        self.assertEqual(a['boot_sha256'],p.sha(self.new));self.assertEqual(a['sha256_head56m'],p.sha(self.new[:p.LOG_START]))
+        self.assertEqual(a['sha256_tail4m'],p.sha(self.new[p.LOG_END:]))
+    def test_host_only_api_no_device_switch(self):
+        self.assertFalse(p.DEVICE_EXECUTION_SUPPORTED)
+        self.assertFalse(hasattr(p,'execute'));self.assertFalse(hasattr(p,'reboot'))
+
+if __name__=='__main__':unittest.main(verbosity=2)

@@ -1,0 +1,59 @@
+"""Mechanical host-only gate/path/pin copy. Default plan, never executes copies."""
+import sys
+def deny(event,args):
+ if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':raise RuntimeError('external operation forbidden')
+sys.addaudithook(deny)
+import ast,copy,difflib,hashlib,importlib.util,json
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent
+BASE=ROOT/'tools/e5_largefile_budget_prepare_20261015/RESULT.json';BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+BASE_MANIFEST=ROOT/'tools/e5_largefile_budget_prepare_20261015/MANIFEST.json';BASE_MANIFEST_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+REVIEW_PATH=Path('/REDACTED_HOST_PATH');REVIEW_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+IDENT='6c405cb2e5c4447e'
+BUILDER=ROOT/'tools/e5_activation_prepare_20261015/activation.py';BUILDER_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+sha=lambda b:hashlib.sha256(b).hexdigest()
+assert sha(BUILDER.read_bytes())==BUILDER_SHA
+sp=importlib.util.spec_from_file_location('_budget_activation_builder',BUILDER);a=importlib.util.module_from_spec(sp);sp.loader.exec_module(a)
+def source():
+ base=json.loads(a.read(BASE,BASE_SHA));m=json.loads(a.read(BASE_MANIFEST,BASE_MANIFEST_SHA))
+ for item in m['files'].values():a.read(item['path'],item['sha256'],item['bytes'])
+ return base,{k:a.read(v['path'],v['sha256'],v['bytes']) for k,v in base['files'].items()}
+def prepare(files,base,dest):
+ recipe=json.loads((ROOT/'tools/e5_nextphase_core_prepare_20261015/ACTIVATION_RECIPE.json').read_bytes());del recipe['literal_gates']['recovery/observe.py']
+ a.GROUPS={k:Path(v).name for k,v in base['directories'].items()}
+ b=a.reseal(files,dest,recipe)
+ rm=b.obj('recovery/MANIFEST.json');rm.update(default_disabled=False,enabled=['observe','recovery','rearm'],status='ENABLED_COPY_PENDING_SOURCE_INDEPENDENT_REVIEW');b.put('recovery/MANIFEST.json',rm)
+ cm=b.obj('core/SOURCE_MANIFEST.json');cm['recovery_manifest']=b.binding('recovery/MANIFEST.json');old=b.digest('core/SOURCE_MANIFEST.json');b.put('core/SOURCE_MANIFEST.json',cm);b.set('core/workflow.py','MANIFEST_SHA',old,b.digest('core/SOURCE_MANIFEST.json'))
+ assert b.files['recovery/observe.py']==files['recovery/observe.py'] and b.files['recovery/evidence_contract.py']==files['recovery/evidence_contract.py']
+ assert b.files['acceptance/collect.sh'].count(b.files['acceptance/collect.py'])==1
+ for k in files:
+  if k.endswith('.ENABLED') or k=='core/bounded_transport.py':assert b.files[k]==files[k]
+ return b
+def make_copy():
+ a.need(REVIEW_PATH is not None and REVIEW_SHA!='0'*64,'independent preparation review not bound')
+ a.read(REVIEW_PATH,REVIEW_SHA);a.need(len(IDENT)==16 and all(c in '0123456789abcdef' for c in IDENT),'fixed unique id')
+ base,files=source();dest={k:ROOT/'tools'/(a.DEST_STEMS[k]+IDENT) for k in base['directories']};control=ROOT/'tools'/('e5_activation_bundle_'+IDENT)
+ for p in [control,*dest.values()]:a.need(not p.exists() and not p.is_symlink(),'fresh sibling copy required')
+ b=prepare(files,base,dest);assert source()[1]==files
+ try:
+  a.mkdir(control)
+  for p in dest.values():a.mkdir(p)
+  for k,raw in b.files.items():
+   path=Path(b.path(k));missing=[];p=path.parent
+   while p not in dest.values() and not p.exists():missing.append(p);p=p.parent
+   for p in reversed(missing):a.mkdir(p)
+   a.write_new(path,raw)
+  assert source()[1]==files
+  for k,v in b.files.items():a.read(b.path(k),sha(v),len(v))
+  changes=''.join(''.join(difflib.unified_diff(files[k].decode().splitlines(True),v.decode().splitlines(True),fromfile='budget-prepare/'+k,tofile='enabled-copy/'+k)) for k,v in sorted(b.files.items()) if files[k]!=v)
+  a.write_new(control/'CHANGES.patch',changes.encode());a.write_new(control/'EDITS.json',a.encode(b.edits))
+  result={'schema':'e5-mechanical-budget-activation-v1','activation_id':IDENT,'base_result':{'path':str(BASE),'sha256':BASE_SHA},'preparation_review':{'path':str(REVIEW_PATH),'sha256':REVIEW_SHA},'directories':{k:str(v) for k,v in dest.items()},'files':{k:b.binding(k,True) for k in sorted(b.files)},'device_io_performed':False,'copies_executed':False,'field_approval_generated':False,'independent_enabled_copy_review_required':True}
+  a.write_new(control/'RESULT.json',a.encode(result));a.write_new(control/'COMPLETE.json',a.encode({'schema':'e5-mechanical-budget-activation-complete-v1','result_sha256':sha(a.encode(result)),'device_execution_authorized_by_this_file':False}));return result
+ except BaseException as exc:
+  if control.exists():a.write_new(control/'STOP.json',a.encode({'error':repr(exc),'partial_copies_invalid':True,'automatic_cleanup_retry':False}))
+  raise
+def main():
+ if sys.argv[1:]==['copy']:print(json.dumps(make_copy(),ensure_ascii=False))
+ elif sys.argv[1:] in ([],['plan']):print(json.dumps({'status':'PLAN_ONLY','source_result_sha256':BASE_SHA,'observer_and_policy_bytes_preserved':True,'source_gates_inverted':13,'independent_review_bound':REVIEW_SHA!='0'*64,'no_device_calls':True,'copies_not_created':True},ensure_ascii=False))
+ else:raise SystemExit('plan | copy')
+if __name__=='__main__':main()

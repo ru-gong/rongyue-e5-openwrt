@@ -1,0 +1,51 @@
+# 带卡第二次试启准备件（默认禁用）
+
+本目录是 **SIM-only 离线准备件**。它不参与正在执行的无卡安装；所有设备入口均禁用，未上传、未在 E5 上运行，未生成任何现场通过或批准凭据。原 noSIM 观察器、预算包、历史原件、共享 ACTIVE/UNCERTAIN/ledger 均未修改。
+
+## 精确范围
+
+- 两槽各自接受原始 `READY` 或 `LOADED`。21 个健康样本和逐请求前后记录允许这四种合法组合间变化，保存原值，不把 `LOADED` 改成 `READY`。ABSENT、NOT_READY、锁卡或未知状态拒绝。
+- 保留首个 nonroot/root 样本不晚于开机 120 秒、21 样本至少 600 秒、每请求主机 8 秒/远端 6 秒、rc255 停止、同 boot/A/原机属性、PID1/日志/异常独审、正常共享状态与原有双层独审。
+- 新读九个物理 NV 分区：p13–18、p22–23、p69。精确 geometry、by-name、sysfs、rdev、inode 和偏移均绑定；每个分区先完整原始读，再逐块远端 SHA 完整复核。两遍变化即保存已有证据并停止，绝不自动重试或刷新 NV。
+- 只被动读取 `dumpsys telephony.registry` 和 `dumpsys connectivity`，没有 AT、切卡、APN、短信发送或联网配置。READY/LOADED 不证明两卡已注册或蜂窝网络实际可用；独审必须根据保存的原始网络记录作该判断，不能只填批准布尔。
+- 唯一写范围继续为 `/dev/block/mmcblk0p3` **offset 2048、length 32**，复用固定已有 native IO helper。不会写 boot B、NV、super、data 或目录，不上传新 helper、不重启、不自动恢复/重试。写前重新完整读取九 NV 与审查基线比较，再紧邻写入重新读取 misc；写后完整 misc、B 和 13 项保护复核。
+- 原件恢复/目录部署入口在本 SIM 包中不可执行，即使改变 `RECOVERY_IO_DISABLED`，对应入口仍直接拒绝。
+
+## 源与证据关系
+
+`DEPENDENCIES.json` 绑定已独审的 `6c405cb2e5c4447e` 源族：core、recovery、workflow/nv_baseline、精确 manifest 和 activation RESULT。新候选 boot 为 `0000000000000000000000000000000000000000000000000000000000000000`，保留 56–60 MiB 诊断窗口，其余必须相符。
+
+无卡历史只通过该固定源族自己的纯主机 raw validator 重放，或固定四文件历史锚点；只形成 boot 排除集合，不移植旧时效、物理断电确认、当前 UI 状态或当前 SIM 准入。不得传任意可信布尔替代来源。`DEPENDENCIES.UNBOUND.example.json` 是不可执行模板，不是现场结果。
+
+`nv_origin.py` 核对：
+
+1. 固定源族的第一次 install COMPLETE/REQUEST、紧邻写 B 前的 `physical-nv-before/COMPLETE.json`、九份 raw 及两遍原始 transport 脚本/回执。
+2. 新候选首次 Linux 只读 collector 的固定 contract、关键保护记录、九物理 NV/只读 loop 映射、source/working-origin 完全相符和 fresh 标记，以及 Android 默认/下一启动状态。
+3. 独立人具名的来源审查，绑定上述原始材料和 digest。随后带卡 Android 新九 NV 与首次 origin 比较。只允许 fix/runtime 的真实变动交独审后保留旧工作副本；delta/cal 变化停止。**从不调用 `--refresh`，不把 retained origin 称为 fresh。**
+
+这是 **NV 来源专项门**，不是完整无卡 Linux 验收器。首轮所有日志、modem/内核异常、collector 缺项与已知 busybox 兼容例外、SSH 身份仍由主线程完成独立整体验收；未通过不得启用本组件。不能根据 `FIRST_FRESH_ORIGIN_VERIFIED_NO_REARM_AUTHORITY` 断言整机稳定或允许带卡重臂。独审姓名是可审责任记录，不是密码学身份认证。
+
+## API / CLI 次序
+
+以下仅说明接口，准备件执行设备动作会先拒绝。未来只能通过独立启用副本和再次核验 manifest 使用；不能覆盖本目录或当前 noSIM 包。
+
+1. `recovery.py state-request`：`--purpose rearm-with-sim --previous-evidence PATH --previous-evidence-sha SHA --sim-confirmation PATH --sim-confirmation-sha SHA --tool-manifest-sha SHA --output NEW_HOST_DIR`。SIM placement 确认只写 slot1/slot2 物理放置，不替系统声称 READY。
+2. `observe.py observe --request PATH --sha256 SHA --tool-manifest-sha SHA`，输出使用观察器自身独占新目录。实际冷启动 raw 后由独审形成 cold review；`recovery.py cold-envelope --input COMPLETE --sha256 SHA --review REVIEW --review-sha256 SHA --tool-manifest-sha SHA --output NEW_HOST_DIR`。
+3. `rearm.py capture --input COLD_ENVELOPE --sha256 SHA --helper-owner-tx EXISTING_TX --tool-manifest-sha SHA --output NEW_HOST_DIR`。只读 16 分区双遍和九 NV 双遍/网络原文，产生 `READONLY_RESULT.json`、`nv/COMPLETE.json`、`raw/reconciliation.json` 和 transport。
+4. 纯主机 `nv_origin.validate_first(binding)` / `sim_nv.validate_capture(...)` / `nv_origin.validate_gate(result_binding, review_binding)` 复核来源与新差异。审查格式见 `INTERFACES.md`，尚无任何真实通过样本。
+5. `rearm.py draft --input READONLY_RESULT --sha256 SHA --nv-review REVIEW --nv-review-sha256 SHA --request-id NEW_32HEX --seconds N --tool-manifest-sha SHA --output NEW_HOST_DIR`，再由独立审查人绑定生成的 proposal。
+6. `rearm.py validate --input PROPOSAL --sha256 SHA --review REVIEW --review-sha256 SHA --tool-manifest-sha SHA`。通过仅是纯主机证据结论。准备件的 `run` 始终拒绝；未来启用副本仍须重新核对当前 state、ledger、helper/boot 身份、全部读回和唯一 BC32 范围。
+
+必要停止条件：任一 barrier 未决、cold/UI/日志未审、SIM 非就绪、NV 两遍变化、未知来源/候选/物理映射、校准差异、Android 注册/联网依据不足、源 SHA 不符、剩余租约不足、8/6 秒超时、任何取消或回执不明。无自动延长租约、回填历史时间或新目录绕过共享阻断。
+
+## 时间与尚未实测项
+
+本包没有扩大恢复/rearm 的 900 秒证据租约或 600 秒总预算。capture 的 16 raw 双遍加九 NV 原始传输约 **697 MB**（另有远端完整 NV SHA 读取及协议/日志）；写阶段九 NV 再读加原有保护/B/misc 约 **698 MB**。这些是代码计数，不是硬件耗时。capture 与写阶段不能各自假定拥有独立新 900 秒；仍受共同 cold expiry 和独审 expiry 限制。现场耗时导致剩余窗口不足时会拒绝，不能暗中放宽。默认 `--seconds 600` 不保证在后段租约可用。
+
+SSH 新 host key 认证、首次 Linux 完整无卡验收、插卡后的 Android 注册/实际数据连接、真实 NV 基线/变化、helper 现状及时间预算都仍为现场 pending。失败目录的新备份及目录回退由现有独立方案负责，本组件不实现它们。
+
+## 离线验证
+
+`python3 -B -m unittest discover -s tools/e5_sim_rearm_prepare_20261015 -p 'test_*.py' -v`
+
+70 项 host/fake 测试通过：原 42 回归、完整 21 样本合法原值转换、19 项 SIM/NV 边界、8 项 first-origin 链。导入前进程/网络 audit hook 禁止外部调用，九 NV fixture 每项缩为 4096 B；未制造现场凭据，未运行 ADB、SSH、AT、VM 或设备 helper。结果不是硬件准入。

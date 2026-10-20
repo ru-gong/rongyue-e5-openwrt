@@ -1,0 +1,118 @@
+"""Pure host copy/reseal tests. No runtime entry, subprocess or socket is invoked."""
+import copy, importlib.util, json, sys, tempfile, unittest
+from pathlib import Path
+from unittest.mock import patch
+
+HERE=Path(__file__).resolve().parent
+spec=importlib.util.spec_from_file_location('tmpfix_builder_tests',HERE/'build_bundle.py')
+b=importlib.util.module_from_spec(spec);spec.loader.exec_module(b)
+
+class CopyTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.base=json.loads(b.a.read(b.BASE,b.BASE_SHA))
+        cls.raw={k:b.bound(v) for k,v in cls.base['files'].items()}
+        cls.cfg={'closure':{'path':'/host-fixture/closure.py','sha256':'1'*64,'bytes':8},
+                 'closure_case':{'path':'/host-fixture/CASE.json','sha256':'2'*64,'bytes':2},
+                 'evidence_inputs':{'arm_build_manifest':{'path':'/host-fixture/BUILD.json','sha256':'3'*64}}}
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='e5-tmpfix-copy-test-')
+        self.addCleanup(self.temp.cleanup)
+        self.root=Path(self.temp.name).resolve()
+        self.dest={g:self.root/('fixture_'+g) for g in self.base['directories']}
+    def prepared(self):
+        return b.reseal(self.raw,self.base,self.dest,self.cfg,disabled=True)
+    def test_default_plan_no_publication(self):
+        with patch.object(b,'load_inputs',side_effect=AssertionError('source read')),patch.object(b,'publish',side_effect=AssertionError('publication')):
+            self.assertEqual(b.main([])['status'],'PLAN_ONLY')
+    def test_activation_default_plan_and_unbound_copy_refused(self):
+        spec=importlib.util.spec_from_file_location('_fixture_activation_template',HERE/'activation_copy_v2.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        self.assertEqual(module.main([])['status'],'PLAN_ONLY')
+        with self.assertRaisesRegex(RuntimeError,'not frozen'):module.create(self.root/'nonexistent.json','0'*64)
+    def test_no_sources_before_freeze(self):
+        with patch.object(b,'INPUTS_SHA','0'*64):
+            with self.assertRaisesRegex(b.a.Refusal,'not frozen'):b.load_inputs()
+    def test_thirteen_gates_disabled(self):
+        new=self.prepared()
+        self.assertEqual(len(b.GATES),13)
+        for key,name in b.GATES.items():self.assertIs(b.a.assignment(new.files[key],name)[0],True)
+    def test_observe_and_policy_unchanged(self):
+        new=self.prepared()
+        for key in ('recovery/observe.py','recovery/evidence_contract.py','core/nv_geometry.json','acceptance/contract.json'):
+            self.assertEqual(new.files[key],self.raw[key])
+    def test_embedded_collector_disabled(self):
+        new=self.prepared()
+        self.assertEqual(new.files['acceptance/collect.sh'].count(new.files['acceptance/collect.py']),1)
+        self.assertIs(b.a.assignment(new.files['acceptance/collect.py'],'DEVICE_IO_DISABLED')[0],True)
+    def test_changed_transport_and_adapter_repin(self):
+        files=copy.deepcopy(self.raw)
+        for name in ('bounded_transport','android_directory_adapter'):files['core/'+name+'.py']+=b'\n# Host fixture source change.\n'
+        new=b.reseal(files,self.base,self.dest,self.cfg,disabled=True)
+        for key in ('core/bounded_stage.py','core/probe_host.py'):
+            self.assertEqual(b.a.assignment(new.files[key],'TRANSPORT_SHA')[0],new.digest('core/bounded_transport.py'))
+            self.assertEqual(b.a.assignment(new.files[key],'ADAPTER_SHA')[0],new.digest('core/android_directory_adapter.py'))
+    def test_all_manifest_pins(self):
+        new=self.prepared();cm=new.obj('core/SOURCE_MANIFEST.json')
+        self.assertEqual(b.a.assignment(new.files['core/workflow.py'],'MANIFEST_SHA')[0],new.digest('core/SOURCE_MANIFEST.json'))
+        for name,digest in cm['modules'].items():self.assertEqual(digest,new.digest('core/'+name+'.py'))
+        for field,key in [('deployment_manifest','scanner/ARTIFACT_MANIFEST.json'),('recovery_manifest','recovery/MANIFEST.json'),('nv_geometry','core/nv_geometry.json')]:
+            self.assertEqual(cm[field],new.binding(key))
+        self.assertEqual(cm['closure'],self.cfg['closure'])
+        self.assertEqual(cm['closure_case'],self.cfg['closure_case'])
+    def test_cold_and_runtime_pins(self):
+        new=self.prepared()
+        for name,digest in b.a.assignment(new.files['recovery/common.py'],'PINS')[0].items():
+            self.assertEqual(digest,new.digest('core/'+name+'.py'))
+        self.assertEqual(b.a.assignment(new.files['core/cold_bridge.py'],'SOURCE_SHA256')[0],new.digest('recovery/evidence_contract.py'))
+        self.assertEqual(b.a.assignment(new.files['core/cold_bridge.py'],'DEPENDENCIES')[0],{n:new.digest('recovery/'+n) for n in ('common.py','observe.py')})
+    def test_scanner_pins(self):
+        new=self.prepared();sm=new.obj('scanner/ARTIFACT_MANIFEST.json')
+        self.assertTrue(sm['host_execution_disabled'])
+        self.assertEqual(sm['host_source_sha256'],new.digest('scanner/stage2_deploy.py'))
+        for name in ('archiver','scanner'):
+            item=sm['artifacts'][name]
+            self.assertEqual(b.sha(new.files['scanner/'+str(Path(item['path']).relative_to(self.dest['scanner']))]),item['sha256'])
+    def test_only_package_paths_rebased(self):
+        new=self.prepared()
+        for key in ('core/bounded_boot_control.py','core/android_directory_adapter.py'):
+            for original in ('/dev/block/mmcblk0p37','/dev/block/mmcblk0p3'):
+                self.assertEqual(new.files[key].count(original.encode()),self.raw[key].count(original.encode()))
+        self.assertEqual(new.obj('core/SOURCE_MANIFEST.json')['stage_inputs'],json.loads(self.raw['core/SOURCE_MANIFEST.json'])['stage_inputs'])
+    def test_copy_is_exclusive_and_preserves_source(self):
+        new=self.prepared();control=self.root/'receipt'
+        result=b.publish(new,self.raw,control,{'host_writes_disabled':True})
+        for key,item in result['files'].items():self.assertEqual(b.bound(item),new.files[key])
+        self.assertFalse(result['device_io_performed'])
+        with self.assertRaisesRegex(b.a.Refusal,'fresh sibling'):b.publish(new,self.raw,control,{})
+        for key,item in self.base['files'].items():self.assertEqual(b.bound(item),self.raw[key])
+    def test_partial_failure_stop_preserves_copies(self):
+        new=self.prepared();control=self.root/'partial';write=b.a.write_new;count=0
+        def failing(path,raw):
+            nonlocal count
+            if Path(path).name!='STOP.json':
+                count+=1
+                if count==3:raise OSError('fixture disk full')
+            return write(path,raw)
+        with patch.object(b.a,'write_new',side_effect=failing):
+            with self.assertRaises(OSError):b.publish(new,self.raw,control,{})
+        self.assertTrue((control/'STOP.json').is_file())
+        self.assertGreater(sum(p.is_file() for p in self.root.rglob('*')),1)
+    def test_symlink_target_rejected(self):
+        new=self.prepared();self.dest['core'].symlink_to(self.root,target_is_directory=True)
+        with self.assertRaises(b.a.Refusal):b.publish(new,self.raw,self.root/'receipt',{})
+    def test_gate_missing_or_duplicate_refused(self):
+        for drift in (b'\nDEVICE_IO_DISABLED=False\n',):
+            files=copy.deepcopy(self.raw);files['core/bounded_boot_control.py']+=drift
+            with self.assertRaises(b.a.Refusal):b.reseal(files,self.base,self.dest,self.cfg,disabled=True)
+    def test_enabled_copy_roundtrip_keeps_cold_and_ranges(self):
+        prepared=self.prepared();base={**self.base,'directories':{k:str(v) for k,v in self.dest.items()},'files':{k:prepared.binding(k,True) for k in prepared.files}}
+        second={k:self.root/('enabled_'+k) for k in self.dest}
+        enabled=b.reseal(prepared.files,base,second,self.cfg,disabled=False)
+        for key,name in b.GATES.items():self.assertIs(b.a.assignment(enabled.files[key],name)[0],False)
+        for key in ('recovery/observe.py','recovery/evidence_contract.py','scanner/build/native_occupancy_scanner.aarch64.ENABLED'):
+            self.assertEqual(enabled.files[key],self.raw[key])
+        self.assertEqual(enabled.files['acceptance/collect.py'],self.raw['acceptance/collect.py'])
+        self.assertEqual(enabled.files['acceptance/collect.sh'],self.raw['acceptance/collect.sh'])
+
+if __name__=='__main__':unittest.main(verbosity=2)

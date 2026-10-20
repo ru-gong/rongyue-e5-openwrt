@@ -1,0 +1,33 @@
+import ast,types,unittest
+from pathlib import Path
+H=Path(__file__).resolve().parent
+class CaptureGuards(unittest.TestCase):
+ def capture_guard(self,*,boot="current",tx="new",refresh=True,purpose="directory",used=False,forbidden=False):
+  path=H/"overlay/recovery/recovery.py";tree=ast.parse(path.read_text());node=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=="reconcile")
+  # Everything before load_runtime; no device or runtime reaches this test.
+  keep=[]
+  for n in node.body:
+   if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="m" for t in n.targets):break
+   keep.append(n)
+  # load_runtime shares its source line with p/output; truncation is structural.
+  def need(x,why):
+   if not x:raise RuntimeError(why)
+  state={"used_txids":[tx] if used else [],"previous_boots":["current"]}
+  cold={"boot_id":boot,"purpose":purpose,"state_snapshot":state}
+  if refresh:cold["refresh_binding"]={"path":"fresh","sha256":"verified"}
+  view={"same_boot_refresh_candidate":"current"}
+  def identity(v,b,t):need(not forbidden,"retired identity")
+  c=types.SimpleNamespace(require=need,obj=lambda b:b,validtx=lambda t:t,recovery_state=lambda s:None,STATE="state",LEDGER="ledger",_closure_api=lambda:types.SimpleNamespace(validate_closed=lambda *a:view,assert_new_identity=identity))
+  ns={"RE COVERY_IO_DISABLED".replace(" ",""):False,"c":c,"e":types.SimpleNamespace(validate_cold=lambda b:cold),"envelope_binding":{},"tx":tx}
+  exec(compile(ast.Module(body=keep,type_ignores=[]),str(path),"exec"),ns)
+ def test_current_boot_verified_refresh_allowed(self):self.capture_guard()
+ def test_current_boot_old_cold_rejected(self):
+  with self.assertRaises(RuntimeError):self.capture_guard(refresh=False)
+ def test_retired_transaction_rejected(self):
+  with self.assertRaises(RuntimeError):self.capture_guard(used=True)
+ def test_retired_boot_rejected(self):
+  with self.assertRaises(RuntimeError):self.capture_guard(forbidden=True)
+ def test_recovery_purpose_cannot_use_exception(self):
+  with self.assertRaises(RuntimeError):self.capture_guard(purpose="recovery")
+ def test_new_boot_allowed_without_refresh(self):self.capture_guard(boot="new",refresh=False)
+if __name__=="__main__":unittest.main(verbosity=2)

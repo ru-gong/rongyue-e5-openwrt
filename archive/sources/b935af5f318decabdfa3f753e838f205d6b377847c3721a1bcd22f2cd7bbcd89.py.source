@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+"""Prepared, hard-disabled p37 + BC32 transactions; no reboot or automatic retry.
+
+All production device calls go through NativeBackend and its literal disabled
+gate. Tests substitute a pure in-memory backend under a process/socket sentinel.
+The persistent ledger is never cleared by reconciliation or a boolean flag.
+"""
+from __future__ import annotations
+import contextlib
+import datetime as dt
+import fcntl
+import hashlib
+import importlib.util
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import struct
+import sys
+import threading
+import time
+import uuid
+import zlib
+
+DEVICE_IO_DISABLED = False
+ROOT = Path(__file__).resolve().parents[2]
+SERIAL = "DEVICE_SERIAL_REDACTED"
+PROFILE_REL = "tools/e5_android_install_live_20261013/device-profile.json"
+PROFILE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+CANDIDATE_REL = "materials/openwrt-no-auto-fsck-20261015/candidate.json"
+CANDIDATE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+ORIGINAL_MISC_REL = "evidence/stage2-execution-20261013/android-install-01/misc.before.bin"
+LINUX_BOOT_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+BOOT_BYTES, MISC_BYTES, BC_OFFSET, CHUNK = 64 << 20, 1 << 20, 2048, 4 << 20
+PROTECTED = frozenset(("trustos_a", "trustos_b", "uboot_a", "uboot_b", "vbmeta_a", "vbmeta_b",
+    "init_boot_a", "init_boot_b", "sml_a", "sml_b", "teecfg_a", "teecfg_b", "boot_a"))
+BB, SU = "/data/adb/magisk/busybox", "/debug_ramdisk/su"
+
+class Refusal(RuntimeError): pass
+def require(ok, why):
+    if not ok: raise Refusal(why)
+def sha(data): return hashlib.sha256(data).hexdigest()
+def canonical(obj): return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+def valid_sha(s): return isinstance(s, str) and re.fullmatch("[a-f0-9]{64}", s) is not None
+def fixed_module(name,digest):
+    path=Path(__file__).resolve().with_name(name+".py")
+    read_pinned(path,digest)  # Verify BEFORE executing module top-level code.
+    existing=sys.modules.get(name)
+    if existing is not None:
+        require(Path(existing.__file__).resolve()==path,"module loaded from wrong source")
+        return existing
+    spec=importlib.util.spec_from_file_location(name,path);module=importlib.util.module_from_spec(spec)
+    sys.modules[name]=module;spec.loader.exec_module(module);return module
+def stamp(): return dt.datetime.now(dt.timezone.utc).isoformat()
+def sync_dir(p):
+    fd = os.open(p, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+def durable_new(p, data):
+    p = Path(p)
+    require(not p.is_symlink() and all(not q.is_symlink() for q in p.absolute().parents), "unsafe evidence path")
+    with p.open("xb") as f:
+        os.fchmod(f.fileno(), 0o600); f.write(data); f.flush(); os.fsync(f.fileno())
+    sync_dir(p.parent)
+def read_pinned(path, digest, size=None):
+    p = Path(path)
+    require(p.is_absolute() and p.is_file() and not p.is_symlink() and
+            all(not q.is_symlink() for q in p.parents), "unsafe input path")
+    st = p.stat(); require(st.st_nlink == 1, "hardlinked input")
+    data = p.read_bytes()
+    require((size is None or len(data) == size) and valid_sha(digest) and sha(data) == digest, "input size/hash changed")
+    return data
+def profile():
+    p = json.loads(read_pinned(ROOT / PROFILE_REL, PROFILE_SHA))
+    require(set(p["protected_hashes"]) == PROTECTED, "protected set changed")
+    return p
+def bc_valid(data, armable=False):
+    require(len(data) == 32 and data[4:8] == b"BCAB" and data[8] == 1 and data[9] & 7 == 2,
+            "bad BC layout")
+    require(struct.unpack_from("<I", data, 28)[0] == zlib.crc32(data[:28]), "bad BC CRC")
+    require(data[:4] in (b"_a\0\0", b"_b\0\0") and not data[13] & 1 and not data[15] & 1, "bad BC slot/error")
+    if armable:
+        require(data[:4] == b"_a\0\0" and data[12] & 0x80 and data[12] & 15 and
+                ((not (data[14] & 15 and data[14] & 0xf0)) or
+                 data[14] & 15 < data[12] & 15), "A not successful / pending B")
+    return data
+def trial_bc(data):
+    bc_valid(data, True); b = bytearray(data); b[:4] = b"_b\0\0"
+    b[12] = (b[12] & 0xf0) | 14; b[14] = 0x2f
+    struct.pack_into("<I", b, 28, zlib.crc32(b[:28])); return bytes(b)
+def outside_bc(data): return data[:BC_OFFSET] + data[BC_OFFSET + 32:]
+
+class Budget:
+    def __init__(self, seconds, cancel=None, clock=time.monotonic):
+        require(type(seconds) is int and 30 <= seconds <= 900, "transaction deadline range")
+        self.clock, self.end, self.cancel = clock, clock() + seconds, cancel or threading.Event()
+    def check(self):
+        require(not self.cancel.is_set(), "operator interruption latched")
+        require(self.clock() < self.end, "transaction deadline exceeded")
+    @contextlib.contextmanager
+    def signals(self):
+        require(threading.current_thread() is threading.main_thread(), "signals require main thread")
+        def stop(signum, frame):
+            self.cancel.set(); raise InterruptedError("operator signal " + str(signum))
+        old = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+        try:
+            for s in old: signal.signal(s, stop)
+            yield
+        finally:
+            for s, h in old.items(): signal.signal(s, h)
+
+class Ledger:
+    """Fixed serial-wide append-only hash chain plus flock; fail closed on tears.
+
+    A run without COMPLETE, including lost ACK or a killed Python process, is
+    poisoned. Only a distinct explicit original-restoration request referencing
+    a complete fresh reconciliation AND its independent review can follow it.
+    """
+    def __init__(self):
+        self.directory = ROOT / "evidence" / (".bounded-boot-v3-" + SERIAL)
+        require(all(not p.is_symlink() for p in self.directory.parents), "ledger parent symlink")
+        if not self.directory.exists(): self.directory.mkdir(mode=0o700); sync_dir(self.directory.parent)
+        require(self.directory.is_dir() and not self.directory.is_symlink(), "unsafe ledger")
+        self.lock = None; self.device_lock = None; self.rows = []; self.head = "0" * 64
+    def __enter__(self):
+        p = self.directory / "lock"
+        require(not p.is_symlink(), "lock symlink")
+        self.lock = os.open(p, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            # Same host-wide lock as the directory session; never unlink it.
+            shared=ROOT/"evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock"
+            self.device_lock=os.open(shared,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+            fcntl.flock(self.device_lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB); sync_dir(self.directory)
+            self.reload()
+        except BaseException: self.__exit__(None, None, None); raise
+        return self
+    def __exit__(self, *args):
+        if self.lock is not None: os.close(self.lock); self.lock = None
+        if self.device_lock is not None: os.close(self.device_lock); self.device_lock=None
+    def reload(self):
+        p = self.directory / "ledger.jsonl"; self.rows=[]; self.head="0"*64
+        if not p.exists(): return
+        require(not p.is_symlink(), "ledger symlink")
+        raw = p.read_bytes(); require(not raw or raw.endswith(b"\n"), "torn ledger; manual review required")
+        for line in raw.splitlines():
+            row=json.loads(line); digest=row.pop("chain_sha256")
+            require(row["previous"]==self.head and row["seq"]==len(self.rows) and sha(canonical(row))==digest,
+                    "broken ledger chain")
+            row["chain_sha256"]=digest; self.rows.append(row); self.head=digest
+    def event(self, event, **fields):
+        require(self.lock is not None, "ledger not locked")
+        require(not set(fields)&{"seq","previous","event","at","chain_sha256"},"reserved ledger field")
+        row=dict(seq=len(self.rows),previous=self.head,event=event,at=stamp(),**fields)
+        digest=sha(canonical(row)); row["chain_sha256"]=digest
+        p=self.directory/"ledger.jsonl"; require(not p.is_symlink(), "ledger symlink")
+        with p.open("ab") as f:
+            os.fchmod(f.fileno(),0o600); f.write(canonical(row)+b"\n"); f.flush(); os.fsync(f.fileno())
+        sync_dir(self.directory); self.rows.append(row); self.head=digest
+        return row
+    def poisoned(self): return bool(self.rows) and self.rows[-1]["event"] != "COMPLETE"
+
+def approved_request(path, expected_sha):
+    r=json.loads(read_pinned(path,expected_sha)); p=profile()
+    require(set(r)=={"schema","serial","boot_id","txid","mode","total_seconds","expected_before",
+                     "image","original_misc","recovery","install_ready"}, "request fields")
+    require(r["schema"]=="e5-bounded-boot-request-v3" and r["serial"]==SERIAL and
+            re.fullmatch("[a-f0-9]{16}",r["txid"]) and str(uuid.UUID(r["boot_id"]))==r["boot_id"], "request identity")
+    require(r["mode"] in ("restore-original","install-linux"),"request mode")
+    require(set(r["expected_before"])=={"boot_b","misc"} and all(valid_sha(x) for x in r["expected_before"].values()), "preimage hashes")
+    for key in ("image","original_misc"):
+        require(set(r[key])=={"path","sha256","bytes"},"artifact fields")
+    image=read_pinned(r["image"]["path"],r["image"]["sha256"],BOOT_BYTES)
+    orig=read_pinned(r["original_misc"]["path"],p["original_misc_sha256"],MISC_BYTES)
+    require(r["image"]["bytes"]==BOOT_BYTES and r["original_misc"]["bytes"]==MISC_BYTES and
+            r["original_misc"]["sha256"]==p["original_misc_sha256"],"artifact dimensions")
+    target=p["original_boot_b_sha256"] if r["mode"]=="restore-original" else LINUX_BOOT_SHA
+    require(sha(image)==target,"not this device original / fixed Linux image")
+    bc_valid(orig[BC_OFFSET:BC_OFFSET+32],True)
+    require((r["mode"]=="restore-original" and r["install_ready"] is None) or
+            (r["mode"]=="install-linux" and isinstance(r["install_ready"],dict)),"install readiness binding required")
+    return r,p,image,orig
+
+def _directory(path):
+    p=Path(path); require(p.is_absolute() and p.is_relative_to(ROOT/"evidence") and
+        not p.exists() and all(not q.is_symlink() for q in p.parents), "new evidence directory required")
+    p.mkdir(mode=0o700); sync_dir(p.parent); sync_dir(p); return p
+
+def _read_all(backend, part, size, budget, ledger=None):
+    blocks=[]
+    for off in range(0,size,CHUNK):
+        budget.check(); n=min(CHUNK,size-off); data=backend.read_chunk(part,off,n,budget)
+        require(type(data) is bytes and len(data)==n,"short/nonbinary read")
+        budget.check(); blocks.append(data)
+        if ledger: ledger.event("READ_VERIFIED",part=part,offset=off,bytes=n,sha256=sha(data))
+    return b"".join(blocks)
+
+def _protected(backend,p,budget,ledger=None):
+    backend.preflight(budget)
+    g=_read_all(backend,"gpt",32768,budget,ledger); require(sha(g)==p["gpt_prefix_sha256"],"GPT changed")
+    actual={k:sha(_read_all(backend,k,p["partitions"][k]["bytes"],budget,ledger)) for k in sorted(PROTECTED)}
+    require(actual==p["protected_hashes"],"protected partition changed")
+    return actual
+
+def _recovery_gate(request, ledger, request_sha):
+    binding=request["recovery"]
+    if binding is None:
+        require(not ledger.poisoned(),"persistent UNKNOWN; only new reviewed original recovery")
+        return
+    require(request["mode"]=="restore-original" and isinstance(binding,dict),"persistent UNKNOWN; only new reviewed original recovery")
+    require(set(binding)=={"reconciliation_path","reconciliation_sha256","review_path","review_sha256"},"recovery binding fields")
+    rec=json.loads(read_pinned(binding["reconciliation_path"],binding["reconciliation_sha256"]))
+    review=json.loads(read_pinned(binding["review_path"],binding["review_sha256"]))
+    require(rec["schema"]=="e5-boot-reconciliation-v3" and rec["ledger_head"]==ledger.head and
+            rec["serial"]==SERIAL and rec["boot_id"]==request["boot_id"] and rec["complete"] is True and
+            rec["protected_match"] is True and rec["misc_outside_original_match"] is True and
+            rec["hashes"]==request["expected_before"],"reconciliation mismatch")
+    age=(dt.datetime.now(dt.timezone.utc)-dt.datetime.fromisoformat(rec["captured_at"])).total_seconds()
+    require(0<=age<=900,"reconciliation stale")
+    proposal=json.loads(json.dumps(request)); proposal["recovery"].pop("review_path"); proposal["recovery"].pop("review_sha256")
+    require(review=={"schema":"e5-explicit-boot-recovery-review-v3","serial":SERIAL,
+        "proposal_sha256":sha(canonical(proposal)),"reconciliation_sha256":binding["reconciliation_sha256"],
+        "ledger_head":ledger.head,"decision":"NEW_ORIGINAL_RECOVERY_ONLY_NO_REPLAY"},"new explicit recovery review required")
+    p=profile();required={"boot_b","misc","gpt"}|PROTECTED
+    require(required<=set(rec["artifacts"]),"reconciliation artifact set")
+    for key in sorted(required):
+        entry=rec["artifacts"][key]
+        require(set(entry)=={"path","sha256","bytes"},"reconciliation artifact binding")
+        size=32768 if key=="gpt" else (BOOT_BYTES if key=="boot_b" else MISC_BYTES if key=="misc" else p["partitions"][key]["bytes"])
+        digest=rec["hashes"][key] if key in ("boot_b","misc") else p["gpt_prefix_sha256"] if key=="gpt" else p["protected_hashes"][key]
+        require(entry["bytes"]==size and entry["sha256"]==digest,"reconciliation raw dimensions/hash")
+        read_pinned(entry["path"],digest,size)
+
+class NativeBackend:
+    """Fixed Android shell/node adapter over the separately reviewed transport.
+
+    `pins` binds host adb, native helper and all Python implementation sources.
+    There is no raw shell API exposed to the transaction engine. No old live
+    module is imported. Ordinary helper provisioning is a separate approval.
+    """
+    def __init__(self,transport,adb,native_path,native_sha,txid,boot_id,pins,directory_adapter=None):
+        transport_module=fixed_module("bounded_transport",pins["bounded_transport"])
+        require(type(transport) is transport_module.BoundedTransport,"fixed transport class required")
+        require(re.fullmatch("[a-f0-9]{16}",txid) and str(uuid.UUID(boot_id))==boot_id,"backend identity")
+        require(isinstance(native_path,str) and re.fullmatch(r"/data/local/tmp/e5-clean-io\.[a-f0-9]{16}",native_path) and valid_sha(native_sha),"fixed native helper binding")
+        require(native_path.endswith("."+txid) or transport.recovery_context is not None or transport.reconciliation_only,
+                "another transaction helper is allowed only for reviewed recovery/read-only reconciliation")
+        require(set(pins)=={"adb","bounded_transport","bounded_boot_control","native_sha256","directory_adapter","uncertainty_recovery"},"source pin fields")
+        for name,path in (("adb",Path(adb)),("bounded_transport",Path(transport_module.__file__)),("bounded_boot_control",Path(__file__))):
+            read_pinned(path.resolve(),pins[name])
+        require(pins["native_sha256"]==native_sha,"native pin mismatch")
+        require(transport.serial==SERIAL and transport.boot_id==boot_id and transport.txid==txid,"transport identity")
+        if transport.reconciliation_only or transport.recovery_context is not None:
+            require(transport.recovery_source_sha==pins["uncertainty_recovery"],"transport recovery source differs")
+        require(transport.state==ROOT/("evidence/e5-clean-v3-device-state-"+SERIAL),"shared uncertainty state path changed")
+        self.transport,self.adb,self.native,self.native_sha=transport,Path(adb),native_path,native_sha
+        self.txid,self.boot_id,self.pins,self.directory_adapter=txid,boot_id,pins,directory_adapter
+        self.p=profile()
+    def poison(self,reason):
+        # Host-only: also block directory operations after an engine-level
+        # mismatch whose transport framing itself happened to be valid.
+        self.transport.mark_uncertain(reason)
+    def execution_scope(self,request,request_sha):
+        require(not self.transport.reconciliation_only,"read-only reconciliation cannot execute")
+        context=self.transport.recovery_context
+        marker=self.transport.state/"RECOVERY_ONLY.json"
+        require(not (self.transport.state/"RECOVERY_PENDING.json").exists(),"unfinished recovery transition")
+        if marker.exists() or marker.is_symlink() or context is not None:
+            require(request["mode"]=="restore-original" and request["recovery"] is not None,"recovery-only state forbids installation")
+            expected={"request_sha256":request_sha,"txid":request["txid"],"boot_id":request["boot_id"]}
+            require(context==expected,"transport recovery context differs from exact request")
+            fixed_module("uncertainty_recovery",self.pins["uncertainty_recovery"]).validate_context(self.transport.state,SERIAL,context)
+        else:
+            require(request["recovery"] is None,"reviewed recovery requires independently staged recovery-only grant")
+        require(self.native.endswith("."+self.txid) or
+                (request["mode"]=="restore-original" and context is not None),
+                "another transaction helper cannot install Linux")
+    def finish_recovery(self,result_path,result_sha):
+        if self.transport.recovery_context is not None:
+            fixed_module("uncertainty_recovery",self.pins["uncertainty_recovery"]).finish(
+                self.transport.state,self.transport.recovery_context,result_path,result_sha)
+    def _base(self):
+        return ("set -eu\nset -o pipefail\n"+
+            f'test "$(id -u)" = 0\ntest "$(cat /proc/sys/kernel/random/boot_id)" = {self.boot_id}\n'+
+            f'test "$(getprop ro.serialno)" = {SERIAL}\n'+
+            'test "$(getprop ro.product.model)" = E5\ntest "$(getprop ro.board.platform)" = ums9621\n'+
+            'test "$(getprop ro.build.display.id)" = TS305_V03_20241128_2301\n'+
+            'test "$(getprop ro.boot.slot_suffix)" = _a\ntest "$(getprop sys.boot_completed)" = 1\n'+
+            'test "$(getprop ro.boot.verifiedbootstate)" = orange\ntest "$(getprop ro.boot.flash.locked)" = 0\n'+
+            'test "$(getprop gsm.sim.state)" = ABSENT,ABSENT\n')
+    def _part(self,part):
+        allowed=PROTECTED|{"boot_b","misc"}
+        if part=="gpt":return {"node":"/dev/block/mmcblk0","dev":"179:0","bytes":32768,"start_lba":None}
+        require(part in allowed,"read target not allowed")
+        return self.p["partitions"][part]
+    def _guard(self,part):
+        p=self._part(part);node=p["node"];leaf=node.rsplit("/",1)[-1]
+        s=f'test -b {node}; test ! -L {node}\ntest "$(cat /sys/class/block/{leaf}/dev)" = {p["dev"]}\n'
+        if part!="gpt":
+            s+=f'test "$(readlink -f /dev/block/by-name/{part})" = {node}\n'
+            s+=f'test "$(cat /sys/class/block/{leaf}/start)" = {p["start_lba"]}\n'
+            s+=f'test "$(cat /sys/class/block/{leaf}/size)" = {p["bytes"]//512}\n'
+            s+=f'test "$(blockdev --getsize64 {node})" = {p["bytes"]}\n'
+        major,minor=map(int,p["dev"].split(":"))
+        s+=f'test "$(stat -c %t:%T {node})" = {major:x}:{minor:x}\n'
+        return s
+    def _request(self,label,script,budget,*,payload=b"",limit=4096,validator=None,mutating=False,op_id=None,followup=None,part_request=None):
+        require(not DEVICE_IO_DISABLED,"DEVICE_IO_DISABLED: no production execution")
+        budget.check();read_pinned(self.adb,self.pins["adb"])
+        script=self._base()+script
+        # Read shells get their own 6 s deadline. A blocked kernel syscall can
+        # outlive timeout; host rejection leaves UNKNOWN, never a retry licence.
+        if not mutating:script=f"{BB} timeout -s TERM 6 /system/bin/sh -c "+shlex.quote(script)
+        argv=[str(self.adb),"-s",SERIAL,"shell","-T",SU+" -c "+shlex.quote(script)]
+        if part_request is not None:
+            result=part_request(label,argv,payload=payload,output_limit=limit,validator=validator or (lambda x:x),deadline_s=8)
+        else:
+            result=self.transport.request(label,argv,payload=payload,output_limit=limit,validator=validator or (lambda x:x),
+                deadline_s=8,mutating=mutating,op_id=op_id,transaction_deadline=budget.end,followup=followup)
+        budget.check();return result
+    def preflight(self,budget):
+        # The complete hashes are read separately in bounded chunks by engine.
+        for part in sorted(PROTECTED|{"boot_b","misc"}):
+            raw=self._request("geometry-"+part,self._guard(part)+"printf 'GEOMETRY_OK\\n'\n",budget)
+            require(raw==b"GEOMETRY_OK\n","geometry framing")
+    def read_chunk(self,part,offset,length,budget,*,part_request=None,expected_identity=None):
+        p=self._part(part);maximum=32768 if part=="gpt" else p["bytes"]
+        require(type(offset) is int and type(length) is int and 0<=offset and 0<length<=CHUNK and
+                offset+length<=maximum and offset%4096==length%4096==0,"read bounds/alignment")
+        op=uuid.uuid4().hex;node=p["node"]
+        script=self._guard(part)+f'i=$(stat -c %i {node}); d=$(stat -c %d {node})\n'
+        prefix=f"E5READ3 {op} {part} {offset} {length}"
+        script+=f'printf "{prefix} %s %s\\n" "$i" "$d"\n'
+        script+=f"{BB} dd if={node} bs=4096 skip={offset//4096} count={length//4096} iflag=fullblock 2>/dev/null\n"
+        script+=self._guard(part)+f'test "$(stat -c %i {node})" = "$i"; test "$(stat -c %d {node})" = "$d"\n'
+        script+=f'test "$(cat /proc/sys/kernel/random/boot_id)" = {self.boot_id}\nprintf "\\nE5END3 {op} %s %s\\n" "$i" "$d"\n'
+        def parse(raw):
+            head,sep,rest=raw.partition(b"\n");fields=head.decode("ascii").split()
+            require(sep and len(fields)==7 and " ".join(fields[:5])==prefix and all(x.isdigit() for x in fields[5:]),"binary read header")
+            if expected_identity is not None:
+                require(tuple(map(int,fields[5:]))==expected_identity,"readback device inode/dev changed since write")
+            tail=f"\nE5END3 {op} {fields[5]} {fields[6]}\n".encode()
+            require(len(rest)==length+len(tail) and rest[length:]==tail,"binary read missing END/length")
+            return rest[:length]
+        return self._request("read-"+part,script,budget,limit=length+1024,validator=parse,part_request=part_request)
+    def write_chunk(self,part,offset,data,op_id,budget):
+        require(part in ("boot_b","misc"),"only B / misc32 writable")
+        require((part=="boot_b" and len(data)==CHUNK and offset%CHUNK==0 and 0<=offset<BOOT_BYTES) or
+                (part=="misc" and offset==BC_OFFSET and len(data)==32),"write range")
+        require(not self.transport.reconciliation_only,"read-only reconciliation cannot write")
+        p=self._part(part);node=p["node"]
+        misc_preimage=self.read_chunk("misc",0,MISC_BYTES,budget) if part=="misc" else None
+        raw=self._request("write-identity",self._guard(part)+f"stat -c '%i %d' {node}\ncat /proc/uptime\n",budget)
+        fields=raw.decode().split();require(len(fields)==4 and all(x.isdigit() for x in fields[:2]),"write node identity")
+        inode,dev=map(int,fields[:2]);require(inode>0 and re.fullmatch(r"[0-9]+\.[0-9]+",fields[2]),"write inode/time")
+        budget.check();remain=min(5.,budget.end-budget.clock()-1.)
+        require(remain>0,"insufficient remaining deadline")
+        deadline_ms=int((float(fields[2])+remain)*1000)
+        major,minor=map(int,p["dev"].split(":"));name="boot_b" if part=="boot_b" else "misc32"
+        script=self._guard(part)+f'test ! -L {self.native}; test -f {self.native}; test "$(sha256sum {self.native})" = "{self.native_sha}  {self.native}"\n'
+        args=["write-block",self.txid,self.boot_id,op_id,str(deadline_ms),str(major),str(minor),str(inode),str(offset),str(len(data)),str(p["bytes"]),name]
+        script+=self.native+" "+" ".join(args)+"\n"
+        def parse(raw):
+            lines=raw.splitlines();require(len(lines)==2,"missing/extra native ACK")
+            start,done=map(json.loads,lines)
+            common={"op_id":op_id,"boot_id":self.boot_id,"txid":self.txid,"deadline_ms":deadline_ms,"action":"write-block"}
+            require(all(start.get(k)==v and done.get(k)==v for k,v in common.items()),"native ACK identity")
+            require(start.get("event")=="START" and type(start.get("pid")) is int and start["pid"]>0 and
+                    type(start.get("starttime_ticks")) is int and start["starttime_ticks"]>0,"native START identity")
+            want={"event":"DONE","ok":True,"offset":offset,"bytes":len(data),"total":p["bytes"],"size":p["bytes"],
+                  "inode":inode,"dev":dev,"major":major,"minor":minor,"fsync_completed":True,"possibly_modified":True}
+            require(all(done.get(k)==v for k,v in want.items()),"native DONE mismatch")
+            return {"op_id":op_id,"part":part,"offset":offset,"bytes":len(data),"fsync_completed":True}
+        def readback(ack,request_part):
+            if part=="misc":
+                full=self.read_chunk(part,0,MISC_BYTES,budget,part_request=request_part,expected_identity=(inode,dev))
+                require(outside_bc(full)==outside_bc(misc_preimage),"misc outside32 changed in write/readback")
+                got=full[BC_OFFSET:BC_OFFSET+32]
+            else:got=self.read_chunk(part,offset,len(data),budget,part_request=request_part,expected_identity=(inode,dev))
+            require(got==data,"native acknowledged but independent readback differs")
+            return ack
+        return self._request("write-"+name,script,budget,payload=data,limit=4096,validator=parse,
+                             mutating=True,op_id=op_id,followup=readback)
+    def verify_install_ready(self,binding,budget):
+        require(set(binding)=={"path","sha256"},"readiness binding")
+        receipt=json.loads(read_pinned(binding["path"],binding["sha256"]))
+        require(receipt.get("schema")=="e5-clean-activation-v3" and receipt.get("serial")==SERIAL and
+                receipt.get("boot_id")==self.boot_id and receipt.get("txid")==self.txid and
+                receipt.get("status")=="ACTIVATED" and receipt.get("default_boot")=="android" and
+                receipt.get("original_B_misc_verified") is True,"not a matching activation receipt")
+        read_pinned(ROOT/CANDIDATE_REL,CANDIDATE_SHA)
+        require(valid_sha(receipt.get("request_sha256")) and receipt.get("candidate_sha256")==CANDIDATE_SHA and
+                valid_sha(receipt.get("tree_sha256")),"receipt hash fields")
+        versions=receipt.get("source_versions",{})
+        require(all(versions.get(k)==v for k,v in {
+            "bounded_boot_control.py":self.pins["bounded_boot_control"],
+            "bounded_transport.py":self.pins["bounded_transport"],
+            "android_directory_adapter.py":self.pins["directory_adapter"],"native_io":self.native_sha}.items()),
+            "activation source versions differ")
+        expiry=dt.datetime.fromisoformat(receipt["expires_at"])
+        require(expiry.tzinfo is not None and dt.datetime.now(dt.timezone.utc)<expiry,"activation receipt expired")
+        # Import only this NEW fixed adapter, never the old live implementation.
+        directory_module=fixed_module("android_directory_adapter",self.pins["directory_adapter"])
+        require(type(self.directory_adapter) is directory_module.AndroidDirectoryAdapter,"fixed real directory verifier required")
+        require(self.directory_adapter.boot_id==self.boot_id and self.directory_adapter.txid==self.txid,"directory verifier identity")
+        require(self.directory_adapter.io_helper.sha256==self.native_sha,"directory native source differs")
+        require(self.directory_adapter.cancel_event is budget.cancel and
+                self.directory_adapter.transaction_deadline is not None and
+                budget.clock()<self.directory_adapter.transaction_deadline<=budget.end,
+                "directory inspection must share cancellation and bounded transaction deadline")
+        inventory=self.directory_adapter.inspect("active")
+        bound=receipt["active_inventory"]
+        expected=json.loads(read_pinned(bound["path"],bound["sha256"]))
+        require(inventory==expected and inventory["tree_sha256"]==receipt["tree_sha256"],"active tree changed")
+        rows={r["path"]:r for r in inventory["rows"]}
+        fixed={"openwrt.ext4":(2<<30,"0000000000000000000000000000000000000000000000000000000000000000"),
+            "openwrt.ext4.gz":(149230668,"0000000000000000000000000000000000000000000000000000000000000000"),
+            "boot.img":(BOOT_BYTES,LINUX_BOOT_SHA),
+            "device-files.tar":(60661760,"0000000000000000000000000000000000000000000000000000000000000000"),
+            "openwrt-install.conf":(123,"0000000000000000000000000000000000000000000000000000000000000000"),
+            "fscrypt-probe":(716192,"0000000000000000000000000000000000000000000000000000000000000000"),
+            "boot-os":(8,sha(b"openwrt\n")),"openwrt-default-boot":(8,sha(b"android\n"))}
+        for name,(size,digest) in fixed.items():
+            row=rows.get("./"+name,{})
+            require(row.get("type")=="f" and row.get("bytes")==size and row.get("sha256")==digest,"active fixed content mismatch: "+name)
+        require(set(rows)=={"."}|{"./"+k for k in fixed},"unexpected active directory members")
+        require(not any(Path(k).name in {"boot-os-next","stay","openwrt.ext4.old","openwrt.ext4.new"} for k in rows),"pending active runtime state")
+        budget.check();require(dt.datetime.now(dt.timezone.utc)<expiry,"activation expired during inspect")
+
+def _write_one(backend,part,offset,data,budget,ledger):
+    budget.check(); op=uuid.uuid4().hex
+    node,rdev,total=("/dev/block/mmcblk0p37","259:30",BOOT_BYTES) if part=="boot_b" else ("/dev/block/mmcblk0p3","179:3",MISC_BYTES)
+    ledger.event("IN_FLIGHT",op_id=op,part=part,node=node,rdev=rdev,total=total,offset=offset,bytes=len(data),sha256=sha(data))
+    # A signal or disk error after IN_FLIGHT is deliberately indistinguishable
+    # from a dispatched command; no path clears it or retries it automatically.
+    budget.check(); ack=backend.write_chunk(part,offset,data,op,budget)
+    budget.check()
+    require(ack=={"op_id":op,"part":part,"offset":offset,"bytes":len(data),"fsync_completed":True},"invalid write ACK")
+    if part=="misc":
+        readback=_read_all(backend,"misc",MISC_BYTES,budget,ledger)
+        require(readback[offset:offset+len(data)]==data,"misc partial/mismatched write")
+    else:
+        readback=backend.read_chunk(part,offset,len(data),budget); require(readback==data,"block readback mismatch")
+    budget.check(); ledger.event("VERIFIED",op_id=op,part=part,offset=offset,bytes=len(data),sha256=sha(data))
+
+def execute(backend,request_path,request_sha,evidence,*,cancel=None,absolute_deadline=None):
+    """No activation switch. Call only after a separately reviewed source change.
+
+    The concrete request hash is the approval boundary, not a resume boolean.
+    """
+    require(not DEVICE_IO_DISABLED,"DEVICE_IO_DISABLED: no production execution")
+    _backend_type(backend)
+    r,p,image,orig=approved_request(request_path,request_sha)
+    budget=Budget(r["total_seconds"],cancel)
+    if absolute_deadline is not None:
+        require(type(absolute_deadline) in (int,float) and math.isfinite(absolute_deadline) and
+                budget.clock()<absolute_deadline<=budget.end,"invalid enclosing deadline")
+        budget.end=absolute_deadline
+    with Ledger() as ledger, budget.signals():
+        _recovery_gate(r,ledger,request_sha)
+        backend.execution_scope(r,request_sha)
+        require(not any(x.get("txid")==r["txid"] for x in ledger.rows),"transaction id already used; no replay")
+        out=_directory(evidence)
+        durable_new(out/"request.json",read_pinned(request_path,request_sha))
+        ledger.event("START",txid=r["txid"],request_sha256=request_sha,evidence=str(out),boot_id=r["boot_id"],mode=r["mode"])
+        try:
+            require(backend.boot_id==r["boot_id"] and backend.txid==r["txid"],"backend boot/tx mismatch")
+            _protected(backend,p,budget,ledger)
+            before=_read_all(backend,"boot_b",BOOT_BYTES,budget,ledger)
+            misc=_read_all(backend,"misc",MISC_BYTES,budget,ledger)
+            require({"boot_b":sha(before),"misc":sha(misc)}==r["expected_before"],"approved preimage changed")
+            require(outside_bc(misc)==outside_bc(orig),"misc outside BC differs; outside write forbidden")
+            target=orig[BC_OFFSET:BC_OFFSET+32] if r["mode"]=="restore-original" else trial_bc(misc[BC_OFFSET:BC_OFFSET+32])
+            durable_new(out/"boot_b.before.bin",before); durable_new(out/"misc.before.bin",misc)
+            require(read_pinned(out/"boot_b.before.bin",sha(before),BOOT_BYTES)==before and
+                    read_pinned(out/"misc.before.bin",sha(misc),MISC_BYTES)==misc,"host preimage verification")
+            ledger.event("PREIMAGES_DURABLE",boot_b=sha(before),misc=sha(misc),target_bc=target.hex())
+            if r["mode"]=="install-linux": backend.verify_install_ready(r["install_ready"],budget)
+            for off in range(0,BOOT_BYTES,CHUNK):
+                budget.check()
+                require(backend.read_chunk("boot_b",off,CHUNK,budget)==before[off:off+CHUNK],"B changed before next block")
+                _write_one(backend,"boot_b",off,image[off:off+CHUNK],budget,ledger)
+            rb=_read_all(backend,"boot_b",BOOT_BYTES,budget,ledger);durable_new(out/"boot_b.readback.bin",rb)
+            require(rb==image,"complete B readback differs")
+            _protected(backend,p,budget,ledger)
+            require(_read_all(backend,"misc",MISC_BYTES,budget,ledger)==misc,"misc changed before activation")
+            if r["mode"]=="install-linux": backend.verify_install_ready(r["install_ready"],budget)
+            ledger.event("B_FULLY_VERIFIED_BEFORE_MISC",sha256=sha(rb))
+            _write_one(backend,"misc",BC_OFFSET,target,budget,ledger)
+            final=_read_all(backend,"misc",MISC_BYTES,budget,ledger);durable_new(out/"misc.readback.bin",final)
+            require(outside_bc(final)==outside_bc(misc) and final[BC_OFFSET:BC_OFFSET+32]==target,"misc outside32/readback mismatch")
+            if r["mode"]=="restore-original":require(final==orig,"restored misc differs from local original")
+            _protected(backend,p,budget,ledger); budget.check()
+            result={"schema":"e5-bounded-boot-result-v3","txid":r["txid"],"request_sha256":request_sha,
+                "boot_b_sha256":sha(rb),"misc_sha256":sha(final),"bc32_hex":target.hex(),"complete":True,
+                "reboot_performed":False,"boot_a_written":False,"misc_atomicity_claimed":False}
+            durable_new(out/"result.json",canonical(result)+b"\n")
+            result_sha=sha((out/"result.json").read_bytes())
+            ledger.event("COMPLETE",txid=r["txid"],result_sha256=result_sha)
+            backend.finish_recovery(out/"result.json",result_sha)
+            return result
+        except BaseException as exc:
+            # Even if this append fails, START/IN_FLIGHT remains a poison latch.
+            try: backend.poison(type(exc).__name__+": "+str(exc))
+            finally: ledger.event("UNKNOWN",txid=r["txid"],error_type=type(exc).__name__,reason=str(exc),no_retry=True)
+            raise
+
+def reconcile_readonly(backend,evidence,total_seconds=600,*,cancel=None):
+    require(not DEVICE_IO_DISABLED,"DEVICE_IO_DISABLED: no production execution")
+    _backend_type(backend)
+    p=profile();budget=Budget(total_seconds,cancel)
+    with Ledger() as ledger,budget.signals():
+        # Also handles directory/transport-only UNKNOWN with an absent or
+        # complete boot ledger. Never derives originals from a prior request.
+        head=ledger.head;out=_directory(evidence)
+        orig=read_pinned(ROOT/ORIGINAL_MISC_REL,p["original_misc_sha256"],MISC_BYTES)
+        backend.preflight(budget)
+        values={};artifacts={}
+        for key in sorted({"boot_b","misc","gpt"}|PROTECTED):
+            size=32768 if key=="gpt" else BOOT_BYTES if key=="boot_b" else MISC_BYTES if key=="misc" else p["partitions"][key]["bytes"]
+            raw=_read_all(backend,key,size,budget)
+            expected=None if key in ("boot_b","misc") else p["gpt_prefix_sha256"] if key=="gpt" else p["protected_hashes"][key]
+            require(expected is None or sha(raw)==expected,"reconciliation protected bytes changed")
+            path=out/(key+".observed.bin");durable_new(path,raw)
+            artifacts[key]={"path":str(path),"sha256":sha(raw),"bytes":len(raw)}
+            if key in ("boot_b","misc"):values[key]=raw
+        _protected(backend,p,budget)
+        require(_read_all(backend,"boot_b",BOOT_BYTES,budget)==values["boot_b"] and
+                _read_all(backend,"misc",MISC_BYTES,budget)==values["misc"],"changed during reconciliation")
+        result={"schema":"e5-boot-reconciliation-v3","serial":SERIAL,"boot_id":backend.boot_id,
+            "ledger_head":head,"captured_at":stamp(),"complete":True,"protected_match":True,
+            "hashes":{key:sha(raw) for key,raw in values.items()},"artifacts":artifacts,
+            "misc_outside_original_match":outside_bc(values["misc"])==outside_bc(orig),"does_not_clear_poison":True}
+        budget.check();durable_new(out/"reconciliation.json",canonical(result)+b"\n")
+        require(ledger.head==head,"ledger changed during reconciliation")
+        return result
+
+def _backend_type(backend):
+    require(type(backend) is NativeBackend,"fixed NativeBackend required; no caller-supplied write hooks")
+
+if __name__=="__main__":
+    print(json.dumps({"status":"PREPARATION_ONLY","device_io_disabled":True,
+        "writes":{"boot_b":{"node":"/dev/block/mmcblk0p37","bytes":BOOT_BYTES,"chunk":CHUNK},
+                  "misc32":{"node":"/dev/block/mmcblk0p3","offset":BC_OFFSET,"bytes":32}},
+        "automatic_retry":False,"reboot":False,"unknown_requires_new_reviewed_original_recovery":True}))

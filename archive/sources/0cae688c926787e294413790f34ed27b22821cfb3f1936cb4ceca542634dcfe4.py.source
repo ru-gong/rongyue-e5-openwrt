@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""D1 offline text candidate only. No device, deployment, process or network API."""
+import argparse
+import difflib
+import hashlib
+import json
+from pathlib import Path
+import re
+import stat
+
+HERE = Path(__file__).absolute().parent
+SOURCE_COMMIT = '569f13d4ce15585f70817c2a1e03bb574a84720b'
+RAW_ROOTFS_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+EXTRACTION_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+LOADER = 'etc/init.d/e5-sipc-wwan'
+ATD = 'opt/e5/t551m-atd'
+START_LINK = 'etc/rc.d/S96t551m-sim-status'
+API = 'usr/share/e5-infoscreen/api.uc'
+UI = 'usr/share/e5-infoscreen/www/app.js'
+# These are actual extracted build artifacts, not upstream-template hashes.
+INPUTS = {
+    LOADER: (2378, '0000000000000000000000000000000000000000000000000000000000000000', '0o100755'),
+    ATD: (12090, '0000000000000000000000000000000000000000000000000000000000000000', '0o100755'),
+    START_LINK: (26, '0000000000000000000000000000000000000000000000000000000000000000', '0o120777'),
+    API: (63754, '0000000000000000000000000000000000000000000000000000000000000000', '0o100644'),
+    UI: (108718, '0000000000000000000000000000000000000000000000000000000000000000', '0o100644'),
+}
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def no_symlink_parents(path):
+    for p in [path, *path.parents]:
+        require(not p.is_symlink(), 'symlink path forbidden: ' + str(p))
+
+
+def regular_bytes(path):
+    no_symlink_parents(path)
+    require(stat.S_ISREG(path.lstat().st_mode), 'not ordinary file: ' + str(path))
+    return path.read_bytes()
+
+
+def validate_inputs(items):
+    require(set(items) == set(INPUTS), 'exact input path set required')
+    for name, (size, sha, mode) in INPUTS.items():
+        require(type(items[name]) is bytes, 'input must be bytes: ' + name)
+        require(len(items[name]) == size and digest(items[name]) == sha,
+                'unapproved input bytes: ' + name)
+    require(items[START_LINK] == b'../init.d/t551m-sim-status', 'unexpected startup target')
+
+
+def load_inputs():
+    base = HERE / 'inputs'
+    no_symlink_parents(base)
+    require(base.is_dir(), 'input directory missing')
+    files = {}
+    for p in base.rglob('*'):
+        no_symlink_parents(p)
+        if p.is_dir():
+            continue
+        files[p.relative_to(base).as_posix()] = regular_bytes(p)
+    validate_inputs(files)
+    evidence = regular_bytes(HERE / 'source-extraction.json')
+    require(digest(evidence) == EXTRACTION_SHA, 'extraction evidence changed')
+    ev = json.loads(evidence)
+    require(ev['raw_sha256'] == RAW_ROOTFS_SHA and ev['raw_bytes'] == 2147483648,
+            'wrong source rootfs')
+    for name, (size, sha, mode) in INPUTS.items():
+        f = ev['files'][name]
+        require((f['bytes'], f['sha256'], f['mode']) == (size, sha, mode),
+                'extraction provenance mismatch: ' + name)
+    return files
+
+
+def replace_exact(text, old, new, count=1):
+    require(text.count(old) == count, 'anchor count differs: ' + repr(old[:90]))
+    return text.replace(old, new)
+
+
+def function_text(text, name):
+    start = text.index('function ' + name + '(')
+    # The pinned functions all close at column zero. Nested blocks are indented.
+    end = text.index('\n}', start) + 2
+    return text[start:end]
+
+
+def transform(items):
+    """Pure bytes transformation; returns four replacements and one deletion intent."""
+    validate_inputs(items)
+    out = {}
+    text = items[LOADER].decode()
+    out[LOADER] = replace_exact(text, 'tx_gap_ms=100', 'tx_gap_ms=300', 2).encode()
+    out[ATD] = replace_exact(items[ATD].decode(),
+                            'def __init__(self, fd, gap=0.1):',
+                            'def __init__(self, fd, gap=0.3):').encode()
+
+    api = items[API].decode()
+    old_modem = function_text(api, 'modem_status')
+    new_modem = replace_exact(old_modem, "'modem'", "'modem-d1'", 3)
+    new_modem = replace_exact(new_modem,
+        "\tlet cells = sh_json('mmcli -J -m any --timeout=5 --get-cell-info 2>/dev/null')?.modem?.generic?.['cell-info'] ?? [];\n",
+        '\t// D1: automatic status uses MM cached properties, without engineering cell queries.\n')
+    new_modem = replace_exact(new_modem,
+        '\tlet serving = null, neighbours = 0;\n\tfor (let line in cells) {\n\t\tlet c = parse_cell(line);\n\t\tif (c.serving && !serving)\n\t\t\tserving = c;\n\t\telse\n\t\t\tneighbours++;\n\t}\n',
+        '\tlet serving = null, neighbours = null;\n')
+    new_modem = replace_exact(new_modem, '\t\tneighbours\n',
+        "\t\tneighbours,\n\t\tcell_collection: { enabled: false, reason: 'paused-d1' }\n")
+    api = replace_exact(api, old_modem, new_modem)
+    old_cells = function_text(api, 'cells')
+    api = replace_exact(api, old_cells,
+        "function cells() {\n\t// D1: ctx.cells() is paused too; modem().cell_collection reports this state.\n\treturn [];\n}")
+    api = replace_exact(api,
+        'function card_modem(m, sims) {\n\tlet s = sims[sim_card()];\n',
+        "function card_modem(m, sims) {\n\tlet s = sims[sim_card()];\n\t// D1: the disabled per-SIM poller must not replace MM cache with unknown fields.\n\tif (s.stale)\n\t\treturn { ...m, status_source: 'modemmanager-cache', per_sim_status: 'disabled-d1' };\n")
+    require('--get-cell-info' not in api, 'engineering cell command still present in screen API')
+    out[API] = api.encode()
+    out[UI] = replace_exact(items[UI].decode(),
+        "\tsetText('sg-nb', m.present ? String(m.neighbours ?? 0) : '--');",
+        "\tsetText('sg-nb', m.present ? (m.cell_collection?.enabled === false ? (lang == 'zh' ? '暂停采集' : lang == 'tr' ? 'Duraklatıldı' : 'Paused') : String(m.neighbours ?? 0)) : '--');").encode()
+    require(set(out) == {LOADER, ATD, API, UI}, 'unexpected replacement set')
+    deletion = {'path': START_LINK, 'kind': 'symlink', 'original_mode': INPUTS[START_LINK][2],
+                'original_sha256': INPUTS[START_LINK][1], 'target': items[START_LINK].decode(),
+                'action': 'DELETE_INTENT_ONLY_NOT_EXECUTED'}
+    return out, [deletion]
+
+
+def review_diff(inputs, outputs, deletions):
+    lines = ['# REVIEW ONLY: offline candidate, not a deployment or rootfs patch command.\n']
+    for name in sorted(outputs):
+        lines.extend(difflib.unified_diff(inputs[name].decode().splitlines(True),
+                     outputs[name].decode().splitlines(True), fromfile='a/' + name, tofile='b/' + name))
+    lines.append('\n# Planned startup symlink deletion (not performed by this tool):\n')
+    lines.append('# ' + json.dumps(deletions[0], sort_keys=True) + '\n')
+    return ''.join(lines).encode()
+
+
+def write_new(path, data):
+    # Outputs are deliberately ordinary non-executable review files.
+    with path.open('xb') as stream:
+        stream.write(data)
+    path.chmod(0o644)
+
+
+def prepare(name='candidate-d1'):
+    require(re.fullmatch(r'[a-z][a-z0-9-]{0,47}', name) is not None, 'invalid local result name')
+    items = load_inputs()
+    outputs, deletions = transform(items)
+    results = HERE / 'results'
+    no_symlink_parents(results)
+    results.mkdir(exist_ok=True)
+    destination = results / name
+    require(not destination.exists() and not destination.is_symlink(), 'result already exists')
+    destination.mkdir()
+    try:
+        records = []
+        for rel, data in sorted(outputs.items()):
+            p = destination / 'files' / rel
+            p.parent.mkdir(parents=True, exist_ok=True)
+            write_new(p, data)
+            records.append({'path': rel, 'bytes': len(data), 'sha256': digest(data),
+                            'original_sha256': INPUTS[rel][1], 'target_mode': INPUTS[rel][2],
+                            'action': 'REPLACE_INTENT_ONLY_NOT_EXECUTED'})
+        diff = review_diff(items, outputs, deletions)
+        write_new(destination / 'review.patch', diff)
+        manifest = {
+            'schema': 'e5-cellular-d1-offline-candidate-v1',
+            'status': 'PREPARED_OFFLINE_NOT_DEPLOYABLE_NOT_PROVEN_FIX',
+            'device_entrypoint': False, 'no_device_or_live_rootfs_operations': True,
+            'source_commit': SOURCE_COMMIT, 'raw_rootfs_sha256': RAW_ROOTFS_SHA,
+            'extraction_evidence_sha256': EXTRACTION_SHA,
+            'generator_sha256': digest(regular_bytes(Path(__file__).absolute())),
+            'replacements': records, 'deletion_intents': deletions,
+            'review_patch_sha256': digest(diff),
+            'required_before_deployment': [
+                'D0 receive-only CP evidence first; D1 is an optional intervention, not a confirmed repair',
+                'snapshot and hash current retained runtime rootfs and private NV work copies',
+                'verify current target files still match pinned input bytes, type and mode; otherwise STOP',
+                'ensure this is the only startup path for t551m-sim-status; no existing active poller',
+                'cold Linux start; no stale runtime per-SIM state may survive',
+                'independent review and separate transaction/deployment approval; tool cannot deploy',
+            ],
+            'residual_load': [
+                'qos_status is unchanged and may query AT on approximately 60 second cache expiry',
+                'MM binary and three-second two-SIM voice polling unchanged',
+                'MM signal polling, SMS monitor and startup data-priority/boot-replay unchanged',
+                'external MM cell method, manual AT terminal and manual sim-status launch remain possible; do not use during D0/D1 measurement',
+                '300 ms is per independent AT channel, not a global CP command rate limit',
+            ],
+            'unchanged_scope': ['kernel', 'boot/initramfs', 'ModemManager binary/plugins',
+                                'NV paths and contents', 'radio bands and RF policy',
+                                'CP reset/recovery code', 'qos_status', 'manual AT terminal'],
+        }
+        write_new(destination / 'PREPARED.json', (json.dumps(manifest, ensure_ascii=False, indent=2) + '\n').encode())
+        return destination
+    except BaseException:
+        # Partial output is review-only and cannot acquire the final marker.
+        marker = destination / 'PREPARED.json'
+        if marker.exists():
+            marker.unlink()
+        write_new(destination / 'FAILED_NOT_USABLE', b'Partial local output; do not use.\n')
+        raise
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--name', default='candidate-d1', help='new local review result name only')
+    args = parser.parse_args(argv)
+    print(prepare(args.name))
+    return 0
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

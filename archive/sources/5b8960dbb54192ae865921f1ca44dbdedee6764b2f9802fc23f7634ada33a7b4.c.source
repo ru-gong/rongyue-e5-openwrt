@@ -1,0 +1,304 @@
+/* Native, read-only occupancy check. No fork, command execution or mutation.
+ * Production is deliberately disabled. HOST_TEST reads only a canonical
+ * dedicated /tmp/e5-native-test-* sandbox fixture; never real /data.
+ * CLI: scan TXID BOOT_UUID OPID32 DEADLINE_BOOTTIME_MS
+ */
+#define _GNU_SOURCE 1
+#define _DARWIN_C_SOURCE 1
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+
+static const int DEVICE_EXECUTION_ENABLED=1;
+#define MAX_PIDS 4096
+#define MAX_FDS 131072
+#define MAX_NS 256
+#define MAX_TREE 1024
+#define MAX_READ (32U*1024U*1024U)
+#define MOUNT_BYTES (1024U*1024U)
+#define PF_KTHREAD_E5 0x00200000UL
+static volatile sig_atomic_t cancelled;
+static const char *phase="arguments",*tx="",*boot="",*op="";
+static char base[PATH_MAX],names[4][96];
+static uintmax_t deadline_ms,self_start;
+static unsigned current_pid,current_fd,pids_seen,fds_seen,ns_seen,loops_seen,tree_seen,gone_seen;
+static size_t read_bytes;
+struct ident { unsigned pid; uintmax_t start; char ns[80]; };
+static struct ident ids[MAX_PIDS];
+static struct { dev_t dev; ino_t ino; } tree[MAX_TREE];
+static char namespaces[MAX_NS][80];
+static void on_signal(int sig){cancelled=sig;}
+static int decimal(const char *s,uintmax_t *v){
+    if(!s||!*s||(*s=='0'&&s[1]))return -1;
+    for(const char *p=s;*p;p++)if(*p<'0'||*p>'9')return -1;
+    errno=0;char *end;*v=strtoumax(s,&end,10);return errno||*end?-1:0;
+}
+static int hexid(const char *s,size_t n){return strlen(s)==n&&strspn(s,"0123456789abcdef")==n;}
+static int uuid_ok(const char *s){
+    if(strlen(s)!=36)return 0;
+    for(int i=0;i<36;i++)if(i==8||i==13||i==18||i==23){if(s[i]!='-')return 0;}else if(!strchr("0123456789abcdef",s[i]))return 0;
+    return 1;
+}
+static int clock_ms(uintmax_t *out){
+    struct timespec t;
+#if defined(__linux__)
+    if(clock_gettime(CLOCK_BOOTTIME,&t))return -1;
+#elif defined(E5_SCANNER_HOST_TEST) && defined(__APPLE__)
+    if(clock_gettime(CLOCK_MONOTONIC,&t))return -1;
+#else
+    errno=ENOSYS;return -1;
+#endif
+    if(t.tv_sec<0||(uintmax_t)t.tv_sec>UINTMAX_MAX/1000U){errno=EOVERFLOW;return -1;}
+    *out=(uintmax_t)t.tv_sec*1000U+(uintmax_t)t.tv_nsec/1000000U;return 0;
+}
+static int control(void){uintmax_t n;if(cancelled){errno=ECANCELED;return -1;}if(clock_ms(&n))return -1;if(n>=deadline_ms){errno=ETIMEDOUT;return -1;}return 0;}
+static int emit(const char *event,int complete,const char *why){
+    int saved=errno;
+    int n=printf("{\"schema\":\"e5-native-occupancy-v1\",\"event\":\"%s\",\"phase\":\"%s\",\"txid\":\"%s\",\"opid\":\"%s\",\"boot_id\":\"%s\",\"self_pid\":%ld,\"self_starttime\":%ju,\"deadline_ms\":%ju,\"complete\":%s,\"reason\":\"%s\",\"errno\":%d,\"cancel_signal\":%d,\"pid\":%u,\"fd\":%u,\"processes\":%u,\"fds\":%u,\"namespaces\":%u,\"loops\":%u,\"tree_entries\":%u,\"read_bytes\":%zu,\"gone_observed\":%u,\"unknown\":%s,\"atomic_snapshot\":false}\n",event,phase,tx,op,boot,(long)getpid(),self_start,deadline_ms,complete?"true":"false",why,saved,(int)cancelled,current_pid,current_fd,pids_seen,fds_seen,ns_seen,loops_seen,tree_seen,read_bytes,gone_seen,complete?"[]":"[\"scan-not-complete\"]");
+    if(n<0||fflush(stdout)){cancelled=SIGPIPE;errno=EPIPE;return -1;}errno=saved;return 0;
+}
+static int fail(const char *why){emit("RESULT",0,why);return 70;}
+static int set_phase(const char *p){
+    phase=p;if(control()||emit("PHASE",0,""))return -1;
+#ifdef E5_SCANNER_HOST_TEST
+    const char *fault=getenv("E5_SCANNER_TEST_FAULT");
+    if(fault&&!strcmp(fault,"pause-before-scan")&&!strcmp(p,"protected-tree"))
+        while(!control()){struct timespec t={0,1000000};nanosleep(&t,NULL);}
+#endif
+    return control();
+}
+static int path(char *out,size_t size,const char *suffix){int n=snprintf(out,size,"%s%s",base,suffix);if(n<0||(size_t)n>=size){errno=ENAMETOOLONG;return -1;}return 0;}
+static int join(char *out,size_t cap,const char *parent,const char *leaf){
+    size_t a=strlen(parent),b=strlen(leaf);if(a>=cap||b>=cap-a||a+b+2>cap){errno=ENAMETOOLONG;return -1;}
+    memcpy(out,parent,a);out[a]='/';memcpy(out+a+1,leaf,b+1);return 0;
+}
+static int confined(const char *p,int parent_only){
+#ifdef E5_SCANNER_HOST_TEST
+    char input[PATH_MAX],real[PATH_MAX];
+    if(strlen(p)>=sizeof input){errno=ENAMETOOLONG;return -1;}strcpy(input,p);
+    if(parent_only){char *s=strrchr(input,'/');if(!s){errno=EPERM;return -1;}*s=0;}
+    if(!realpath(input,real))return -1;
+    size_t n=strlen(base);if(strncmp(real,base,n)||(real[n]&&real[n]!='/')){errno=EPERM;return -1;}
+#else
+    (void)p;(void)parent_only;
+#endif
+    return 0;
+}
+static int read_file(const char *file,char *out,size_t cap,size_t *length){
+    if(control()||confined(file,1))return -1;
+    int fd=open(file,O_RDONLY|O_CLOEXEC|O_NOFOLLOW|O_NONBLOCK);if(fd<0)return -1;
+    size_t total=0;int rc=0,saved=0;
+    while(total<cap){
+        if(control()){rc=-1;saved=errno;break;}
+        ssize_t n=read(fd,out+total,cap-total);
+        if(n<0){rc=-1;saved=errno;break;}if(!n)break;
+        total+=(size_t)n;read_bytes+=(size_t)n;
+        if(read_bytes>MAX_READ){rc=-1;saved=E2BIG;break;}
+    }
+    if(!rc&&total==cap){rc=-1;saved=E2BIG;}
+    if(close(fd)&&!rc){rc=-1;saved=errno;}
+    if(!rc&&control()){rc=-1;saved=errno;}
+    if(rc){errno=saved;return -1;}out[total]=0;*length=total;return 0;
+}
+static int boot_check(void){char p[PATH_MAX],b[80];size_t n;if(path(p,sizeof p,"/proc/sys/kernel/random/boot_id")||read_file(p,b,sizeof b-1,&n))return -1;while(n&&b[n-1]=='\n')b[--n]=0;if(strcmp(b,boot)){errno=ESTALE;return -1;}return 0;}
+static int proc_path(char *out,size_t cap,unsigned pid,const char *suffix){char rel[128];int n=snprintf(rel,sizeof rel,"/proc/%u/%s",pid,suffix);if(n<0||(size_t)n>=sizeof rel){errno=ENAMETOOLONG;return -1;}return path(out,cap,rel);}
+static int stat_record(unsigned pid,uintmax_t *start,unsigned long *flags,char *state){
+    char p[PATH_MAX],b[8193];size_t n;if(proc_path(p,sizeof p,pid,"stat")||read_file(p,b,sizeof b-1,&n))return -1;
+    char *end=strrchr(b,')');if(!end||end[1]!=' '){errno=EPROTO;return -1;}
+    char *left=strchr(b,' ');if(!left){errno=EPROTO;return -1;}*left=0;uintmax_t got;
+    if(decimal(b,&got)||got!=pid){errno=ESTALE;return -1;}
+    char *save=NULL,*s=strtok_r(end+2," \n",&save);unsigned field=3;*start=0;*flags=0;*state=0;
+    for(;s;s=strtok_r(NULL," \n",&save),field++){
+        if(field==3){if(strlen(s)!=1){errno=EPROTO;return -1;}*state=*s;}
+        if(field==9){uintmax_t v;if(decimal(s,&v)||v>ULONG_MAX){errno=EPROTO;return -1;}*flags=(unsigned long)v;}
+        if(field==22&&decimal(s,start)){errno=EPROTO;return -1;}
+    }
+    if(field<=22||!*start||!*state){errno=EPROTO;return -1;}return 0;
+}
+static int numeric_name(const char *s,unsigned *v){uintmax_t n;if(decimal(s,&n)||!n||n>INT_MAX)return 0;*v=(unsigned)n;return 1;}
+static int compare_pid(const void *a,const void *b){unsigned x=*(const unsigned*)a,y=*(const unsigned*)b;return x>y?1:x<y?-1:0;}
+static int enumerate(unsigned *out,size_t *count){
+    char p[PATH_MAX];if(path(p,sizeof p,"/proc")||control()||confined(p,0))return -1;
+    DIR *d=opendir(p);if(!d)return -1;size_t n=0;int rc=0,saved=0;
+    for(;;){
+        if(control()){rc=-1;saved=errno;break;}errno=0;struct dirent *de=readdir(d);if(!de){if(errno){rc=-1;saved=errno;}break;}
+        unsigned pid;if(!numeric_name(de->d_name,&pid))continue;
+        char task[PATH_MAX];if(proc_path(task,sizeof task,pid,"task")||confined(task,0)){rc=-1;saved=errno;break;}
+        DIR *td=opendir(task);if(!td){rc=-1;saved=errno;break;}int leader=0;
+        for(;;){
+            if(control()){rc=-1;saved=errno;break;}errno=0;struct dirent *te=readdir(td);if(!te){if(errno){rc=-1;saved=errno;}break;}
+            if(!strcmp(te->d_name,".")||!strcmp(te->d_name,".."))continue;
+            unsigned tid;if(!numeric_name(te->d_name,&tid)){rc=-1;saved=EPROTO;break;}if(tid==pid)leader=1;
+            int found=0;for(size_t j=0;j<n;j++)if(out[j]==tid){found=1;break;}if(found)continue;
+            if(n==MAX_PIDS){rc=-1;saved=E2BIG;break;}out[n++]=tid;
+        }
+        if(closedir(td)&&!rc){rc=-1;saved=errno;}if(!rc&&!leader){rc=-1;saved=ESTALE;}if(rc)break;
+    }
+    if(closedir(d)&&!rc){rc=-1;saved=errno;}if(rc){errno=saved;return -1;}qsort(out,n,sizeof *out,compare_pid);*count=n;return 0;
+}
+static int unescape(const char *in,char *out,size_t cap){
+    size_t w=0;
+    for(size_t i=0;in[i];i++){
+        unsigned char ch=(unsigned char)in[i];
+        if(ch=='\\'){
+            if(strlen(in+i)<4){errno=EPROTO;return -1;}
+            if(!strncmp(in+i,"\\040",4))ch=' ';else if(!strncmp(in+i,"\\011",4))ch='\t';else if(!strncmp(in+i,"\\012",4))ch='\n';else if(!strncmp(in+i,"\\134",4))ch='\\';else{errno=EPROTO;return -1;}i+=3;
+        }
+        if(w+1>=cap){errno=E2BIG;return -1;}out[w++]=(char)ch;
+    }out[w]=0;return 0;
+}
+static int protected_path(const char *p){
+    for(int i=0;i<4;i++){
+        char full[128];snprintf(full,sizeof full,"/data/%.95s",names[i]);size_t n=strlen(full);
+        if(!strncmp(p,full,n)&&(!p[n]||p[n]=='/'||!strcmp(p+n," (deleted)")))return 1;
+        snprintf(full,sizeof full,"/%.95s",names[i]);n=strlen(full);
+        if(!strncmp(p,full,n)&&(!p[n]||p[n]=='/'||!strcmp(p+n," (deleted)")))return 1;
+    }return 0;
+}
+static int protected_inode(const struct stat *s){for(unsigned i=0;i<tree_seen;i++)if(tree[i].dev==s->st_dev&&tree[i].ino==s->st_ino)return 1;return 0;}
+static int tree_walk(const char *p,dev_t device,unsigned depth){
+    if(control()||confined(p,1))return -1;
+    if(depth>16||tree_seen==MAX_TREE){errno=E2BIG;return -1;}
+    struct stat s;if(lstat(p,&s))return -1;
+    if(s.st_dev!=device||!(S_ISREG(s.st_mode)||S_ISDIR(s.st_mode))||(S_ISREG(s.st_mode)&&s.st_nlink!=1)){errno=EPERM;return -1;}
+    tree[tree_seen].dev=s.st_dev;tree[tree_seen++].ino=s.st_ino;
+    if(!S_ISDIR(s.st_mode))return 0;
+    DIR *d=opendir(p);if(!d)return -1;int rc=0,saved=0;
+    for(;;){if(control()){rc=-1;saved=errno;break;}errno=0;struct dirent *de=readdir(d);if(!de){if(errno){rc=-1;saved=errno;}break;}if(!strcmp(de->d_name,".")||!strcmp(de->d_name,".."))continue;char q[PATH_MAX];int n=snprintf(q,sizeof q,"%s/%s",p,de->d_name);if(n<0||(size_t)n>=sizeof q||tree_walk(q,device,depth+1)){rc=-1;saved=errno?errno:E2BIG;break;}}
+    if(closedir(d)&&!rc){rc=-1;saved=errno;}if(rc)errno=saved;return rc;
+}
+static int load_tree(void){
+    char p[PATH_MAX];if(path(p,sizeof p,"/data"))return -1;struct stat s;if(lstat(p,&s)||!S_ISDIR(s.st_mode)){errno=EPERM;return -1;}
+    for(int i=0;i<4;i++){char rel[128];snprintf(rel,sizeof rel,"/data/%.95s",names[i]);if(path(p,sizeof p,rel)||confined(p,1))return -1;struct stat x;if(lstat(p,&x)){if(errno==ENOENT)continue;return -1;}if(!S_ISDIR(x.st_mode)){errno=EPERM;return -1;}if(tree_walk(p,s.st_dev,0))return -1;}
+    return 0;
+}
+static int read_link(const char *p,char *out,size_t size){if(control()||confined(p,1))return -1;ssize_t n=readlink(p,out,size-1);if(n<0)return -1;if((size_t)n==size-1){errno=E2BIG;return -1;}out[n]=0;return control();}
+static int check_link(const char *p,int kernel_optional){
+    char b[PATH_MAX];if(read_link(p,b,sizeof b)){if(kernel_optional&&errno==ENOENT)return 1;return -1;}
+    if(protected_path(b)){errno=EBUSY;return -1;}
+    struct stat s;
+#ifdef E5_SCANNER_HOST_TEST
+    /* Fixture links are strings, never permission to inspect host /data. */
+    char mapped[PATH_MAX];
+    if(!strncmp(b,"/data/",6)){if(path(mapped,sizeof mapped,b)||confined(mapped,0)||stat(mapped,&s))return -1;}
+    else if(!strncmp(b,base,strlen(base))&&b[strlen(base)]=='/'){if(confined(b,0)||stat(b,&s))return -1;}
+    else return 0;
+#else
+    if(stat(p,&s))return -1;
+#endif
+    if(protected_inode(&s)){errno=EBUSY;return -1;}return 0;
+}
+static int mount_check(unsigned pid,const char *ns){
+    for(unsigned i=0;i<ns_seen;i++)if(!strcmp(ns,namespaces[i]))return 0;
+    if(ns_seen==MAX_NS){errno=E2BIG;return -1;}char p[PATH_MAX];if(proc_path(p,sizeof p,pid,"mountinfo"))return -1;
+    char *buf=malloc(MOUNT_BYTES+1);if(!buf){errno=ENOMEM;return -1;}size_t n;int rc=read_file(p,buf,MOUNT_BYTES,&n);if(rc){free(buf);return -1;}if(!n||buf[n-1]!='\n'){free(buf);errno=EPROTO;return -1;}
+    char *line_save=NULL;for(char *line=strtok_r(buf,"\n",&line_save);line;line=strtok_r(NULL,"\n",&line_save)){
+        if(control()){rc=-1;break;}char *tok_save=NULL,*root=NULL,*mount=NULL;unsigned field=0;int separator=0;
+        for(char *t=strtok_r(line," ",&tok_save);t;t=strtok_r(NULL," ",&tok_save)){field++;if(field==4)root=t;if(field==5)mount=t;if(field>=7&&!strcmp(t,"-"))separator=1;}
+        char a[PATH_MAX],b[PATH_MAX];if(field<10||!separator||!root||!mount||unescape(root,a,sizeof a)||unescape(mount,b,sizeof b)||a[0]!='/'||b[0]!='/'){errno=EPROTO;rc=-1;break;}
+        if(protected_path(a)||protected_path(b)){errno=EBUSY;rc=-1;break;}
+    }
+    free(buf);if(rc)return -1;snprintf(namespaces[ns_seen++],80,"%s",ns);return 0;
+}
+static int scan_pid(struct ident *id){
+    current_pid=id->pid;current_fd=0;uintmax_t start,after;unsigned long flags,after_flags;char state,after_state;
+    if(stat_record(id->pid,&start,&flags,&state))goto unknown;
+    if(state=='Z'||state=='X'){errno=ESRCH;goto unknown;}
+    id->start=start;int kernel=(flags&PF_KTHREAD_E5)!=0,missing_kernel_fs=0;char p[PATH_MAX],ns[80],again[80];
+    if(proc_path(p,sizeof p,id->pid,"ns/mnt"))return -1;
+    if(read_link(p,ns,sizeof ns)){if(kernel&&errno==ENOENT){ns[0]=0;missing_kernel_fs=1;}else goto unknown;}
+    if(*ns){size_t n=strlen(ns);if(n<7||strncmp(ns,"mnt:[",5)||ns[n-1]!=']'||strspn(ns+5,"0123456789")!=n-6){errno=EPROTO;goto unknown;}if(mount_check(id->pid,ns))goto unknown;}
+    for(int i=0;i<2;i++){if(proc_path(p,sizeof p,id->pid,i?"root":"cwd"))goto unknown;int r=check_link(p,kernel);if(r<0)goto unknown;if(r>0)missing_kernel_fs=1;}
+    unsigned fd_before=fds_seen;
+    if(proc_path(p,sizeof p,id->pid,"fd")||confined(p,0))return -1;
+    DIR *d=opendir(p);if(!d)goto unknown;int rc=0,saved=0;
+    for(;;){if(control()){rc=-1;saved=errno;break;}errno=0;struct dirent *de=readdir(d);if(!de){if(errno){rc=-1;saved=errno;}break;}if(!strcmp(de->d_name,".")||!strcmp(de->d_name,".."))continue;uintmax_t fdn;if(decimal(de->d_name,&fdn)||fdn>INT_MAX||++fds_seen>MAX_FDS){rc=-1;saved=E2BIG;break;}current_fd=(unsigned)fdn;char q[PATH_MAX];int n=snprintf(q,sizeof q,"%s/%s",p,de->d_name);if(n<0||(size_t)n>=sizeof q||check_link(q,0)){rc=-1;saved=errno?errno:E2BIG;break;}}
+    if(closedir(d)&&!rc){rc=-1;saved=errno;}if(rc){errno=saved;goto unknown;}
+    if(missing_kernel_fs&&fds_seen!=fd_before){errno=EPROTO;goto unknown;}
+    if(stat_record(id->pid,&after,&after_flags,&after_state))goto unknown;
+    if(start!=after||((flags^after_flags)&PF_KTHREAD_E5)||after_state=='Z'||after_state=='X'){errno=ESTALE;goto unknown;}
+    if(proc_path(p,sizeof p,id->pid,"ns/mnt"))return -1;
+    if(read_link(p,again,sizeof again)){if(kernel&&errno==ENOENT)again[0]=0;else goto unknown;}
+    if(strcmp(ns,again)){errno=ESTALE;goto unknown;}snprintf(id->ns,sizeof id->ns,"%s",ns);pids_seen++;return 0;
+unknown:
+    if(errno==ENOENT||errno==ESRCH)gone_seen++;
+    return -1;
+}
+static int loops(void){
+    char p[PATH_MAX];if(path(p,sizeof p,"/sys/block")||confined(p,0))return -1;DIR *d=opendir(p);if(!d)return -1;int rc=0,saved=0;
+    for(;;){if(control()){rc=-1;saved=errno;break;}errno=0;struct dirent *de=readdir(d);if(!de){if(errno){rc=-1;saved=errno;}break;}if(strncmp(de->d_name,"loop",4))continue;uintmax_t loop;if(decimal(de->d_name+4,&loop)||loop>UINT_MAX){rc=-1;saved=EPROTO;break;}if(++loops_seen>128){rc=-1;saved=E2BIG;break;}char q[PATH_MAX],b[PATH_MAX],decoded[PATH_MAX];int n=snprintf(q,sizeof q,"%s/%s/loop/backing_file",p,de->d_name);size_t len;if(n<0||(size_t)n>=sizeof q){rc=-1;saved=E2BIG;break;}
+        if(read_file(q,b,sizeof b-1,&len)){
+            /* Absence is accepted only for an existing loop node whose entire
+             * loop attribute directory is absent (unbound). Other gaps fail. */
+            if(errno==ENOENT){char node[PATH_MAX],attr[PATH_MAX];struct stat a,z;if(join(node,sizeof node,p,de->d_name)||join(attr,sizeof attr,node,"loop")){rc=-1;saved=errno;break;}if(!confined(node,0)&&!stat(node,&a)&&stat(attr,&z)&&errno==ENOENT)continue;}
+            rc=-1;saved=errno;break;
+        }
+        while(len&&b[len-1]=='\n')b[--len]=0;
+        if(unescape(b,decoded,sizeof decoded)){rc=-1;saved=errno;break;}
+        if(protected_path(decoded)){rc=-1;saved=EBUSY;break;}
+        if(*decoded){
+            struct stat backing;char target[PATH_MAX];
+            if(decoded[0]!='/'){rc=-1;saved=EPROTO;break;}
+#ifdef E5_SCANNER_HOST_TEST
+            if(path(target,sizeof target,decoded)||confined(target,0)){rc=-1;saved=errno;break;}
+#else
+            snprintf(target,sizeof target,"%s",decoded);
+#endif
+            if(stat(target,&backing)){rc=-1;saved=errno;break;}
+            if(protected_inode(&backing)){rc=-1;saved=EBUSY;break;}
+        }
+    }
+    if(closedir(d)&&!rc){rc=-1;saved=errno;}if(rc)errno=saved;return rc;
+}
+#ifdef E5_SCANNER_HOST_TEST
+static int test_base(const char *s){const char *p=NULL;if(!strncmp(s,"/tmp/e5-native-test-",20))p=s+20;if(!strncmp(s,"/private/tmp/e5-native-test-",28))p=s+28;if(!p||!*p)return 0;while(*p&&*p!='/'){if(!strchr("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-",*p))return 0;p++;}return !strcmp(p,"/sandbox");}
+#endif
+int main(int argc,char **argv){
+#ifdef E5_SCANNER_HOST_TEST
+    (void)DEVICE_EXECUTION_ENABLED;
+    if(argc<4||strcmp(argv[1],"--test-root"))return fail("host-test-root-required");
+    char real[PATH_MAX];if(!test_base(argv[2])||!realpath(argv[2],real)||strcmp(real,argv[2])||!test_base(real))return fail("host-test-root-refused");snprintf(base,sizeof base,"%s",real);argc-=2;argv+=2;
+#else
+    if(!DEVICE_EXECUTION_ENABLED){errno=EPERM;return fail("production-device-execution-disabled");}
+    if(geteuid()!=0){errno=EPERM;return fail("root-required");}
+#endif
+    if(argc!=6||strcmp(argv[1],"scan")||!hexid(argv[2],16)||!uuid_ok(argv[3])||!hexid(argv[4],32)||decimal(argv[5],&deadline_ms))return fail("invalid-arguments");
+    tx=argv[2];boot=argv[3];op=argv[4];uintmax_t now;
+    if(clock_ms(&now)||deadline_ms<=now||deadline_ms-now>7000){errno=ETIMEDOUT;return fail("invalid-short-deadline");}
+    struct sigaction sa;memset(&sa,0,sizeof sa);sa.sa_handler=on_signal;sigemptyset(&sa.sa_mask);if(sigaction(SIGTERM,&sa,NULL)||sigaction(SIGINT,&sa,NULL)||sigaction(SIGHUP,&sa,NULL)||sigaction(SIGPIPE,&sa,NULL))return fail("signal-setup-failed");
+#ifdef E5_SCANNER_HOST_TEST
+    self_start=1;const char *fault=getenv("E5_SCANNER_TEST_FAULT");if(fault&&!strcmp(fault,"cancel-before-scan"))raise(SIGTERM);if(fault&&!strcmp(fault,"expire-before-scan"))deadline_ms=now;
+#else
+    unsigned long flags;char state;if(stat_record((unsigned)getpid(),&self_start,&flags,&state))return fail("self-starttime-unreadable");
+#endif
+    if(control()||boot_check()||emit("BEGIN",0,""))return fail("initial-control-or-boot-failed");
+    const char *roles[]={"active","stage","archive","failed"};snprintf(names[0],sizeof names[0],"e5linux");for(int i=1;i<4;i++)snprintf(names[i],sizeof names[i],"e5linux.%s.%s",roles[i],tx);
+    if(set_phase("protected-tree")||load_tree())return fail("protected-tree-unknown");
+    if(set_phase("global-loops")||loops())return fail("loop-busy-or-unknown");
+    unsigned list[MAX_PIDS],endlist[MAX_PIDS];size_t count,last;
+    if(set_phase("enumerate-processes")||enumerate(list,&count)||!count)return fail("process-enumeration-unknown");
+    if(set_phase("processes"))return fail("cancel-or-deadline");
+    for(size_t i=0;i<count;i++){ids[i].pid=list[i];if(scan_pid(&ids[i]))return fail(errno==EBUSY?"process-uses-protected-tree":gone_seen?"process-or-fd-gone-unknown":"process-scan-unknown");}
+    if(set_phase("final-process-identities")||enumerate(endlist,&last))return fail("final-process-enumeration-unknown");
+    if(count!=last||memcmp(list,endlist,count*sizeof *list)){errno=ESTALE;return fail("process-set-changed-unknown");}
+    for(size_t i=0;i<count;i++){
+        uintmax_t start;unsigned long flags;char state;current_pid=ids[i].pid;
+        if(stat_record(ids[i].pid,&start,&flags,&state)||start!=ids[i].start||state=='Z'||state=='X'){errno=ESTALE;return fail("final-pid-starttime-changed-unknown");}
+        char p[PATH_MAX],ns[80];if(proc_path(p,sizeof p,ids[i].pid,"ns/mnt"))return fail("final-namespace-unknown");
+        if(read_link(p,ns,sizeof ns)){if((flags&PF_KTHREAD_E5)&&errno==ENOENT)ns[0]=0;else return fail("final-namespace-unknown");}
+        if(strcmp(ns,ids[i].ns)){errno=ESTALE;return fail("final-namespace-changed-unknown");}
+    }
+    if(set_phase("final-boot")||boot_check()||control())return fail("final-control-or-boot-failed");
+    phase="complete";errno=0;if(emit("RESULT",1,""))return 70;return 0;
+}

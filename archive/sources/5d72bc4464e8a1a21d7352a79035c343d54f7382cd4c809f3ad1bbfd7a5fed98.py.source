@@ -1,0 +1,43 @@
+"""Pinned host input reader. No device, subprocess or network operations."""
+import hashlib,os,stat
+from pathlib import Path
+class InputChanged(RuntimeError):
+ def __init__(self,message,details=None):super().__init__(message);self.details=details or {}
+FIELDS=('st_dev','st_ino','st_mode','st_nlink','st_uid','st_gid','st_size','st_mtime_ns','st_ctime_ns')
+def identity(s):return tuple(getattr(s,k) for k in FIELDS)
+def checked_path(path):
+ p=Path(path)
+ if not p.is_absolute() or '..' in p.parts or p.is_symlink() or any(q.is_symlink() for q in p.parents):raise InputChanged('unsafe input path')
+ s=p.lstat()
+ if not stat.S_ISREG(s.st_mode) or s.st_nlink!=1:raise InputChanged('input must be a single regular file')
+ return p,s
+class PinnedInput:
+ def __init__(self,path,size,digest):
+  if type(size) is not int or not 0<=size<=16<<30 or len(digest)!=64 or any(c not in '0123456789abcdef' for c in digest):raise InputChanged('input binding')
+  self.path,self.expected,self.digest=Path(path),size,digest;self.fd=None;self.count=0;self.hash=hashlib.sha256();self.finished=False
+ def __enter__(self):
+  p,s=checked_path(self.path);self.initial=identity(s)
+  if s.st_size!=self.expected:raise InputChanged('input size before read')
+  fd=os.open(p,os.O_RDONLY|os.O_NOFOLLOW|os.O_CLOEXEC)
+  try:
+   if identity(os.fstat(fd))!=self.initial or identity(checked_path(p)[1])!=self.initial:raise InputChanged('input replaced during open')
+  except BaseException:os.close(fd);raise
+  self.fd=fd;return self
+ def read(self,n):
+  if self.fd is None or self.finished or type(n) is not int or n<=0:raise InputChanged('invalid input read')
+  b=os.read(self.fd,n);self.count+=len(b);self.hash.update(b)
+  if self.count>self.expected:raise InputChanged('input grew')
+  return b
+ def finish(self):
+  if self.fd is None or self.finished:raise InputChanged('input not active')
+  observed_fd=identity(os.fstat(self.fd));observed_path=identity(checked_path(self.path)[1])
+  trailing=os.read(self.fd,1)
+  if self.count!=self.expected or self.hash.hexdigest()!=self.digest or trailing or observed_fd!=self.initial or observed_path!=self.initial:
+   reason='input identity or stable metadata changed' if observed_fd!=self.initial or observed_path!=self.initial else 'input length or hash differs'
+   raise InputChanged(reason,{'path':str(self.path),'initial':dict(zip(FIELDS,self.initial)),'observed_fd':dict(zip(FIELDS,observed_fd)),'observed_path':dict(zip(FIELDS,observed_path)),'changed_fd_fields':[k for k,a,b in zip(FIELDS,self.initial,observed_fd) if a!=b],'changed_path_fields':[k for k,a,b in zip(FIELDS,self.initial,observed_path) if a!=b],'bytes_read':self.count,'hash_matches':self.hash.hexdigest()==self.digest,'length_matches':self.count==self.expected,'trailing_data':bool(trailing)})
+  self.finished=True
+ def __exit__(self,typ,value,tb):
+  try:
+   if typ is None and not self.finished:raise InputChanged('input was not fully verified')
+  finally:
+   if self.fd is not None:os.close(self.fd);self.fd=None

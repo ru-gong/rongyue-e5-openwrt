@@ -1,0 +1,178 @@
+"""Compile HOST_TEST only and mutate confined, synthetic temporary filesystems."""
+import os
+from pathlib import Path
+import json
+import shutil
+import selectors
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+HERE=Path(__file__).resolve().parent
+CC=shutil.which('cc')
+ALLOWED={Path(CC).resolve()}
+def guard(event,args):
+    if event.startswith('socket.') or event in ('os.system','os.exec','os.posix_spawn','os.posix_spawnp'):
+        raise AssertionError('network/indirect process forbidden')
+    if event=='subprocess.Popen' and Path(args[0]).resolve() not in ALLOWED:
+        raise AssertionError('only compiler and own HOST_TEST/disabled binaries allowed')
+sys.addaudithook(guard)
+TX='0123456789abcdef';OLD='4d6efbbcd48f2d73';BOOT='00000000-0000-4000-8000-000000000001';OP='a'*32
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.build=tempfile.TemporaryDirectory(prefix='e5-lock-archive-build-',dir='/tmp')
+        cls.binary=Path(cls.build.name)/'hosttest';cls.disabled=Path(cls.build.name)/'disabled'
+        for path,flags in [(cls.binary,['-DE5_LOCK_ARCHIVE_HOST_TEST']),(cls.disabled,[])]:
+            subprocess.run([CC,'-std=c11','-Wall','-Wextra','-Werror','-O2',*flags,str(HERE/'native/lock_archive.c'),'-o',str(path)],check=True,timeout=30)
+            ALLOWED.add(path.resolve())
+    @classmethod
+    def tearDownClass(cls):cls.build.cleanup()
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='e5-lock-archive-test-',dir='/tmp');self.addCleanup(self.tmp.cleanup)
+        self.base=Path(self.tmp.name).resolve();self.data=self.base/'data';self.parent=self.data/'local/tmp'
+        self.parent.mkdir(parents=True);self.data.chmod(0o771);self.data.joinpath('local').chmod(0o751);self.parent.chmod(0o771)
+        self.lock=self.parent/'e5-clean-directory.lock';self.lock.mkdir(mode=0o700)
+        self.owner=self.lock/'owner';self.owner.write_bytes((OLD+'\n').encode());self.owner.chmod(0o600)
+        self.archive=self.parent/f'e5-clean-directory.lock.archive.{OLD}.{TX}'
+        (self.base/'boot_id').write_text(BOOT+'\n')
+        self.original={'lock':self.lock.stat().st_ino,'owner':self.owner.stat().st_ino,'bytes':self.owner.read_bytes()}
+    def argv(self,delta=5000):
+        paths=[self.data,self.data/'local',self.parent,self.lock,self.owner]
+        return [str(self.binary),'--test-root',str(self.data),'archive',TX,BOOT,OP,
+                str(int(time.clock_gettime(time.CLOCK_MONOTONIC)*1000)+delta),str(self.data.stat().st_dev),*[str(p.lstat().st_ino) for p in paths]]
+    def run_one(self,fault=None,argv=None):
+        env=dict(os.environ);env.pop('E5_LOCK_ARCHIVE_TEST_FAULT',None)
+        if fault:env['E5_LOCK_ARCHIVE_TEST_FAULT']=fault
+        p=subprocess.run(argv or self.argv(),env=env,capture_output=True,timeout=8)
+        rows=[json.loads(x) for x in p.stdout.splitlines()];self.assertTrue(rows,p.stderr)
+        self.assertEqual(rows[-1]['event'],'RESULT');return p,rows[-1]
+    def preserved(self,renamed=False):
+        p=self.archive if renamed else self.lock
+        self.assertTrue(p.is_dir());self.assertEqual(p.stat().st_ino,self.original['lock'])
+        self.assertEqual((p/'owner').stat().st_ino,self.original['owner']);self.assertEqual((p/'owner').read_bytes(),self.original['bytes'])
+        self.assertEqual(list(x.name for x in p.iterdir()),['owner'])
+        self.assertFalse((self.lock if renamed else self.archive).exists())
+    def test_success_exact_preserving_rename(self):
+        p,r=self.run_one();self.assertEqual(p.returncode,0,r);self.assertTrue(r['complete']);self.assertTrue(r['renamed']);self.assertTrue(r['fsync_completed']);self.assertFalse(r['power_loss_safety_proven']);self.assertFalse(r['f2fs_confirmed']);self.preserved(True)
+    def test_two_prior_archives_remain_byte_and_inode_identical(self):
+        saved=[]
+        for old,new in [('fad8a60f84aa4268','7d125fa2bd1c4e63'),('7d125fa2bd1c4e63','722b7e1f5956cc07'),('722b7e1f5956cc07',OLD)]:
+            path=self.parent/f'e5-clean-directory.lock.archive.{old}.{new}';path.mkdir(mode=0o700)
+            owner=path/'owner';owner.write_bytes((old+'\n').encode());owner.chmod(0o600)
+            saved.append((path,path.stat().st_ino,owner.stat().st_ino,owner.read_bytes()))
+        p,r=self.run_one();self.assertEqual(p.returncode,0,r);self.preserved(True)
+        for path,ino,ownerino,data in saved:
+            self.assertEqual(path.stat().st_ino,ino);self.assertEqual((path/'owner').stat().st_ino,ownerino)
+            self.assertEqual((path/'owner').read_bytes(),data);self.assertEqual([x.name for x in path.iterdir()],['owner'])
+    def test_prior_7d_owner_cannot_be_used_as_current(self):
+        self.owner.write_bytes(b'7d125fa2bd1c4e63\n');p,r=self.run_one()
+        self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted'])
+        self.assertEqual(self.owner.read_bytes(),b'7d125fa2bd1c4e63\n')
+    def test_disabled_before_paths(self):
+        p,r=self.run_one(argv=[str(self.disabled)]);self.assertEqual(p.returncode,70);self.assertEqual(r['reason'],'production-device-execution-disabled');self.preserved()
+    def test_host_test_cannot_target_data(self):
+        a=self.argv();a[2]='/data';p,r=self.run_one(argv=a);self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.preserved()
+    def test_existing_empty_destination_refused(self):
+        self.archive.mkdir();ino=self.archive.stat().st_ino;p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.assertEqual(self.archive.stat().st_ino,ino);self.assertEqual(self.lock.stat().st_ino,self.original['lock'])
+    def test_existing_nonempty_destination_refused(self):
+        self.archive.mkdir();(self.archive/'keep').write_text('keep');p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertEqual((self.archive/'keep').read_text(),'keep');self.assertFalse(r['mutation_attempted'])
+    def test_destination_symlink_refused(self):
+        self.archive.symlink_to(self.lock);p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertTrue(self.archive.is_symlink());self.assertFalse(r['mutation_attempted'])
+    def test_unknown_lock_member_refused(self):
+        (self.lock/'probe-source.old').mkdir();p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.assertTrue((self.lock/'probe-source.old').is_dir())
+    def test_wrong_old_owner_refused(self):
+        self.owner.write_text(TX+'\n');p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted'])
+    def test_owner_length_refused(self):
+        self.owner.write_bytes((OLD+'\nextra').encode());p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted'])
+    def test_owner_hardlink_refused(self):
+        os.link(self.owner,self.parent/'owner-alias');p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.assertTrue((self.parent/'owner-alias').exists())
+    def test_owner_symlink_refused(self):
+        q=self.parent/'real-owner';self.owner.rename(q);self.owner.symlink_to(q);p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.assertEqual(q.read_bytes(),self.original['bytes'])
+    def test_lock_symlink_refused(self):
+        q=self.parent/'real-lock';self.lock.rename(q);self.lock.symlink_to(q);p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.assertTrue(q.exists())
+    def test_ancestor_symlink_refused(self):
+        a=self.argv();q=self.data/'local-real';self.data.joinpath('local').rename(q);self.data.joinpath('local').symlink_to(q)
+        p,r=self.run_one(argv=a);self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted'])
+    def test_wrong_dev_or_inode_refused(self):
+        for pos in range(8,14):
+            with self.subTest(pos=pos):
+                a=self.argv();a[pos]=str(int(a[pos])+1);p,r=self.run_one(argv=a);self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.preserved()
+    def test_wrong_modes_refused(self):
+        for path in (self.data,self.data/'local',self.parent,self.lock,self.owner):
+            with self.subTest(path=str(path)):
+                mode=path.stat().st_mode&0o7777;path.chmod(0o777);p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);path.chmod(mode)
+    def test_same_old_transaction_refused(self):
+        a=self.argv();a[4]=OLD;p,r=self.run_one(argv=a);self.assertEqual(p.returncode,70);self.preserved()
+    def test_invalid_transaction_op_or_boot_refused(self):
+        for pos,value in [(4,'../../bad'),(5,'not-uuid'),(6,'A'*32)]:
+            a=self.argv();a[pos]=value;p,r=self.run_one(argv=a);self.assertEqual(p.returncode,70);self.preserved()
+    def test_boot_changed_refused(self):
+        (self.base/'boot_id').write_text('00000000-0000-4000-8000-000000000001\n');p,r=self.run_one();self.assertEqual(p.returncode,70);self.preserved()
+    def test_expired_or_long_deadline_refused(self):
+        for delta in (-1,9000):
+            p,r=self.run_one(argv=self.argv(delta));self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.preserved()
+    def test_number_grammar(self):
+        for value in ('-1','+1','01','18446744073709551616','not-number'):
+            a=self.argv();a[9]=value;p,r=self.run_one(argv=a);self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.preserved()
+    def test_no_fallback_on_unsupported(self):
+        p,r=self.run_one('rename-unsupported');self.assertEqual(p.returncode,70);self.assertTrue(r['mutation_attempted']);self.assertFalse(r['renamed']);self.preserved()
+    def test_failures_before_rename_preserve_source(self):
+        for point in ('owner-fsync','lock-fsync','parent-before-fsync','before-rename'):
+            p,r=self.run_one('fail-'+point);self.assertEqual(p.returncode,70);self.assertFalse(r['renamed']);self.preserved()
+    def test_cancel_before_rename_no_mutation(self):
+        p,r=self.run_one('cancel-before-rename');self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.preserved()
+    def test_expiry_after_fsync_before_rename_no_mutation(self):
+        p,r=self.run_one('deadline-before-rename');self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.preserved()
+    def test_failure_after_rename_keeps_archive_unknown(self):
+        p,r=self.run_one('fail-after-rename');self.assertEqual(p.returncode,70);self.assertTrue(r['renamed']);self.assertEqual(r['outcome'],'UNKNOWN_AFTER_MUTATION_ATTEMPT');self.preserved(True)
+    def test_failed_parent_fsync_keeps_archive(self):
+        p,r=self.run_one('fail-parent-after-fsync');self.assertEqual(p.returncode,70);self.assertTrue(r['renamed']);self.assertFalse(r['fsync_completed']);self.preserved(True)
+    def test_cancel_after_rename_does_not_undo(self):
+        p,r=self.run_one('cancel-after-rename');self.assertEqual(p.returncode,70);self.assertTrue(r['renamed']);self.preserved(True)
+    def test_lost_result_preserves_committed_archive(self):
+        p,r=self.run_one('fail-before-result');self.assertEqual(p.returncode,70);self.assertTrue(r['renamed']);self.assertFalse(r['complete']);self.preserved(True)
+    def test_replay_does_not_rename_twice(self):
+        argv=self.argv();self.run_one(argv=argv);p,r=self.run_one(argv=argv);self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.preserved(True)
+    def test_actual_signals_prevent_later_rename(self):
+        for sig in (signal.SIGTERM,signal.SIGINT,signal.SIGHUP):
+            with self.subTest(sig=sig):
+                env=dict(os.environ,E5_LOCK_ARCHIVE_TEST_FAULT='pause-before-rename')
+                p=subprocess.Popen(self.argv(),stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env)
+                prefix=b''
+                try:
+                    with selectors.DefaultSelector() as sel:
+                        sel.register(p.stdout,selectors.EVENT_READ);end=time.monotonic()+4
+                        while b'"phase":"rename-noreplace"' not in prefix:
+                            self.assertLess(time.monotonic(),end,'native did not reach fixed pause')
+                            for _,_ in sel.select(.1):prefix+=os.read(p.stdout.fileno(),65536)
+                    p.send_signal(sig);out,err=p.communicate(timeout=2);out=prefix+out
+                finally:
+                    if p.poll() is None:p.kill();p.wait(timeout=2)
+                r=json.loads(out.splitlines()[-1]);self.assertEqual(p.returncode,70,(out,err));self.assertFalse(r['mutation_attempted']);self.assertEqual(r['cancel_signal'],sig);self.preserved()
+
+# Additional regression: prior archived transaction remains immutable.
+class PartialOwnerTests(Tests):
+    def test_previous_fad8_archive_preserved(self):
+        old=self.parent/f'e5-clean-directory.lock.archive.fad8a60f84aa4268.{OLD}'
+        old.mkdir(mode=0o700);(old/'owner').write_text('fad8a60f84aa4268\n')
+        identity=old.stat().st_ino;raw=(old/'owner').read_bytes()
+        p,r=self.run_one();self.assertEqual(p.returncode,0,r);self.preserved(True)
+        self.assertEqual(old.stat().st_ino,identity);self.assertEqual((old/'owner').read_bytes(),raw)
+    def test_fad8_owner_not_accepted_as_current(self):
+        self.owner.write_text('fad8a60f84aa4268\n');p,r=self.run_one();self.assertEqual(p.returncode,70)
+        self.assertFalse(r['mutation_attempted']);self.assertTrue(self.lock.exists());self.assertFalse(self.archive.exists())
+
+class SuccessfulOwnerTests(Tests):
+    def test_prior_722b_owner_rejected(self):
+        self.owner.write_bytes(b'722b7e1f5956cc07\n');p,r=self.run_one();self.assertEqual(p.returncode,70);self.assertFalse(r['mutation_attempted']);self.assertEqual(self.owner.read_bytes(),b'722b7e1f5956cc07\n')
+
+def load_tests(loader,tests,pattern):
+    base=loader.loadTestsFromTestCase(Tests)
+    return unittest.TestSuite([base,PartialOwnerTests('test_previous_fad8_archive_preserved'),PartialOwnerTests('test_fad8_owner_not_accepted_as_current'),SuccessfulOwnerTests('test_prior_722b_owner_rejected')])
+
+if __name__=='__main__':unittest.main(verbosity=2)

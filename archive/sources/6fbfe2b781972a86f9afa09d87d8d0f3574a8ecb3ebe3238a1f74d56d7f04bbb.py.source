@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Local bytes + fake device only. All subprocess spawning is audit-blocked."""
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+spec = importlib.util.spec_from_file_location("rearm", Path(__file__).with_name("rearm.py"))
+r = importlib.util.module_from_spec(spec); spec.loader.exec_module(r)
+e = r.load_core()
+
+
+def changed(data, offset):
+    return data[:offset] + bytes([data[offset] ^ 1]) + data[offset+1:]
+
+
+class FakeDevice:
+    def __init__(self, profile, boot, misc):
+        self.profile, self.boot, self.misc = profile, boot, misc
+        self.protected = profile["protected_hashes"].copy()
+        self.calls, self.writes = [], []
+        self.read_counts = {"boot_b": 0, "misc": 0}
+        self.protected_calls = 0
+        self.fail_preflight = False
+        self.write_failure = False
+        self.before_read = None
+        self.after_write = None
+    def preflight(self, require_data=True):
+        self.calls.append(("preflight", require_data))
+        assert require_data is True
+        e.require(not self.fail_preflight, "fake wrong Android A/root/F2FS")
+    def protected_hashes(self):
+        self.calls.append(("protected",))
+        self.protected_calls += 1
+        return self.protected.copy()
+    def read(self, name):
+        self.calls.append(("read", name)); self.read_counts[name] += 1
+        if self.before_read: self.before_read(self, name, self.read_counts[name])
+        return self.boot if name == "boot_b" else self.misc
+    def write_misc_bc(self, bc):
+        self.calls.append(("write_misc_bc", len(bc)))
+        self.writes.append(bc)
+        e.require(not self.write_failure, "fake write transport failed")
+        self.misc = self.misc[:2048] + bc + self.misc[2080:]
+        if self.after_write: self.after_write(self)
+    def write_boot_b(self, *args):
+        raise AssertionError("boot write forbidden")
+    def shell(self, *args, **kwargs):
+        raise AssertionError("new remote command forbidden")
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.profile = e.load_profile()
+        cls.approved = (r.MANIFEST.parent / "boot.img").read_bytes()
+        cls.original = r.ORIGINAL_MISC.read_bytes()
+        assert e.digest(cls.approved) == r.BOOT_SHA
+        assert e.digest(cls.original) == cls.profile["original_misc_sha256"]
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.dest = Path(self.temp.name) / "new-evidence"
+        self.fake = FakeDevice(self.profile, self.approved, self.original)
+    def tearDown(self):
+        self.temp.cleanup()
+    def run_transaction(self):
+        return r.rearm_transaction(e, self.fake, self.profile, self.approved, self.original, self.dest)
+    def refuse(self, writes=0):
+        with self.assertRaises((e.Refusal, OSError)):
+            self.run_transaction()
+        self.assertEqual(len(self.fake.writes), writes)
+        if (self.dest / "journal.jsonl").exists():
+            events = [json.loads(x)["event"] for x in (self.dest / "journal.jsonl").read_text().splitlines()]
+            self.assertEqual(events[-1], "STOP_NO_RETRY_NO_ROLLBACK_NO_REBOOT")
+            self.assertNotIn("COMPLETE_NO_REBOOT", events)
+    def test_success_one_32b_no_other_command(self):
+        out = self.run_transaction()
+        self.assertEqual(out["status"], "VERIFIED_BC32_ONLY_NO_REBOOT")
+        self.assertEqual(self.fake.writes, [e.bc_trial(self.original[2048:2080])])
+        self.assertEqual((self.dest/"misc.before.bin").read_bytes(), self.original)
+        e.misc_changed_only_bc(self.original, (self.dest/"misc.readback.bin").read_bytes(), self.fake.writes[0])
+        events = [json.loads(x)["event"] for x in (self.dest/"journal.jsonl").read_text().splitlines()]
+        self.assertLess(events.index("BACKUP_VERIFIED"), events.index("BEGIN_MISC32"))
+        self.assertEqual(events[-1], "COMPLETE_NO_REBOOT")
+    def test_runtime_A_bc_dynamic_not_original_byte_copy(self):
+        a, _ = e.runtime_bc_templates(self.original[2048:2080])
+        self.fake.misc = self.original[:2048]+a+self.original[2080:]
+        self.run_transaction()
+        self.assertEqual(self.fake.writes[0], e.bc_trial(a))
+        self.assertNotEqual(self.fake.writes[0], e.bc_trial(self.original[2048:2080]))
+    def test_log_window_first_and_last_bytes_allowed(self):
+        self.fake.boot = changed(changed(self.approved, r.LOG_START), r.LOG_END-1)
+        self.run_transaction()
+    def test_before_log_window_change_refused(self):
+        self.fake.boot = changed(self.approved, r.LOG_START-1); self.refuse()
+    def test_after_log_window_change_refused(self):
+        self.fake.boot = changed(self.approved, r.LOG_END); self.refuse()
+    def test_footer_change_refused(self):
+        self.fake.boot = changed(self.approved, len(self.approved)-1); self.refuse()
+    def test_short_boot_refused(self):
+        self.fake.boot = self.approved[:-1]; self.refuse()
+    def test_misc_outer_change_refused(self):
+        self.fake.misc = changed(self.original, 2080); self.refuse()
+    def test_short_misc_refused(self):
+        self.fake.misc = self.original[:-1]; self.refuse()
+    def test_bad_bc_crc_refused(self):
+        self.fake.misc = changed(self.original, 2048+28); self.refuse()
+    def test_B_suffix_not_armable(self):
+        self.fake.misc = self.original[:2048]+e.bc_trial(self.original[2048:2080])+self.original[2080:]
+        self.refuse()
+    def test_root_slot_preflight_failure_refused(self):
+        self.fake.fail_preflight = True; self.refuse()
+    def test_protected_A_change_refused(self):
+        self.fake.protected["boot_a"] = "0"*64; self.refuse()
+    def test_prewrite_misc_race_refused(self):
+        def mutate(dev, name, count):
+            if name == "misc" and count == 2: dev.misc = changed(dev.misc, 2)
+        self.fake.before_read = mutate; self.refuse()
+    def test_prewrite_log_race_refused(self):
+        def mutate(dev, name, count):
+            if name == "boot_b" and count == 2: dev.boot = changed(dev.boot, r.LOG_START)
+        self.fake.before_read = mutate; self.refuse()
+    def test_write_error_no_retry(self):
+        self.fake.write_failure = True; self.refuse(writes=1)
+    def test_readback_outside32_refused_no_retry(self):
+        self.fake.after_write = lambda dev: setattr(dev, "misc", changed(dev.misc, 2080))
+        self.refuse(writes=1)
+    def test_readback_bc_mismatch_refused_no_retry(self):
+        self.fake.after_write = lambda dev: setattr(dev, "misc", changed(dev.misc, 2048))
+        self.refuse(writes=1)
+    def test_postwrite_boot_change_refused(self):
+        self.fake.after_write = lambda dev: setattr(dev, "boot", changed(dev.boot, r.LOG_START))
+        self.refuse(writes=1)
+    def test_postwrite_protected_change_refused(self):
+        self.fake.after_write = lambda dev: dev.protected.update({"trustos_b": "0"*64})
+        self.refuse(writes=1)
+    def test_existing_evidence_no_device_calls(self):
+        self.dest.mkdir()
+        with self.assertRaises(FileExistsError): self.run_transaction()
+        self.assertEqual(self.fake.calls, [])
+    def test_backup_fsync_failure_before_write(self):
+        with mock.patch.object(e, "durable_write", side_effect=OSError("fake fsync failure")):
+            self.refuse()
+    def test_mutated_local_boot_zero_device_calls(self):
+        with self.assertRaises(e.Refusal):
+            r.rearm_transaction(e,self.fake,self.profile,changed(self.approved,0),self.original,self.dest)
+        self.assertEqual(self.fake.calls, [])
+    def test_mutated_local_original_zero_device_calls(self):
+        with self.assertRaises(e.Refusal):
+            r.rearm_transaction(e,self.fake,self.profile,self.approved,changed(self.original,0),self.dest)
+        self.assertEqual(self.fake.calls, [])
+    def test_live_cli_dispatch_fully_mocked(self):
+        with mock.patch.object(sys,"argv",["rearm.py","live-rearm","--evidence",str(self.dest)]), \
+             mock.patch.object(r,"fixed_inputs",return_value=(self.profile,self.approved,self.original)), \
+             mock.patch.object(e,"AdbBackend",return_value=self.fake) as backend, \
+             mock.patch.object(r,"load_core",return_value=e), mock.patch("builtins.print"):
+            r.main()
+        backend.assert_called_once_with(r.ADB,r.ADB_SHA,self.profile)
+        self.assertEqual(len(self.fake.writes),1)
+    def test_bad_bundle_cannot_construct_backend(self):
+        with mock.patch.object(sys,"argv",["rearm.py","live-rearm","--evidence",str(self.dest)]), \
+             mock.patch.object(r,"fixed_inputs",side_effect=e.Refusal("bad fixed bundle")), \
+             mock.patch.object(e,"AdbBackend") as backend, mock.patch.object(r,"load_core",return_value=e):
+            with self.assertRaises(e.Refusal): r.main()
+        backend.assert_not_called()
+
+
+if __name__ == "__main__":
+    def block_process(event, args):
+        if event.startswith(("subprocess.", "os.system", "os.exec", "os.posix_spawn", "pty.spawn")):
+            raise AssertionError("OFFLINE SENTINEL: external process forbidden: " + event)
+    sys.addaudithook(block_process)
+    unittest.main(verbosity=2)

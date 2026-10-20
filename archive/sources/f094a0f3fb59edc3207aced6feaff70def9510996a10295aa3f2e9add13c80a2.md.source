@@ -1,0 +1,40 @@
+# 成功部署后的只读 probe STOP：固定主机处理准备
+
+本包只处理 `4d6efbbcd48f2d73` / boot `00000000-0000-4000-8000-000000000001` 的一次已保存事件。执行门 `HOST_CLOSURE_ENABLED = False`；本轮仅准备、临时目录测试及实际证据 **plan** 重放，没有执行真实 close/resume，没有设备命令，没有改动共享 state、账本、原工具或原证据。
+
+## 两段事实
+
+- `scanner-execution`：177/177 顶层请求完成，6 项普通辅助文件/锁操作，14 个同 ACTIVE 内读回；完整扫描和之后原 B、misc、13 保护及 GPT 校验完成。该成功 COMPLETE、RESULT、源版本及全部原始记录原样保留。
+- `probe-execution`：65 次请求，64 次完成，0 mutation、0 payload、0 followup；最后只读 occupancy 返回 70 / errno 116，`fd-tables / pid-fds / fd-table-not-converged`，reason `fd-table-scan-unknown`。它运行了只读 native scanner；**尚未上传/运行 noreplace probe，未创建或删除 probe 空目录**。失败后没有额外设备保护/owner 检查。
+- 本 case 两段均未发送 B、misc、rootfs 或 NV 写命令。这不撤销其他历史事务发生过的写入。已有 inventory 草稿/审核不得穿过这次 STOP 继续执行。
+
+固定 CASE 绑定两段 1,325 个文件（545,239,392 字节）、880 个既有完成记录、完整 ledger 前缀，以及原有三层闭包。独立 STOP 审阅见 CASE 的 review。固定 native 失败的完整 RESULT 与 8 行输出均保留，不能用其他 rc70、timeout、未知错误替代。
+
+## 主机动作与后续接口
+
+未来经独审启用的 `close` 仅在原全局锁和原 serial 锁下：逐字节核验 case→耐久化第四永久 `RECOVERY_LIFECYCLE_TRANSITION.json`→在 `state/postdeployment-probe-stop-closures/4d6efbbcd48f2d73/` 保留 ledger-prefix→无覆盖改名移入原 ACTIVE/UNCERTAIN→同步 archive/parent/state→生成确定性 `POSTDEPLOY_PROBE_STOP_ARCHIVED_NOT_READY.json`。原三个永久标记与所有完成记录不改；不删除任何证据。新 receipt 明确 deployment completed=true、probe completed=false、没有新设备许可。
+
+相同 case 的第二次默认 close 拒绝；中断仅允许未来明确调用 `resume`，重新验证所有证据并补齐必要 fsync。不能自动清理、换 state、重放设备请求或猜测成功。任何外来 pending、部分文件、不一致、账本提前增长、新完成记录均拒绝。
+
+消费者 API 保持 `validate_closed`、`assert_new_identity`、`normal_gate`、`transport_gate`、`augment_snapshot`、`snapshot_gate`。完整保留三层 prior；旧 source-bound snapshot 只委托历史验证，不改签、不赋予 freshness。新请求必须使用 **新 boot、新 tx**；所有 retired tx / excluded boot 均保留。新 ACTIVE/UNCERTAIN/RECOVERY_ONLY 或新临时 `RECOVERY_POSTDEPLOY_TRANSITION.json` 仍阻止普通执行。未来原 B/BC32 grant 用新临时名，不得覆盖第四永久标记。
+
+七件 `overlay/` 仅供父集成器重封，基底固定 441f RESULT。涉及 transport、boot、grant、workflow、phase_evidence、common、stage2；写入口维持禁用。common 有八个 marker（ACTIVE、UNCERTAIN、ONLY、四个永久、一个新临时）。后续不复用成功的旧 4d6e 作为新 scanner 准入，而是在新鲜 cold/原件证据后，归档旧 4d6e 设备锁并实际重新部署。历史 successful deployment 不因此改称失败。
+
+保留物扩为三组 18 项：旧归档 owner 和对应 7d / 722b / 4d6e 四个程序；实际后续部署必须在第一 mutation 前与完整 scanner 后各读取一遍，精确核 raw metadata、SHA、owner。当前 4d6e lock/owner 的历史 inode/元数据亦固定，现场变化即停止；本包不声称失败后状态已重新读取。native/lock_archive.c 基于已审上一版，仅 oldtx 722b→4d6e，默认 gate0；正确 tmp 2000:2000/0771、no-replace、取消/期限、无回滚均不变。其 ARM 产物由构建代理另封，不由本包声称完成。
+
+## 主机验证与边界
+
+分别执行，不能把 native 允许编译器的审计钩子与禁进程测试混在同一进程：
+
+```sh
+python3 -B -m unittest -v test_closure test_consumers test_phase_retained
+python3 -B -m unittest -v test_lock_archive
+python3 -B -m unittest -v test_native_metadata
+python3 -B verify_actual_plan.py
+```
+
+结果：37 closure + 20 consumer + 14 retained = 71；35 native HOST_TEST + 6 生产元数据谓词 = 41。合计112主机测试。native 只在临时 Mac 文件系统进行 HOST_TEST / gate0 拒绝验证；不表示 Android F2FS、扫描修复、供电故障安全或未来安装已经通过。actual plan 有进程/网络禁钩子和真实 state 写入拒绝，前后完整 state/ledger 哈希相同。
+
+`tests-wrong-cwd.log` 为首次 unittest 在项目根启动时的导入失败；未导入 closure、未访问设备/状态。有效日志是 tests-02.log、tests-native.log、tests-metadata.log。CASE.draft-01.json 保留了增加下一阶段18项保留字段前的准备草稿，不能替代唯一固定 CASE.json。
+
+仍待独立审查、本次 scanner 修复/ARM、新 family source/pin 重封及现场新证据。**此交付不是执行票据或新实机通过记录。**

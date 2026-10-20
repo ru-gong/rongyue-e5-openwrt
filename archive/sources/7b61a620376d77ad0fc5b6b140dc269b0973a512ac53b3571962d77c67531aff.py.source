@@ -1,0 +1,248 @@
+"""Host temporary-filesystem tests only; production source stays disabled."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+SOURCE = Path(__file__).with_name('noreplace_probe.c').resolve()
+CC = shutil.which('cc')
+ALLOWED = {Path(CC).resolve()}
+BOOT = '00000000-0000-4000-8000-000000000001'
+TX = '1234567890abcdef'
+OP = 'a' * 32
+
+
+def sentinel(event, args):
+    if event.startswith('socket.') or event in ('os.system', 'os.posix_spawn', 'os.posix_spawnp', 'os.exec'):
+        raise AssertionError('network/indirect process forbidden')
+    if event == 'subprocess.Popen' and Path(args[0]).resolve() not in ALLOWED:
+        raise AssertionError('unapproved host process')
+
+
+sys.addaudithook(sentinel)
+
+
+class ProbeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.build = tempfile.TemporaryDirectory(prefix='e5-noreplace-build-', dir='/tmp')
+        cls.binary = Path(cls.build.name) / 'hosttest'
+        cls.disabled = Path(cls.build.name) / 'production-disabled'
+        cls.source_hash = hashlib.sha256(SOURCE.read_bytes()).hexdigest()
+        for target, flags in ((cls.binary, ['-DE5_NOREPLACE_HOST_TEST']), (cls.disabled, [])):
+            subprocess.run([CC, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', *flags,
+                            str(SOURCE), '-o', str(target)], check=True, capture_output=True)
+            ALLOWED.add(target.resolve())
+
+    @classmethod
+    def tearDownClass(cls):
+        assert hashlib.sha256(SOURCE.read_bytes()).hexdigest() == cls.source_hash
+        cls.build.cleanup()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='e5-noreplace-test-', dir='/tmp')
+        self.addCleanup(self.tmp.cleanup)
+        self.base = Path(self.tmp.name).resolve()
+        self.data = self.base / 'data'
+        self.lock = self.data / 'local/tmp/e5-clean-directory.lock'
+        self.lock.mkdir(parents=True, mode=0o700)
+        (self.base / 'boot_id').write_text(BOOT + '\n')
+        self.owner = self.lock / 'owner'
+        self.owner.write_text(TX + '\n')
+        self.owner.chmod(0o600)
+        self.paths = {r: self.lock / f'probe-{r}.{TX}' for r in ('source', 'destination', 'renamed')}
+
+    def args(self, **changes):
+        ds = self.data.stat(); ls = self.lock.stat()
+        fields = dict(action='probe', tx=TX, boot=BOOT, op=OP,
+                      deadline=int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000) + 5000,
+                      data_dev=ds.st_dev, data_ino=ds.st_ino, lock_dev=ls.st_dev, lock_ino=ls.st_ino)
+        fields.update(changes)
+        return [str(self.binary), '--test-root', str(self.data), *map(str, fields.values())]
+
+    def runprobe(self, args=None, fault=None):
+        env = dict(os.environ); env.pop('E5_NOREPLACE_TEST_FAULT', None)
+        if fault: env['E5_NOREPLACE_TEST_FAULT'] = fault
+        r = subprocess.run(args or self.args(), capture_output=True, timeout=8, env=env)
+        return r, [json.loads(line) for line in r.stdout.splitlines()]
+
+    def assert_stopped(self, r, records):
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(records[-1]['complete'])
+        self.assertFalse(records[-1]['cleanup_completed'])
+
+    def test_success_fixed_paths_and_owner_unchanged(self):
+        before = self.owner.stat()
+        r, records = self.runprobe()
+        self.assertEqual(r.returncode, 0, r.stdout)
+        final = records[-1]
+        for key in ('complete', 'existing_dest_eexist', 'existing_inodes_unchanged',
+                    'missing_dest_rename', 'cleanup_completed', 'mutation_attempted'):
+            self.assertTrue(final[key], key)
+        self.assertFalse(final['f2fs_confirmed'])
+        self.assertFalse(final['power_loss_safety_proven'])
+        self.assertEqual(final['outcome'], 'COMPLETED')
+        self.assertEqual((final['txid'], final['boot_id'], final['opid']), (TX, BOOT, OP))
+        self.assertGreater(final['source_inode'], 0)
+        self.assertNotEqual(final['source_inode'], final['destination_inode'])
+        self.assertEqual(list(self.lock.iterdir()), [self.owner])
+        self.assertEqual(self.owner.read_text(), TX + '\n')
+        self.assertEqual(self.owner.stat().st_ino, before.st_ino)
+
+    def test_unrelated_file_untouched(self):
+        marker = self.lock / 'unrelated'; marker.write_bytes(b'preserve')
+        r, _ = self.runprobe(); self.assertEqual(r.returncode, 0)
+        self.assertEqual(marker.read_bytes(), b'preserve')
+
+    def test_existing_source_refused(self):
+        self.paths['source'].mkdir(); r, x = self.runprobe(); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted']); self.assertTrue(self.paths['source'].is_dir())
+
+    def test_existing_destination_refused(self):
+        self.paths['destination'].mkdir(); r, x = self.runprobe(); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted']); self.assertFalse(self.paths['source'].exists())
+
+    def test_existing_renamed_refused(self):
+        self.paths['renamed'].mkdir(); r, x = self.runprobe(); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted'])
+
+    def test_existing_probe_symlink_refused(self):
+        self.paths['source'].symlink_to(self.base); r, x = self.runprobe(); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted'])
+
+    def test_wrong_owner_refused(self):
+        self.owner.write_text('0' * 16 + '\n'); r, x = self.runprobe(); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted'])
+
+    def test_owner_extra_bytes_refused(self):
+        self.owner.write_text(TX + '\nextra'); r, x = self.runprobe(); self.assert_stopped(r, x)
+
+    def test_owner_mode_refused(self):
+        self.owner.chmod(0o644); r, x = self.runprobe(); self.assert_stopped(r, x)
+
+    def test_owner_hardlink_refused(self):
+        os.link(self.owner, self.base / 'hardlink'); r, x = self.runprobe(); self.assert_stopped(r, x)
+
+    def test_owner_symlink_refused(self):
+        target = self.base / 'owner'; self.owner.rename(target); self.owner.symlink_to(target)
+        r, x = self.runprobe(); self.assert_stopped(r, x)
+
+    def test_lock_symlink_refused(self):
+        args = self.args(); other = self.lock.with_name('elsewhere'); self.lock.rename(other)
+        self.lock.symlink_to(other, target_is_directory=True)
+        r, x = self.runprobe(args); self.assert_stopped(r, x)
+
+    def test_parent_symlink_refused(self):
+        args = self.args(); parent = self.data / 'local'; other = self.data / 'elsewhere'
+        parent.rename(other); parent.symlink_to(other, target_is_directory=True)
+        r, x = self.runprobe(args); self.assert_stopped(r, x)
+
+    def test_wrong_data_inode_refused(self):
+        r, x = self.runprobe(self.args(data_ino=self.data.stat().st_ino + 1)); self.assert_stopped(r, x)
+
+    def test_wrong_lock_inode_refused(self):
+        r, x = self.runprobe(self.args(lock_ino=self.lock.stat().st_ino + 1)); self.assert_stopped(r, x)
+
+    def test_wrong_device_refused(self):
+        r, x = self.runprobe(self.args(lock_dev=self.lock.stat().st_dev + 1)); self.assert_stopped(r, x)
+
+    def test_lock_mode_refused(self):
+        self.lock.chmod(0o755); r, x = self.runprobe(); self.assert_stopped(r, x)
+
+    def test_wrong_boot_refused(self):
+        (self.base / 'boot_id').write_text('0' * 36 + '\n'); r, x = self.runprobe(); self.assert_stopped(r, x)
+
+    def test_expired_deadline(self):
+        r, x = self.runprobe(self.args(deadline=1)); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted'])
+
+    def test_long_deadline(self):
+        r, x = self.runprobe(self.args(deadline=int(time.clock_gettime(time.CLOCK_MONOTONIC)*1000)+60000)); self.assert_stopped(r, x)
+
+    def test_argument_injection_refused(self):
+        r, x = self.runprobe(self.args(tx='../foo')); self.assert_stopped(r, x)
+
+    def test_extra_arguments_refused(self):
+        r, x = self.runprobe(self.args() + ['anything']); self.assert_stopped(r, x)
+
+    def test_production_disabled_before_paths(self):
+        r = subprocess.run([str(self.disabled), *self.args()[3:]], capture_output=True, timeout=2)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(json.loads(r.stdout)['reason'], 'production-device-execution-disabled')
+        self.assertEqual(list(self.lock.iterdir()), [self.owner])
+
+    def test_host_fixture_cannot_target_data(self):
+        args = self.args(); args[2] = '/data'
+        r, x = self.runprobe(args); self.assert_stopped(r, x)
+        self.assertEqual(x[-1]['reason'], 'test-root-refused')
+
+    def test_failure_before_create_no_changes(self):
+        r, x = self.runprobe(fault='fail-before-create-source'); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted']); self.assertEqual(list(self.lock.iterdir()), [self.owner])
+
+    def test_cancel_before_create_no_changes(self):
+        r, x = self.runprobe(fault='cancel-before-create-source'); self.assert_stopped(r, x)
+        self.assertFalse(x[-1]['mutation_attempted'])
+
+    def test_second_create_failure_keeps_first(self):
+        r, x = self.runprobe(fault='fail-before-create-destination'); self.assert_stopped(r, x)
+        self.assertTrue(self.paths['source'].is_dir()); self.assertFalse(self.paths['destination'].exists())
+
+    def test_existing_rename_failure_keeps_both(self):
+        r, x = self.runprobe(fault='fail-before-existing-rename'); self.assert_stopped(r, x)
+        self.assertTrue(self.paths['source'].is_dir()); self.assertTrue(self.paths['destination'].is_dir())
+
+    def test_missing_rename_failure_keeps_both(self):
+        r, x = self.runprobe(fault='fail-before-missing-rename'); self.assert_stopped(r, x)
+        self.assertTrue(x[-1]['existing_dest_eexist']); self.assertTrue(self.paths['source'].is_dir())
+
+    def test_after_rename_failure_never_cleans(self):
+        r, x = self.runprobe(fault='fail-after-rename'); self.assert_stopped(r, x)
+        self.assertTrue(x[-1]['missing_dest_rename']); self.assertTrue(self.paths['renamed'].is_dir())
+        self.assertTrue(self.paths['destination'].is_dir()); self.assertFalse(self.paths['source'].exists())
+
+    def test_after_rename_cancel_never_cleans(self):
+        r, x = self.runprobe(fault='cancel-after-rename'); self.assert_stopped(r, x)
+        self.assertTrue(self.paths['renamed'].is_dir()); self.assertTrue(self.paths['destination'].is_dir())
+
+    def test_after_rename_deadline_never_cleans(self):
+        r, x = self.runprobe(fault='deadline-after-rename'); self.assert_stopped(r, x)
+        self.assertTrue(self.paths['renamed'].is_dir()); self.assertTrue(self.paths['destination'].is_dir())
+
+    def test_parent_fsync_failure_retains_renamed(self):
+        r, x = self.runprobe(fault='fail-rename-parent-fsync'); self.assert_stopped(r, x)
+        self.assertTrue(self.paths['renamed'].is_dir()); self.assertTrue(self.paths['destination'].is_dir())
+
+    def test_cleanup_failure_keeps_all_not_yet_removed(self):
+        r, x = self.runprobe(fault='fail-before-remove-destination'); self.assert_stopped(r, x)
+        self.assertTrue(self.paths['renamed'].is_dir()); self.assertTrue(self.paths['destination'].is_dir())
+
+    def test_first_cleanup_then_failure_stops(self):
+        r, x = self.runprobe(fault='fail-after-first-cleanup'); self.assert_stopped(r, x)
+        self.assertFalse(self.paths['destination'].exists()); self.assertTrue(self.paths['renamed'].is_dir())
+
+    def signal_case(self, sig):
+        env = dict(os.environ, E5_NOREPLACE_TEST_FAULT='pause-before-create-destination')
+        p = subprocess.Popen(self.args(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        initial = []
+        while True:
+            line = p.stdout.readline(); self.assertTrue(line); initial.append(json.loads(line))
+            if initial[-1]['phase'] == 'create-destination': break
+        p.send_signal(sig); stdout, stderr = p.communicate(timeout=2)
+        self.assertFalse(stderr); records = initial + [json.loads(x) for x in stdout.splitlines()]
+        self.assertNotEqual(p.returncode, 0); self.assertFalse(records[-1]['complete'])
+        self.assertTrue(self.paths['source'].is_dir()); self.assertFalse(self.paths['destination'].exists())
+
+    def test_sigterm_stops_without_cleanup(self): self.signal_case(signal.SIGTERM)
+    def test_sigint_stops_without_cleanup(self): self.signal_case(signal.SIGINT)
+    def test_sighup_stops_without_cleanup(self): self.signal_case(signal.SIGHUP)
+
+
+if __name__ == '__main__': unittest.main()

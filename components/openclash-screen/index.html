@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>OpenClash</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;background:#0b0e13;color:#e8ecf2;font-family:"Noto Sans CJK SC","DejaVu Sans",sans-serif;user-select:none;cursor:none}
+body{padding:6px}header{display:flex;align-items:center;justify-content:space-between;margin:0 0 5px;font-size:17px;font-weight:700}
+.pill{font-size:11px;color:#ffcf76;background:#382e1c;border-radius:8px;padding:3px 7px}.pill.good{color:#62e8a3;background:#163a2a}
+.summary{background:#161d28;border:1px solid #29364a;border-radius:10px;padding:6px 8px;margin-bottom:5px}
+#mode{font-size:18px;font-weight:700;line-height:1.4}.sub{font-size:11px;color:#a9b5c7;line-height:1.6}#node{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.modes{display:grid;grid-template-columns:1fr 1fr;gap:5px}button{position:relative;min-height:46px;text-align:left;border:1px solid #303e53;border-radius:9px;background:#18212f;color:#eef3fb;padding:5px 7px;font:inherit;outline:0}
+button strong{display:block;font-size:14px}button small{font-size:10px;color:#a9b5c7}button.active{border-color:#47d998;background:#15352b}button.active:after{content:'✓';position:absolute;right:6px;top:4px;color:#76efb8;font-size:11px}
+button:focus{box-shadow:inset 0 0 0 2px #edf5ff}button:disabled{opacity:.55}#message{min-height:20px;font-size:11px;line-height:1.4;color:#c4d1e6;margin-top:5px}#message.error{color:#ffbaae}
+.hint{color:#8392a8;font-size:10px;line-height:1.3;border-top:1px solid #233043;padding-top:4px;margin-top:3px}
+.nodes{margin-top:7px}.node-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:5px;font-size:13px;font-weight:700}
+#test-nodes{min-height:27px;padding:3px 9px;font-size:11px;background:#233b54}.node-list{display:grid;gap:4px}
+.node-choice{display:flex;align-items:center;justify-content:space-between;gap:7px;min-height:36px;padding:5px 8px;width:100%}
+.node-name{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}.node-choice.active:after{display:none}.node-choice.active .node-name:before{content:'✓ ';color:#76efb8}
+.node-delay{font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap;color:#b8c8dc}.node-delay.good{color:#76efb8}.node-delay.bad{color:#ffbaae}
+#test-time{font-size:10px;color:#8392a8;line-height:1.4;margin-top:4px}
+@media(min-width:400px){body{max-width:440px;margin:auto;padding:14px}button{min-height:76px}button strong{font-size:17px}button small,.sub,#message{font-size:13px}.hint{font-size:12px}}
+</style>
+</head>
+<body>
+<header><span>OpenClash</span><span id="service" class="pill">读取中</span></header>
+<section class="summary" aria-live="polite">
+ <div id="mode">正在读取状态…</div>
+ <div id="node" class="sub">节点：--</div>
+</section>
+<div class="modes" aria-label="分流模式">
+ <button data-mode="direct"><strong>直连模式</strong><small>所有外网直连</small></button>
+ <button data-mode="gfw"><strong>GFW 模式</strong><small>名单内走代理</small></button>
+ <button data-mode="mainland"><strong>大陆白名单</strong><small>国内直连，其余代理</small></button>
+ <button data-mode="global"><strong>全局模式</strong><small>所有外网走代理</small></button>
+</div>
+<section class="nodes" aria-label="代理节点">
+ <div class="node-head"><span>代理节点</span><button id="test-nodes">测试全部</button></div>
+ <div id="node-list" class="node-list"><div class="sub">正在读取节点…</div></div>
+ <div id="test-time">HTTPS 延迟 · 手动测试</div>
+</section>
+<div id="message" role="status">选择一种模式，按确认切换</div>
+<div class="hint">方向键选择 · 确认操作 · 返回退出<br>选择自动保存；新连接按新设置处理</div>
+<script src="/sdk/e5.js"></script>
+<script src="app.js?v=1.1.1"></script>
+</body>
+</html>

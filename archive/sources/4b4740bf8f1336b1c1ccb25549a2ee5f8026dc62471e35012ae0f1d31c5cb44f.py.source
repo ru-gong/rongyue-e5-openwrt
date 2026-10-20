@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""Fixed existing-rootfs D0 trial preparation. Device execution HARD DISABLED."""
+from __future__ import annotations
+import argparse
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import re
+import stat
+
+LIVE_ENABLED = True
+WORK = Path(__file__).resolve().parents[2]
+CORE = WORK / "tools/e5_android_install_live_20261013/e5_install.py"
+CORE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+EXECUTION = WORK / "evidence/stage2-execution-20261013"
+SNAPDIR = WORK / "evidence/cellular-diagnosis-20261013/existing-linux-files-snapshot"
+SNAPSHOT = SNAPDIR / "snapshot.json"
+SNAPSHOT_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+INSPECTION_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+MANIFEST = EXECUTION / "final-install-bundle/final-manifest.json"
+MANIFEST_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+BOOT = EXECUTION / "final-install-bundle/boot.img"
+BOOT_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+ORIGINAL_B = EXECUTION / "android-install-01/boot_b.before.bin"
+ORIGINAL_B_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+ORIGINAL_MISC = EXECUTION / "android-install-01/misc.before.bin"
+ORIGINAL_MISC_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+ADB = Path("/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb")
+ADB_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+EVIDENCE = WORK / "evidence/cellular-diagnosis-20261013/d0-trial-01"
+NAMES = ("fscrypt-probe", "openwrt.ext4.gz", "device-files.tar", "boot.img",
+         "boot-os", "openwrt.ext4", "openwrt-default-boot")
+REMOTE = "/data/e5linux"
+
+
+def load_core():
+    if CORE.is_symlink() or hashlib.sha256(CORE.read_bytes()).hexdigest() != CORE_SHA:
+        raise RuntimeError("frozen backend hash changed; no device access")
+    spec = importlib.util.spec_from_file_location("e5_d0_frozen_core", CORE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def fixed_inputs(e):
+    profile = e.load_profile()
+    snapshot = e.pinned_json(e.regular(SNAPSHOT), SNAPSHOT_SHA)
+    inspection = e.pinned_json(e.regular(SNAPDIR / "offline-rootfs-inspection.json"), INSPECTION_SHA)
+    e.pinned_json(e.regular(MANIFEST), MANIFEST_SHA)
+    e.require(snapshot["status"] == "CURRENT_INACTIVE_LINUX_FILES_BACKED_UP_VERIFIED" and
+              snapshot["source_unmounted_no_loop_no_open_file_precheck"] is True and
+              snapshot["source_hashes_before_after_equal"] is True and
+              tuple(x["path"] for x in snapshot["files"]) == NAMES, "snapshot contract mismatch")
+    e.require(inspection["source_tar_sha256"] == snapshot["tar_sha256"] and
+              inspection["internal_default_boot"] == "android" and
+              inspection["ext4_recover_feature"] is False, "internal Android default not pinned")
+    tar = e.regular(SNAPDIR / "e5linux.tar")
+    e.require(tar.stat().st_size == snapshot["tar_bytes"] and e.file_hash(tar) == snapshot["tar_sha256"],
+              "existing runtime backup missing or changed")
+    for path, size, sha in ((BOOT, e.BOOT_BYTES, BOOT_SHA), (ORIGINAL_B, e.BOOT_BYTES, ORIGINAL_B_SHA),
+                            (ORIGINAL_MISC, e.MISC_BYTES, ORIGINAL_MISC_SHA)):
+        e.require(e.regular(path).stat().st_size == size and e.file_hash(path) == sha, "fixed boot/misc input changed")
+    before = ORIGINAL_MISC.read_bytes()
+    e.require(e.digest(before) == profile["original_misc_sha256"] == ORIGINAL_MISC_SHA, "misc recovery binding")
+    e.bc_validate(before[e.BC_OFFSET:e.BC_OFFSET+32])
+    return profile, snapshot
+
+
+def audit_script(full):
+    """Read-only shell, fixed paths only. Unknown/inaccessible inactivity state rejects."""
+    script = r'''
+BB=/data/adb/magisk/busybox
+ROOT=/data/e5linux
+IMG=/data/e5linux/openwrt.ext4
+test -d "$ROOT"; test ! -L "$ROOT"
+test "$("$BB" readlink -f "$ROOT")" = "$ROOT"
+test -f "$IMG"; test ! -L "$IMG"
+app=$($BB --list)
+case "
+$app
+" in *'
+fuser
+'*) ;; *) exit 81;; esac
+imgid=$($BB stat -c '%d:%i' "$IMG")
+for b in /sys/class/block/loop*/loop/backing_file; do
+  test -e "$b" || continue
+  back=$(cat "$b")
+  test -n "$back" || continue
+  case "$back" in *e5linux*) exit 82;; esac
+  test -e "$back" || exit 83
+  test "$($BB stat -c '%d:%i' "$back")" != "$imgid" || exit 84
+done
+for m in /proc/[0-9]*/mountinfo; do
+  if test ! -r "$m"; then test ! -d "${m%/mountinfo}" || exit 85; continue; fi
+  if mounts=$(cat "$m" 2>/dev/null); then
+    case "$mounts" in *e5linux*) exit 86;; esac
+  else
+    test ! -d "${m%/mountinfo}" || exit 87
+  fi
+done
+if users=$($BB fuser "$IMG" 2>&1); then exit 88
+else code=$?; test "$code" = 1; test -z "$users"; fi
+printf 'BOOTID|'; cat /proc/sys/kernel/random/boot_id
+$BB find "$ROOT" -mindepth 1 -maxdepth 1 -print | $BB sort | while IFS= read -r p; do printf 'ENTRY|%s\n' "$p"; done
+'''
+    for name in NAMES:
+        path = REMOTE + "/" + name  # Names are source constants, never CLI/remote inputs.
+        script += f"test -f {path}; test ! -L {path}\n"
+        script += f"a=$($BB stat -c '%f|%s|%d|%i|%Y|%Z|%u|%g' {path})\n"
+        if full:
+            script += f"sum=$($BB sha256sum {path}); sum=${{sum%% *}}\n"
+        else:
+            script += "sum=-\n"
+        script += f"test \"$a\" = \"$($BB stat -c '%f|%s|%d|%i|%Y|%Z|%u|%g' {path})\"\n"
+        script += f"printf 'FILE|{name}|%s|%s\\n' \"$a\" \"$sum\"\n"
+    script += "test \"$(cat /data/e5linux/boot-os)\" = openwrt\ntest \"$(cat /data/e5linux/openwrt-default-boot)\" = android\nprintf 'INACTIVE_OK\\n'\n"
+    return script
+
+
+def parse_audit(e, raw, snapshot, full):
+    e.require(len(raw) < 16384, "oversized file audit")
+    lines = raw.decode("ascii").splitlines()
+    e.require(len(lines) == 16 and lines[-1] == "INACTIVE_OK", "incomplete inactivity/file audit")
+    e.require(re.fullmatch(r"BOOTID\|[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", lines[0]), "invalid boot ID")
+    e.require(lines[1:8] == ["ENTRY|"+REMOTE+"/"+n for n in sorted(NAMES)], "directory contents changed")
+    records = {}
+    for line, expected in zip(lines[8:15], snapshot["files"]):
+        fields = line.split("|")
+        e.require(len(fields) == 11 and fields[:2] == ["FILE", expected["path"]], "file audit schema changed")
+        mode, size, dev, inode, mtime, ctime, uid, gid, sha = fields[2:]
+        e.require(re.fullmatch(r"[a-f0-9]+", mode) and stat.S_ISREG(int(mode,16)), "file is not regular")
+        e.require(all(re.fullmatch(r"[0-9]+", x) for x in (size,dev,inode,mtime,ctime,uid,gid)), "invalid file metadata")
+        e.require(int(size) == expected["bytes"] and sha == (expected["sha256"] if full else "-"), "fixed file content/size drift")
+        records[expected["path"]] = {"metadata": fields[2:10], "sha256": sha}
+    return {"boot_id": lines[0].split("|",1)[1], "files": records}
+
+
+def files_audit(e, device, snapshot, full=True):
+    return parse_audit(e, device.shell(audit_script(full), timeout=1800), snapshot, full)
+
+
+def same_metadata(e, first, second):
+    e.require(first["boot_id"] == second["boot_id"] and
+              {k:v["metadata"] for k,v in first["files"].items()} ==
+              {k:v["metadata"] for k,v in second["files"].items()}, "file/boot state drift")
+
+
+def transaction(e, device, profile, snapshot, evidence=EVIDENCE):
+    """Only called after fixed_inputs. The alternate evidence argument is for fake tests, not CLI."""
+    evidence = Path(evidence)
+    evidence.mkdir(mode=0o700, parents=False, exist_ok=False)
+    e.fsync_directory(evidence.parent); e.fsync_directory(evidence)
+    journal = e.Journal(evidence / "journal.jsonl")
+    try:
+        journal.event("START_D0_EXISTING_ROOTFS", serial=e.SERIAL, core_sha256=CORE_SHA,
+                      snapshot_sha256=SNAPSHOT_SHA, manifest_sha256=MANIFEST_SHA,
+                      helper_sha256=e.file_hash(Path(__file__)))
+        e.require(profile == e.load_profile(), "frozen profile changed")
+        device.preflight()
+        audit1 = files_audit(e, device, snapshot)
+        protected = device.protected_hashes()
+        e.require(protected == profile["protected_hashes"], "protected chain changed")
+        before_b, before_misc = device.read("boot_b"), device.read("misc")
+        e.require(len(before_b) == e.BOOT_BYTES and e.digest(before_b) == ORIGINAL_B_SHA, "B is not exact restored original")
+        e.require(len(before_misc) == e.MISC_BYTES and e.digest(before_misc) == ORIGINAL_MISC_SHA, "misc is not exact restored original")
+        bc = e.bc_validate(before_misc[e.BC_OFFSET:e.BC_OFFSET+32])
+        trial = e.bc_trial(bc)
+        e.durable_write(evidence / "boot_b.before.bin", before_b)
+        e.durable_write(evidence / "misc.before.bin", before_misc)
+        e.require(e.file_hash(evidence/"boot_b.before.bin") == ORIGINAL_B_SHA and
+                  e.file_hash(evidence/"misc.before.bin") == ORIGINAL_MISC_SHA, "host backup readback failed")
+        e.durable_write(evidence / "prewrite.json", (json.dumps({"audit":audit1, "protected":protected,
+                        "before_bc":bc.hex(), "trial_bc":trial.hex()},indent=2)+"\n").encode())
+        journal.event("BACKUPS_DURABLE_VERIFIED")
+        device.preflight()
+        audit2 = files_audit(e, device, snapshot)
+        e.require(audit1 == audit2, "second complete file hash/metadata/boot audit drift")
+        e.require(device.read("boot_b") == before_b and device.read("misc") == before_misc, "targets changed before write")
+        e.require(device.protected_hashes() == protected, "protection changed before B")
+        # Last inactivity/metadata check after all long reads and immediately before BEGIN.
+        same_metadata(e, audit2, files_audit(e, device, snapshot, full=False))
+        journal.event("BEGIN_BOOT_B", node="/dev/block/mmcblk0p37", bytes=e.BOOT_BYTES, sha256=BOOT_SHA)
+        device.write_boot_b(BOOT, BOOT_SHA)
+        after_b = device.read("boot_b")
+        e.durable_write(evidence / "boot_b.readback.bin", after_b)
+        e.require(len(after_b) == e.BOOT_BYTES and e.digest(after_b) == BOOT_SHA, "full boot B readback mismatch")
+        e.require(device.protected_hashes() == protected, "protection changed after B; no misc")
+        e.require(device.read("misc") == before_misc, "misc changed before trial; stop")
+        same_metadata(e, audit2, files_audit(e, device, snapshot, full=False))
+        journal.event("VERIFIED_BOOT_B", sha256=BOOT_SHA)
+        journal.event("BEGIN_MISC32", node="/dev/block/mmcblk0p3", offset=e.BC_OFFSET, bytes=32, hex=trial.hex())
+        device.write_misc_bc(trial)
+        after_misc = device.read("misc")
+        e.durable_write(evidence / "misc.readback.bin", after_misc)
+        e.misc_changed_only_bc(before_misc, after_misc, trial)
+        e.require(device.read("boot_b") == after_b, "boot B changed after misc")
+        e.require(device.protected_hashes() == protected, "protection changed after misc")
+        same_metadata(e, audit2, files_audit(e, device, snapshot, full=False))
+        result = {"status":"COMPLETE_NO_REBOOT", "serial":e.SERIAL, "core_sha256":CORE_SHA,
+                  "snapshot_sha256":SNAPSHOT_SHA, "boot_b_sha256":e.digest(after_b),
+                  "misc_sha256":e.digest(after_misc), "trial_bc_hex":trial.hex(),
+                  "existing_files_full_audits":2, "rootfs_replaced":False,
+                  "protected_13_unchanged":True, "device_write_invocations":2,
+                  "reboot":False, "retry":False, "rollback":False}
+        e.durable_write(evidence / "result.json", (json.dumps(result,indent=2)+"\n").encode())
+        journal.event("COMPLETE_NO_REBOOT", boot_b_sha256=e.digest(after_b), misc_sha256=e.digest(after_misc))
+        return result
+    except BaseException as error:
+        journal.event("STOP_NO_RETRY_NO_ROLLBACK_NO_REBOOT", error_type=type(error).__name__, reason=str(error))
+        raise
+    finally:
+        journal.close()
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("plan", "execute"))
+    args = parser.parse_args(argv)
+    if args.mode == "execute" and not LIVE_ENABLED:
+        parser.error("LIVE HARD DISABLED: independent approval/enabling copy required; no transport constructed")
+    e = load_core()
+    profile, snapshot = fixed_inputs(e)
+    e.require(not EVIDENCE.exists() and not EVIDENCE.is_symlink(), "fixed evidence already exists; do not retry")
+    if args.mode == "plan":
+        print(json.dumps({"status":"LOCAL_PLAN_ONLY_DEVICE_UNCHECKED", "live_enabled":LIVE_ENABLED,
+                          "core_sha256":CORE_SHA, "snapshot_sha256":SNAPSHOT_SHA,
+                          "manifest_sha256":MANIFEST_SHA, "evidence":str(EVIDENCE),
+                          "writes":[{"node":"/dev/block/mmcblk0p37","bytes":e.BOOT_BYTES,"sha256":BOOT_SHA},
+                                    {"node":"/dev/block/mmcblk0p3","offset":2048,"bytes":32}],
+                          "files_unchanged":list(NAMES), "no_reboot_retry_rollback":True}, indent=2))
+        return 0
+    device = e.AdbBackend(ADB, ADB_SHA, profile)
+    print(json.dumps(transaction(e, device, profile, snapshot), indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

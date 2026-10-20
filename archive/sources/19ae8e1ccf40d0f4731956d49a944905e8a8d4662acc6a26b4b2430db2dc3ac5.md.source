@@ -1,0 +1,95 @@
+# 阶段 2：旧锁保全归档和修复 scanner 部署准备
+
+本目录是 2026-10-15 新增离线材料，旧冻结目录、设备上的旧 helper、真实 ACTIVE/UNCERTAIN/ledger 均未修改。**目前 host runner、部署库、所依赖的新 core adapter 都硬禁设备 I/O。** ARM 成品包含单独 gate1 变体，以便后续审阅、明确确认并固定启用副本后部署；这些生产成品从未运行或上传。本轮只使用 Mac 和本地 Colima 临时文件系统。Colima 已恢复 Stopped。
+
+这不是刷机入口。允许的设备变化只有四个新辅助普通文件、固定旧锁的保全改名，以及新事务锁/owner。没有分区、OpenWrt 目录树、系统设置、SIM/NV、重启、清理或自动重试操作。scanner 完整扫描在此准备阶段未实机通过。
+
+## 固定顺序和前提
+
+1. 先由独立恢复流程完成本机原 boot_b 与原 BC32 恢复，实际完整 B/misc 读回和 ledger COMPLETE 必须成立。该流程的 request/result 和两份真实 readback 被本工具重新核验。恢复 request 的 boot ID 必须不同于之后的 cold boot。
+2. 新无卡冷启动。真实 `evidence_contract.validate_directory_ready` 重新核验 21 样本、当前 16 项原始读取、原 B/misc、保护哈希、身份和共享状态；本工具不接受伪造的布尔通过标志。
+3. 请求、独立审阅、工具材料精确绑定。新的 tx 不得为旧 `fad8a60f84aa4268`，也不得出现在证据绑定的已用 ledger tx 集合。请求有效期不超过 900 秒且不得晚于 cold gate；阶段总预算 30–600 秒，并预留 5 秒。
+4. 全阶段独占主机锁，正常 serial-wide transport；任何 ACTIVE、UNCERTAIN、RECOVERY_ONLY、RECOVERY_PENDING 都拒绝。不能用另开证据目录或 readonly-reconciliation 标志绕过。
+5. 真实原 B/misc、13 保护、GPT 和完整几何再校验。只读取旧锁身份和 owner，不运行旧 scanner，不取得旧事务所有权。
+6. 独占上传第四辅助文件：`/data/local/tmp/e5-clean-lock-archive.<newtx>`。完整读回、独立设备 SHA 和前后 inode/元数据全部一致后才运行。
+7. 原生唯一改名：
+   - 从 `/data/local/tmp/e5-clean-directory.lock`
+   - 到 `/data/local/tmp/e5-clean-directory.lock.archive.fad8a60f84aa4268.<newtx>`。
+   - 旧 owner 必须为 `fad8a60f84aa4268\n`，精确 17 字节；目录只能包含该 owner。保留目录及 owner inode、内容、属性。目标必须不存在，原生 `renameat2(RENAME_NOREPLACE)` 不可用则拒绝，无普通 mv fallback。
+8. 同一 mutation ACTIVE 下实际重新读取 archive 身份、owner 和旧路径缺失，先保存主机 `OLD_LOCK_ARCHIVED.json`，才完成该请求。
+9. 独占新建原 lock 名及 `<newtx>\n` owner；再独占上传 `/data/local/tmp/e5-clean-scanner.<newtx>`、`e5-clean-io.<newtx>`、`e5-clean-helper.<newtx>`。每件完整读回和独立 SHA，旧后缀三个程序不覆盖、不删除。
+10. 修复 scanner 只执行一次完整占用扫描。成功后再次核验新旧锁、四件辅助文件、全部固定分区基线与 GPT；生成 RESULT/COMPLETE。
+
+`scanner_real_full_scan_passed=true` 仅会在将来真实成功运行后由结果生成。准备材料和 fake fixture 没有产生这份真实结果。`noreplace_probe_passed=false`、`approved_to_activate=false` 固定保持；本工具成功仍不授权候选目录切换，另需新 owner 下的专用空目录实测、备份、空间和目录准入。
+
+## 原生归档器范围
+
+CLI 固定为：
+
+```text
+archive NEWTX BOOT_UUID OPID32 DEADLINE_MS DATADEV DATAINO LOCALINO TMPINO LOCKINO OWNERINO
+```
+
+固定 `/data/local/tmp`，同设备号、canonical/nofollow 路径、目录及 owner 身份前后复核。生产要求 `/data` 为 F2FS；祖先元数据要求 data `1000:1000 771`、local `0:0 751`、tmp `0:2000 771`，lock `0:0 700`、owner `0:0 600` 且普通单链接文件。
+
+原生 deadline 由真实 `/proc/uptime` 生成，最多 6 秒；归档调用实际使用 5 秒。安装并检查 TERM/INT/HUP/PIPE 取消处理，长操作前后检查时间/boot/取消。改名 syscall 紧前屏蔽信号、检查 pending 与取消标志；syscall 返回后立即重新检查。不执行第二次改名或撤销。
+
+归档前 fsync owner、lock、父目录；成功后复核同 inode、旧名消失、owner 不变，并 fsync archive 和父目录。回执逐行绑定 schema、boot、tx、op、deadline、全部 inode、同一个 native PID/starttime 和递增时钟。kernel rename 提供“不覆盖目标”，**身份检查和 syscall 之间不是抗任意并发 root 交换的原子事务**，依赖唯一操作者和整个阶段的 host 锁。fsync 遇到不可中断内核等待时，主机只能记录 UNKNOWN，不能保证取消瞬间停止。
+
+辅助上传和新锁创建复用已审的 6 秒 shell/8 秒主机 transport；文件先独占创建、完整有限输入、检查期限、chmod，再同 ACTIVE 下双重读回。取消/连接丢失可能留下部分普通文件或新锁，不能当作未发生；这些 bootstrap 写入不声称断电原子性。任何异常不自动删除、改回旧名、清 marker 或重跑。
+
+## 源码和启用边界
+
+- `native/scanner.DISABLED.c` 逐字节保留已审通用 starttime=0 修复源。
+- `native/scanner.ENABLED.c` 仅 `DEVICE_EXECUTION_ENABLED=0 → 1`。
+- `native/lock_archive.c` 默认为 0；`lock_archive.ENABLED.c` 仅相同 gate 变化。
+- `build/*.aarch64.ENABLED` 静态 ELF64/AArch64，无 PT_INTERP，文件在 Mac 设为 0644。只能由后续已批准固定部署链上传，不能用其运行探针。
+- IO/directory helper 继续绑定既有 0837b1… / ab43a8… ARM 成品，不改代码与范围。
+- `runner.py`、`stage2_deploy.py`、新 core adapter 的 host gate 均关闭。没有环境变量/CLI 参数开启它们。
+- 后续启用应复制到独立目录，只修改经审 gate、重新封存源/材料/入口来源绑定、补启用差异独审。**不得直接编辑这里的冻结准备源或任意更改已审 manifest。**
+
+## 库 API、证据和命令
+
+库接口：
+
+```python
+Stage2Deploy(adapter, request_binding, manifest_binding, review_binding,
+             cold_validator, evidence_dir).run()
+```
+
+adapter 必须来自 manifest 绑定的新 core 类，ADB 固定实际路径/版本 SHA；`cold_validator` 必须是固定 evidence_contract 模块的真实函数，其 common/observe 来源一并绑定。库内部持有整阶段 host flock，调用者不要重复加相同 flock。runner 为本阶段创建独占新主机 evidence 根，再将 `transport/` 和 `result/` 分开；取消 event 和单一总期限贯穿所有请求。
+
+以下均需在项目目录运行。`SHA256SUMS` 和交付清单提供实际 manifest 哈希；尖括号是待替换字段，不能原样运行。
+
+```sh
+python3 -B tools/e5_scanner_deploy_next_prepare_20261015/runner.py
+python3 -B tools/e5_scanner_deploy_next_prepare_20261015/runner.py draft \
+  --manifest <ARTIFACT_MANIFEST绝对路径> --manifest-sha256 <真实SHA> \
+  --output <新的本机模板路径>
+python3 -B tools/e5_scanner_deploy_next_prepare_20261015/runner.py validate \
+  --manifest <绝对路径> --manifest-sha256 <真实SHA> \
+  --request <真实请求绝对路径> --request-sha256 <真实SHA> \
+  --review <独审绝对路径> --review-sha256 <真实SHA>
+```
+
+`draft` 只产生 `TEMPLATE_NOT_VALID`、空现场值和未授权声明。`validate` 只读本机真实材料，检查全部门，不连接设备；目前真实恢复/新 cold 证据尚不存在，不应伪造使其通过。未来独立启用副本的执行调用形式为：
+
+```sh
+python3 -B <独立启用副本>/runner.py execute \
+  --manifest <重新封存manifest> --manifest-sha256 <真实SHA> \
+  --request <本次请求> --request-sha256 <真实SHA> \
+  --review <本次独审> --review-sha256 <真实SHA> \
+  --evidence-dir <evidence下不存在的新目录>
+```
+
+当前准备版 execute 在任何 runtime/device I/O 前直接拒绝。没有本次实际执行请求或通过审阅凭据。
+
+请求 schema 见 `SCHEMA.md`。成功结果只证明当次辅助部署及读取门，不能续期、不能当作刷写授权。STOP/未知之后须另行只读核对实际布局和共享状态，不能再运行本入口试运气。
+
+## 验证和未实测部分
+
+本机 fixture：47 项 host 库合同/协议/失败顺序测试，12 项 runner 测试；所有 fake suite 用导入前进程/网络拒绝哨兵，不加载真实 adapter。
+
+原生：scanner 的同 57 项 HOST_TEST 在 Mac、Linux 均通过；archive 的 30 项真实临时文件系统测试在 Mac、Linux 均通过，包括目标存在、inode/owner/元数据漂移、取消/期限、rename 后错误/丢回执、unsupported syscall。另启用源只编译成 HOST_TEST 重跑同 30 项，两平台也通过。disabled 原生二进制只用于确认 gate 拒绝；生产 enabled 从未执行。Mac 的临时目录测试不证明 E5 F2FS 的行为，Linux VM 测试也不是手机验收。
+
+仍待未来明确执行授权后的实机门：新 cold/原件复核、scanner 在 Android 全进程上的完整成功与耗时、旧锁真实属性和仅 owner 内容、F2FS no-replace/目录持久化、数据链路 ACK 与断连行为、专用空目录校准。历史 Android panic/无线故障未由本准备工作证明消失。

@@ -1,0 +1,37 @@
+#!/usr/bin/env python3
+"""Print or save non-executable request skeletons. No subprocess/device imports."""
+from pathlib import Path
+import argparse,hashlib,json,os
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parents[1]
+SERIAL='DEVICE_SERIAL_REDACTED'
+def digest(path):return hashlib.sha256(path.read_bytes()).hexdigest()
+def file_binding(path):return {'path':str(path),'sha256':digest(path)}
+def empty_binding():return {'path':None,'sha256':None}
+def templates():
+ manifest=HERE/'SOURCE_MANIFEST.json';workflow=HERE/'workflow.py'
+ candidate=ROOT/'materials/openwrt-no-auto-fsck-20261015/candidate.json'
+ material=ROOT/'materials/openwrt-no-auto-fsck-20261015/files/boot.img'
+ original=ROOT/'evidence/stage2-execution-20261013/android-install-01/misc.before.bin'
+ definitions={'probe':{},'inventory':{'roles':['active','stage','archive','failed']},'backup':{'inventory':empty_binding(),'output':None},'stage':{},'activate':{'directory_request':empty_binding()},'rollback':{'directory_request':empty_binding()},'install':{'boot_request':empty_binding()}}
+ workflows={}
+ for phase,inputs in definitions.items():
+  requirements={'deployment':empty_binding()}
+  if phase in {'stage','activate','rollback','install'}:requirements['probe']=empty_binding()
+  if phase=='install':requirements['activation']=empty_binding()
+  workflows[phase]={'schema':'e5-nextphase-workflow-request-v1','phase':phase,'serial':SERIAL,'boot_id':None,'txid':None,'total_seconds':600 if phase!='stage' else 1800,'manifest_sha256':digest(manifest) if manifest.exists() else None,'runner_sha256':digest(workflow),'cold_ready':empty_binding(),'requirements':requirements,'inputs':inputs,'evidence_directory':None,'user_confirmation':None,'technical_review':empty_binding()}
+ directory={'schema':'e5-clean-directory-session-request-v1','mode':'activate','serial':SERIAL,'txid':None,'boot_id':None,'candidate':file_binding(candidate),'cold_resume':empty_binding(),'original_inventory':empty_binding(),'stage_inventory':empty_binding(),'original_backup':{'path':None,'bytes':None,'sha256':None,'receipt_path':None,'receipt_sha256':None},'technical_review':empty_binding()}
+ install={'schema':'e5-bounded-boot-request-v3','serial':SERIAL,'boot_id':None,'txid':None,'mode':'install-linux','total_seconds':600,'expected_before':{'boot_b':'0000000000000000000000000000000000000000000000000000000000000000','misc':'0000000000000000000000000000000000000000000000000000000000000000'},'image':{'path':str(material),'bytes':67108864,'sha256':'0000000000000000000000000000000000000000000000000000000000000000'},'original_misc':{'path':str(original),'bytes':1048576,'sha256':'0000000000000000000000000000000000000000000000000000000000000000'},'recovery':None,'install_ready':empty_binding()}
+ return {'schema':'e5-nextphase-request-skeletons-v1','status':'NON_EXECUTABLE_TEMPLATE','device_execution_authorized':False,'instructions':['Fill identities and bindings only from actual observations and completed earlier phases.','Never copy synthetic test review or claim a request skeleton is approval.','Recompute runner/material bindings from separately reviewed activated copies before live requests.','Workflow review binds canonical request excluding technical_review; directory review uses directory_session.review_binding.','Rollback additionally requires origin_session, failed_inventory and failed_backup; preserve changed trial completely before any rename.'], 'workflow':workflows,'directory_activate':directory,'directory_rollback':{**directory,'mode':'rollback','origin_session':empty_binding(),'failed_inventory':None,'failed_backup':None},'install':install}
+def main():
+ ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('--output');args=ap.parse_args();data=(json.dumps(templates(),ensure_ascii=False,indent=2)+'\n').encode()
+ if not args.output:print(data.decode(),end='');return
+ p=Path(args.output).absolute()
+ if not p.parent.is_dir() or any(x.is_symlink() for x in p.parents):raise ValueError('unsafe output parent')
+ fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'wb') as f:f.write(data);f.flush();os.fsync(f.fileno())
+ fd=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:os.fsync(fd)
+ finally:os.close(fd)
+ print(json.dumps({'path':str(p),'sha256':hashlib.sha256(data).hexdigest(),'execution_authorized':False}))
+if __name__=='__main__':main()

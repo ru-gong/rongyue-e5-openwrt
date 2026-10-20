@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""Host-only exact-input transform. No process, network, device or installation API."""
+from pathlib import Path
+import argparse
+import difflib
+import hashlib
+import json
+import os
+
+DEVICE_EXECUTION_ENABLED = False
+ORIGINAL_SHA256 = '0000000000000000000000000000000000000000000000000000000000000000'
+ROOT = Path(__file__).resolve().parent
+GATE = '''# OFFLINE CANDIDATE. Activation is a separately reviewed one-line change.
+E5_WAN_CANDIDATE_EXECUTION_ENABLED=0
+[ "$E5_WAN_CANDIDATE_EXECUTION_ENABLED" = 1 ] || exit 126
+
+'''
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def transform(original, functions):
+    if sha(original) != ORIGINAL_SHA256:
+        raise ValueError('actual proto SHA mismatch; refuse patch')
+    if not original.startswith(b'#!/bin/sh\n'):
+        raise ValueError('unexpected interpreter')
+    start = original.index(b'modemmanager_set_plmn() {\n')
+    end = original.index(b'\n# unisoc-pdp-connect-retry:', start)
+    if original.count(b'modemmanager_set_plmn() {\n') != 1:
+        raise ValueError('non-unique registration function')
+    if not functions.endswith(b'\n') or functions.count(b'modemmanager_set_plmn() {\n') != 1:
+        raise ValueError('unexpected function payload')
+    output = original[:start] + functions + original[end:]
+    return output[:10] + GATE.encode() + output[10:]
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--original', type=Path, default=ROOT/'actual/lib/netifd/proto/modemmanager.sh')
+    p.add_argument('--out', type=Path, required=True)
+    args = p.parse_args()
+    if DEVICE_EXECUTION_ENABLED:
+        raise SystemExit('invalid preparation build')
+    src = args.original
+    if src.is_symlink() or not src.is_file():
+        raise SystemExit('regular original required')
+    original = src.read_bytes()
+    functions = (ROOT/'late-registration.functions.sh').read_bytes()
+    output = transform(original, functions)
+    args.out.mkdir(mode=0o700, parents=False, exist_ok=False)
+    files = {
+        'modemmanager.sh.disabled': output,
+        'review.patch': ''.join(difflib.unified_diff(original.decode().splitlines(True), output.decode().splitlines(True), fromfile='a/lib/netifd/proto/modemmanager.sh', tofile='b/lib/netifd/proto/modemmanager.sh')).encode(),
+    }
+    for name, data in files.items():
+        with (args.out/name).open('xb') as f:
+            f.write(data); f.flush(); os.fsync(f.fileno())
+        (args.out/name).chmod(0o600)
+    report = {'status':'OFFLINE_CANDIDATE_DEVICE_EXECUTION_DISABLED', 'device_execution_enabled':False,
+              'original':{'bytes':len(original), 'sha256':sha(original)},
+              'functions_sha256':sha(functions),
+              'outputs':{k:{'bytes':len(v),'sha256':sha(v)} for k,v in files.items()},
+              'activation_required':'exact single 0-to-1 hard gate edit, new SHA, independent review, and later authorized RAM overlay only',
+              'not_proven':['actual BusyBox/native shell execution', 'late registration recovery', 'bearer/IP/WAN/Internet success', 'CP/SIPA health']}
+    (args.out/'PREPARED.json').write_text(json.dumps(report, indent=2)+'\n')
+    print(json.dumps(report, indent=2))
+
+if __name__ == '__main__':
+    main()

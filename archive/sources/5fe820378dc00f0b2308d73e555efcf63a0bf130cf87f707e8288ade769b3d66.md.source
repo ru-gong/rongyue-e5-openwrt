@@ -1,0 +1,39 @@
+# 有界 boot_b / misc32 事务：离线准备
+
+`bounded_boot_control.py` 的生产门仍为 `DEVICE_IO_DISABLED=True`，没有 CLI、环境变量或调用参数启用方式。本轮只实现、主机测试与独立审阅，不访问设备，不代表批准未来写入或证明硬件恢复成功。旧 live 工具没有导入或修改。
+
+写集仅固定物理 `/dev/block/mmcblk0p37`（259:30，64 MiB，16 个 4 MiB 块）以及 `/dev/block/mmcblk0p3`（179:3，1 MiB 中 offset 2048 的 32 字节）。没有 A、super、userdata、metadata、NV 写入口，也没有 reboot、擦除、自动重试或自动回滚。GPT 前 32768 字节与固定 13 个保护分区只读。
+
+每个块前持久保存 IN_FLIGHT，原生助手先完整接收输入、核固定节点/inode/rdev/尺寸/boot/短 BOOTTIME 截止，再尝试一次 pwrite 和 fsync。主机 ACK 不是完成：同一个公共 ACTIVE 内先独立字节读回，并核同 inode/dev；misc 必须完整读回 1 MiB，外 32 字节不变。引擎再复核，每块写 VERIFIED。完整 B 全量相等、保护分区仍相等后，才可写 misc32。最终完整读回、保护核对、result 落盘与 ledger COMPLETE 同时成立才算事务成功。
+
+读写请求主机截止 8 秒，读取 shell 另有约 6 秒远端 timeout，原生写入截止最多从读到 uptime 后 5 秒。整体请求为 30–900 秒。取消、SIGINT/SIGTERM、短写、坏 ACK、失联、读回失败、证据写入失败会停止后续写入，持久 UNKNOWN。内核阻塞的 I/O/fsync 或主机进程创建不能由这些期限保证立即结束；杀死主机 adb 不证明远端退出。misc32 不宣称原子写入。A 字节保持不变也不等于任意掉电状态都必然自动选 A。
+
+固定 host 共享 flock 与目录事务一致。boot ledger 位于 `evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl`，带连续哈希链；共享 transport barrier 位于 `evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED/`。换输出目录、新 Python 实例、重用事务 ID不能解除 UNKNOWN。ledger 不清除；reconciliation 不写设备、不追加完成状态。
+
+## 绑定与调用合同
+
+构造 `NativeBackend(transport, adb_path, native_path, native_sha, txid, boot_id, pins, directory_adapter=None)`。`pins` 恰好包含 `adb`、`bounded_transport`、`bounded_boot_control`、`native_sha256`、`directory_adapter`、`uncertainty_recovery`。所有 Python 源先核 hash 后加载；特殊恢复 transport 必须使用同一 recovery source SHA。本轮所有 native guard 都固定串号、板型、原 Android build、A、root/unlocked/orange、boot completed、boot ID，且要求 `gsm.sim.state=ABSENT,ABSENT`。
+
+`execute(backend, request_path, request_sha, new_evidence_dir, cancel=event)` 的请求 schema 为 `e5-bounded-boot-request-v3`。严格字段：`schema, serial, boot_id, txid, mode, total_seconds, expected_before, image, original_misc, recovery, install_ready`。mode 仅 `restore-original` 或 `install-linux`；两类 image 都是完整 64 MiB 文件并固定 SHA，原 misc 始终固定本机备份。expected_before 固定整个 B/misc SHA，不能只审批文件名。
+
+install 必须绑定 `e5-clean-activation-v3` receipt。candidate SHA 精确等于 `research/author-clean-reinstall-20261014/candidate.json` 的 `0000000000000000000000000000000000000000000000000000000000000000`，并重新核本地候选文件；还核源版本、有效期，使用固定真实 adapter.inspect(active) 重验整个当前树及 8 个固定文件。不能用 caller 的布尔值冒充安装就绪。目录 adapter 必须共享取消事件且其单调时钟截止不晚于 boot 总截止。
+
+B 试启动 BC 根据当前有效 CRC 的 A 状态生成。要求 A 已成功，且 B 不可启动或 A 优先级严格高于 B；不会把已有同优先可启动 B 当作安全空闲状态。恢复则允许当前 32 字节 CRC 已损坏，但必须证明 misc 外部所有字节等于原件；只将 32 字节恢复为本机原值。
+
+## UNKNOWN 后的独立恢复
+
+`reconcile_readonly(backend, new_evidence_dir, total_seconds, cancel=event)` 只读保存 16 项全长 raw：B、misc、GPT 前缀、13 个保护分区。前后保护和 B/misc 稳定读取；结果绑定当前 ledger head（允许尚无 boot ledger，或它已 COMPLETE，因为未知可能来自目录事务）。原 misc 来源固定为 `evidence/stage2-execution-20261013/android-install-01/misc.before.bin`，不从未知旧请求猜测。
+
+恢复可以复用已存在 `/data/local/tmp/e5-clean-io.<旧 txid>`，仍逐次验证完整 helper SHA 和 nofollow。只有 reconciliation 读取或经 exact recovery_context 批准的 restore-original 可以使用与新 txid 不同的路径后缀；普通 Linux 安装拒绝它。因此 UNKNOWN 恢复不需要为新 txid 另外上传普通文件。
+
+若共享 barrier 已未知，必须用 `reconciliation_only=True` 的公共 transport：它保留全局旧 ACTIVE/UNCERTAIN，使用独立只读操作记录。NativeBackend 的 write_chunk 和 execute 均拒绝该模式。之后需根线程独立 `uncertainty_recovery.stage`：新的 Android boot、完整 raw、本机原件、旧 barrier/ledger 的精确 hash、两层独立 review、不同 txid、精确的新 restore-original 请求。该转换同样默认硬禁。
+
+boot 引擎有自己的 reconciliation/review 门；共享 recovery grant 另绑定 `{request_sha256,txid,boot_id}`。不能缺少 grant，也不能借恢复 grant 安装 Linux。成功时先保存完整 readback/result/ledger COMPLETE，随后调用固定 recovery 模块 finish 才归档 RECOVERY_ONLY。失败保留它。所有归档保留原未知记录；无清除 marker 的参数。
+
+恢复 review 的 proposal SHA 为 request 去掉仅 `recovery.review_path` 和 `recovery.review_sha256` 后的 canonical JSON SHA，避免循环引用。最终完整 request 仍有自己的审批 SHA。
+
+## 验证与实际限制
+
+`python3 -B -m unittest -v test_bounded_boot_control` 单独运行。38 项 host/fake 测试通过：16 块与 BC 次序、丢 ACK、部分 misc、保护变化、取消/信号/截止、证据 fsync 失败、永久 ledger、精确二进制封套、同 ACTIVE followup、固定 candidate/no-SIM、只读模式拒写等。测试进程审计钩子禁止子进程/网络；设备以内存 fixture 代替，不是硬件验收。
+
+未来仍需固定全部新源/二进制与具体请求、完成独审、得到用户写范围确认，然后由主线程唯一设备操作者执行。完整数据吞吐、Android ABI、实际超时长度、真实文件系统 fsync、断电状态和恢复可达性不由本轮 fake tests 证明。

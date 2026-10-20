@@ -1,0 +1,60 @@
+"""Positive negative acknowledgements remain refusals, never write admission."""
+import copy,importlib.util,json,sys,types,unittest
+from pathlib import Path
+from unittest.mock import patch
+import combined as c
+from test_combined import make,guard,OP
+ROOT=Path(__file__).resolve().parents[2]
+class Tests(unittest.TestCase):
+ def nack(self):return json.loads((ROOT/'tools/e5_stage_fd_churn_prepare_20261020/CASE.json').read_bytes())['native_failure_preserved']
+ def fixture(self):
+  w=make();r=self.nack();r.update({'opid':OP,'boot_id':w.a.boot_id,'txid':w.a.txid,'deadline_ms':6000})
+  raw=guard(w);start=raw.index(f'CDEADLINE\t{OP}\t6000\n'.encode());head=raw[:start]+f'CDEADLINE\t{OP}\t6000\n'.encode()
+  first=dict(r,event='PHASE');tail=f'CEXIT\t{OP}\t70\nCNOW\t{OP}\t2.00\nCEND\t{OP}\t{w.a.boot_id}\n'.encode()
+  return w,head+json.dumps(first).encode()+b'\n'+json.dumps(r).encode()+b'\n'+tail
+ def test_exact_nack_has_no_write_deadline(self):
+  w,raw=self.fixture();v=w.parse_preflight(raw,OP);self.assertEqual(v['outcome'],'KNOWN_FD_CONVERGENCE_REFUSAL');self.assertIsNone(v['deadline_ms']);self.assertFalse(v['scanner']['complete'])
+ def test_wrong_exit_or_partial_footer_refused(self):
+  w,raw=self.fixture()
+  for changed in (raw.replace(f'CEXIT\t{OP}\t70'.encode(),f'CEXIT\t{OP}\t0'.encode()),raw.replace(f'CEXIT\t{OP}\t70'.encode(),f'CEXIT\t{OP}\t124'.encode()),raw[:-10]):
+   with self.assertRaises(RuntimeError):w.parse_preflight(changed,OP)
+ def test_other_unknown_or_target_object_not_nack(self):
+  for key,value in [('errno',16),('detail','occupied'),('fd_closed_rejected',1),('cancel_signal',15),('fd_diff_records_omitted',1)]:
+   r=self.nack();r[key]=value;self.assertFalse(c.known_closed_object_refusal(r))
+  r=self.nack();r['fd_differences'][0]['old_dev']=66367;self.assertFalse(c.known_closed_object_refusal(r))
+ def test_missing_diagnostics_not_nack(self):
+  for key in ['fd_differences','fd_closed_rejected','cancel_signal','fd_diff_records_omitted','fd_closed_records_omitted']:
+   r=self.nack();r.pop(key);self.assertFalse(c.known_closed_object_refusal(r))
+ def test_binary_tamper_not_nack(self):
+  w,raw=self.fixture()
+  with self.assertRaises(RuntimeError):w.parse_preflight(raw.replace(b'ELF',b'ELX',1),OP)
+ def test_declined_then_fresh_complete_scan(self):
+  w=make();seq=[{'outcome':'KNOWN_FD_CONVERGENCE_REFUSAL','deadline_ms':None}]*2+[{'outcome':'READY','deadline_ms':7000}];calls=[]
+  w._preflight_once=lambda:(calls.append(1),copy.deepcopy(seq[len(calls)-1]))[1]
+  v=w.preflight();self.assertEqual(v['full_scan_attempts'],3);self.assertEqual(len(calls),3);self.assertEqual(v['deadline_ms'],7000)
+ def test_three_declines_never_write(self):
+  w=make();scans=[];writes=[];w._preflight_once=lambda:(scans.append(1),{'outcome':'KNOWN_FD_CONVERGENCE_REFUSAL','deadline_ms':None})[1];w.a._request=lambda *a,**k:writes.append(a)
+  with patch.object(c,'DEVICE_APPEND_ENABLED',True),self.assertRaises(RuntimeError):w.write('openwrt.ext4',types.SimpleNamespace(size=2<<30),0,b'\0'*c.CHUNK,0)
+  self.assertEqual(len(scans),3);self.assertEqual(writes,[])
+ def test_transport_failure_never_repeated(self):
+  w=make();calls=[]
+  def fail():calls.append(1);raise RuntimeError('lost ACK or transport timeout')
+  w._preflight_once=fail
+  with self.assertRaises(RuntimeError):w.preflight()
+  self.assertEqual(len(calls),1)
+ def test_declined_guard_cannot_be_misused_as_write_admission(self):
+  w=make();calls=[];w.preflight=lambda:{'outcome':'KNOWN_FD_CONVERGENCE_REFUSAL','deadline_ms':None};w.a._request=lambda *a,**k:calls.append(a)
+  with patch.object(c,'DEVICE_APPEND_ENABLED',True),self.assertRaises(RuntimeError):w.write('openwrt.ext4',types.SimpleNamespace(size=2<<30),0,b'\0'*c.CHUNK,0)
+  self.assertEqual(calls,[])
+ def test_real_success_and_refusal_as_explicit_framing_fixtures(self):
+  material=json.loads((c.CORE/'SOURCE_MANIFEST.json').read_bytes());base=ROOT/'evidence/author-stage-continuation-20261020/resume-stage-execution/transport';folders=sorted(base.glob('*stage-combined-preflight*'))
+  for p in [folders[-2],folders[-1]]:
+   b=json.loads((p/'IN_FLIGHT.json').read_bytes());op=b['op_id'];raw=(p/'stdout.bin').read_bytes();w=make();w.a.boot_id=b['boot_id'];w.a.txid=b['txid'];w.a.remote_scanner='/data/local/tmp/e5-clean-scanner.'+b['txid'];w.a.remote_io='/data/local/tmp/e5-clean-io.'+b['txid']
+   w.a.scanner=types.SimpleNamespace(size=material['artifacts']['scanner']['bytes'],sha256=material['artifacts']['scanner']['sha256']);w.a.io_helper=types.SimpleNamespace(size=material['artifacts']['io_helper']['bytes'],sha256=material['artifacts']['io_helper']['sha256'])
+   if (p/'COMPLETE.json').exists():
+    raw=raw.replace(f'CNOW\t{op}\t'.encode(),f'CEXIT\t{op}\t0\nCNOW\t{op}\t'.encode());expected='READY'
+   else:
+    deadline=self.nack()['deadline_ms'];raw+=f'CEXIT\t{op}\t70\nCNOW\t{op}\t{deadline/1000-1:.2f}\nCEND\t{op}\t{b["boot_id"]}\n'.encode();expected='KNOWN_FD_CONVERGENCE_REFUSAL'
+   # Added framing is a host fixture, not a new real device proof.
+   self.assertEqual(w.parse_preflight(raw,op)['outcome'],expected)
+if __name__=='__main__':unittest.main(verbosity=2)

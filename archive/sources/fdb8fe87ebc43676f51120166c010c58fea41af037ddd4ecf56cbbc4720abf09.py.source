@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+"""Small offline acceptance tests; no subprocess/device access permitted."""
+import importlib.util
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+
+spec=importlib.util.spec_from_file_location("check",Path(__file__).with_name("check.py"))
+c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c);e=c.load_core()
+
+
+class Fake:
+    def __init__(self):
+        self.files={};self.created=False;self.calls=[]
+        self.boot="00000000-0000-4000-8000-000000000001"
+        self.source="/dev/block/mmcblk0p70";self.fstype="f2fs";self.options="rw,seclabel"
+        self.encrypted=False;self.badprotected=False;self.preflight_fail=False
+    def preflight(self,require_data=True):
+        assert require_data is True
+        self.calls.append("preflight")
+        e.require(not self.preflight_fail,"fake preflight state mismatch")
+    def protected_hashes(self):
+        values=e.load_profile()["protected_hashes"].copy()
+        if self.badprotected:values["boot_a"]="0"*64
+        return values
+    def verify_file(self,target,size,sha):
+        e.require(target in self.files and len(self.files[target])==size and e.digest(self.files[target])==sha,"fake remote file mismatch")
+    def shell(self,script,payload=None):
+        self.calls.append(script)
+        if payload is not None:
+            target=next(x for x in (c.PROBE,c.NONCE) if "cat > "+x+";" in script)
+            e.require(target not in self.files,"file exists")
+            self.files[target]=payload;return b""
+        if script=="cat /proc/sys/kernel/random/boot_id":return (self.boot+"\n").encode()
+        if script=="cat /proc/mounts":return f"{self.source} /data {self.fstype} {self.options} 0 0\n".encode()
+        if script.startswith("readlink -f "):return (self.source+"\n").encode()
+        if script.startswith("getprop ro.crypto."):return b"unencrypted\n"
+        if script.startswith("test -d "):
+            if "mkdir "+c.REMOTE in script:
+                e.require(not self.created,"remote directory exists");self.created=True
+            else:e.require(self.created,"remote directory absent")
+            return b""
+        if script.startswith(c.PROBE+" "):return b"encrypted\n" if self.encrypted else b"unencrypted\n"
+        if script=="cat "+c.NONCE:return self.files[c.NONCE]
+        raise AssertionError("Unexpected fake command: "+script)
+
+
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name);self.fake=Fake()
+    def tearDown(self):self.temp.cleanup()
+    def begin(self):
+        result=c.before(e,self.fake,self.root/"before")
+        return c.load_before(e,Path(result["before_manifest"]),result["sha256"])
+    def test_two_stage_success_and_after_only_reads(self):
+        proof,nonce=self.begin();self.fake.boot="00000000-0000-4000-8000-000000000001"
+        self.fake.calls=[]
+        result=c.after(e,self.fake,proof,nonce,self.root/"after")
+        self.assertEqual(result["status"],"PLAINTEXT_AND_REBOOT_PERSISTENCE_VERIFIED")
+        self.assertTrue(all(" > " not in x and "mkdir " not in x and "chmod " not in x for x in self.fake.calls))
+        self.assertEqual(len(self.fake.files),2)
+        self.assertIn("/data/",result["policies"])
+    def test_same_boot_rejected(self):
+        proof,nonce=self.begin()
+        with self.assertRaises(e.Refusal):c.after(e,self.fake,proof,nonce,self.root/"after")
+    def test_mapper_rejected_before_remote_writes(self):
+        self.fake.source="/dev/block/dm-42"
+        with self.assertRaises(e.Refusal):self.begin()
+        self.assertEqual(self.fake.files,{})
+    def test_ext4_rejected_before_remote_writes(self):
+        self.fake.fstype="ext4"
+        with self.assertRaises(e.Refusal):self.begin()
+        self.assertEqual(self.fake.files,{})
+    def test_encrypted_policy_stops_with_files_retained(self):
+        self.fake.encrypted=True
+        with self.assertRaises(e.Refusal):self.begin()
+        self.assertFalse((self.root/"before/before.json").exists())
+        self.assertEqual(len(self.fake.files),2)
+    def test_missing_nonce_after_reboot_rejected(self):
+        proof,nonce=self.begin();self.fake.boot="00000000-0000-4000-8000-000000000001"
+        self.fake.files[c.NONCE]=b"changed"
+        with self.assertRaises(e.Refusal):c.after(e,self.fake,proof,nonce,self.root/"after")
+    def test_existing_remote_directory_refused(self):
+        self.fake.created=True
+        with self.assertRaises(e.Refusal):self.begin()
+        self.assertEqual(self.fake.files,{})
+    def test_source_or_nonce_binding_rejected(self):
+        self.begin();path=self.root/"before/before.json"
+        with self.assertRaises(e.Refusal):c.load_before(e,path,"0"*64)
+        (self.root/"before/nonce.bin").write_bytes(b"changed")
+        with self.assertRaises(e.Refusal):c.load_before(e,path,e.file_hash(path))
+    def test_protected_change_fails_before_success(self):
+        self.fake.badprotected=True
+        with self.assertRaises(e.Refusal):self.begin()
+        self.assertFalse((self.root/"before/before.json").exists())
+    def test_A_root_preflight_failure_no_remote_writes(self):
+        self.fake.preflight_fail=True
+        with self.assertRaises(e.Refusal):self.begin()
+        self.assertEqual(self.fake.files,{})
+
+
+if __name__=="__main__":
+    def block(event,args):
+        if event.startswith(("subprocess.","os.system","os.exec","os.posix_spawn","pty.spawn")):
+            raise AssertionError("OFFLINE ONLY: "+event)
+    sys.addaudithook(block)
+    unittest.main(verbosity=2)

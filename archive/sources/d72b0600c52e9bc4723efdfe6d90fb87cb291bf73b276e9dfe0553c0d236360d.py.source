@@ -1,0 +1,117 @@
+"""Host-only shell fixtures for the exact generated mount guard; no device I/O."""
+import ast
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import android_directory_adapter as a
+
+
+def audit(event,args):
+    if event.startswith('socket.') or event in ('os.system','os.exec','os.posix_spawn'):
+        raise AssertionError('external operation forbidden')
+    if event == 'subprocess.Popen':
+        argv=args[1]
+        if not isinstance(argv,list) or argv[0]!='/bin/bash':
+            raise AssertionError('only fixed host bash fixture/syntax process allowed')
+sys.addaudithook(audit)
+
+
+STUBS=r'''
+awk() { /usr/bin/awk "$1" "$MOUNT_FIXTURE"; }
+readlink() {
+  [ "$1" = -f ] || return 90
+  case "$2" in
+    /dev/block/by-name/userdata) printf '%s\n' "$ALIAS_RESOLVED";;
+    /dev/block/mmcblk0p70) printf '%s\n' "$RAW_RESOLVED";;
+    *) return 91;;
+  esac
+}
+cat() {
+  [ "$#" = 1 ] && [ "$1" = /sys/class/block/mmcblk0p70/dev ] || return 92
+  printf '%s\n' "$SYS_DEV"
+}
+stat() {
+  [ "$#" = 3 ] && [ "$1" = -c ] && [ "$2" = '%t:%T' ] && [ "$3" = /dev/block/mmcblk0p70 ] || return 93
+  printf '%s\n' "$STAT_DEV"
+}
+test() {
+  if [ "$#" = 2 ] && [ "$1" = -b ]; then
+    [ "$2" = /dev/block/mmcblk0p70 ] && [ "$BLOCK_OK" = 1 ]
+  else
+    builtin test "$@"
+  fi
+}
+set -eu
+set -o pipefail
+'''
+
+
+class MountGuardTests(unittest.TestCase):
+    def setUp(self):
+        self.ad=a.AndroidDirectoryAdapter(None,None,'0123456789abcdef','00000000-0000-4000-8000-000000000001')
+        guard=self.ad._guard()
+        self.script=guard.split('# DATA_MOUNT_GUARD_BEGIN\n',1)[1].split('# DATA_MOUNT_GUARD_END',1)[0]
+
+    def run_guard(self,mounts,**override):
+        with tempfile.TemporaryDirectory() as tmp:
+            fixture=Path(tmp)/'mounts';fixture.write_text(mounts)
+            env=dict(os.environ,MOUNT_FIXTURE=str(fixture),ALIAS_RESOLVED='/dev/block/mmcblk0p70',
+                     RAW_RESOLVED='/dev/block/mmcblk0p70',SYS_DEV='259:63',STAT_DEV='103:3f',BLOCK_OK='1')
+            env.update(override)
+            result=subprocess.run(['/bin/bash','--noprofile','--norc'],input=(STUBS+self.script+'\nprintf "PASSED\\n"\n').encode(),
+                                  stdout=subprocess.PIPE,stderr=subprocess.PIPE,env=env,timeout=3)
+            return result.returncode==0 and result.stdout==b'PASSED\n' and not result.stderr
+
+    def row(self,source='/dev/block/by-name/userdata',fstype='f2fs',opts='rw,nosuid,nodev'):
+        return f'{source} /data {fstype} {opts} 0 0\n'
+
+    def test_alias_and_fixed_raw_source_allowed(self):
+        for source in ('/dev/block/by-name/userdata','/dev/block/mmcblk0p70'):
+            with self.subTest(source=source):self.assertTrue(self.run_guard(self.row(source)))
+
+    def test_unapproved_source_rejected(self):
+        for source in ('/dev/block/dm-42','/dev/block/mmcblk0p69','/dev/block/by-name/metadata','/tmp/userdata'):
+            with self.subTest(source=source):self.assertFalse(self.run_guard(self.row(source)))
+
+    def test_alias_or_raw_resolves_to_wrong_node_rejected(self):
+        for key in ('ALIAS_RESOLVED','RAW_RESOLVED'):
+            with self.subTest(key=key):self.assertFalse(self.run_guard(self.row(),**{key:'/dev/block/mmcblk0p69'}))
+
+    def test_rdev_or_type_mismatch_rejected(self):
+        for overrides in ({'SYS_DEV':'259:62'},{'STAT_DEV':'103:3e'},{'BLOCK_OK':'0'}):
+            with self.subTest(overrides=overrides):self.assertFalse(self.run_guard(self.row(),**overrides))
+
+    def test_readonly_or_contradictory_modes_rejected(self):
+        for opts in ('ro,nosuid','rw,ro','relatime','rwx,nosuid'):
+            with self.subTest(opts=opts):self.assertFalse(self.run_guard(self.row(opts=opts)))
+
+    def test_missing_or_multiple_data_matches_rejected(self):
+        for mounts in ('',self.row()+self.row(),self.row()+self.row(opts='ro')):
+            with self.subTest(mounts=mounts):self.assertFalse(self.run_guard(mounts))
+
+    def test_filesystem_mismatch_rejected(self):
+        self.assertFalse(self.run_guard(self.row(fstype='ext4')))
+
+    def test_only_guard_method_changed_and_expensive_checks_retained(self):
+        new=Path(a.__file__);old=new.parent.parent/'e5_clean_author_prepare_20261014'/new.name
+        def stripped(path):
+            tree=ast.parse(path.read_text())
+            for item in tree.body:
+                if isinstance(item,ast.ClassDef) and item.name=='AndroidDirectoryAdapter':
+                    item.body=[m for m in item.body if not (isinstance(m,ast.FunctionDef) and m.name=='_guard')]
+            return ast.dump(tree,include_attributes=False)
+        self.assertEqual(stripped(new),stripped(old))
+        self.assertIn('/proc/[0-9]*/fd/*',self.ad._guard())
+        self.assertIn('/proc/[0-9]*/mountinfo',self.ad._guard())
+
+    def test_device_gate_still_hard_disabled(self):
+        self.assertIs(a.DEVICE_IO_DISABLED,True)
+        with patch.object(a.subprocess,'run',side_effect=AssertionError('transport attempted')):
+            with self.assertRaisesRegex(a.Refusal,'DEVICE_IO_DISABLED'):self.ad._shell('id')
+
+
+if __name__=='__main__':unittest.main(verbosity=2)

@@ -1,0 +1,131 @@
+"""Host-only, one-time finite-budget preparation; never imports runtime modules."""
+import ast, copy, difflib, hashlib, importlib.util, json, sys
+from pathlib import Path
+from datetime import datetime, timezone
+
+def sentinel(event, args):
+    if event.startswith(('subprocess.', 'socket.', 'os.exec', 'os.spawn', 'os.posix_spawn')) or event == 'os.system':
+        raise RuntimeError('external process/network forbidden')
+sys.addaudithook(sentinel)
+ROOT=Path(__file__).resolve().parents[2]; HERE=Path(__file__).resolve().parent
+BASE=ROOT/'tools/e5_activation_bundle_176656abb97d4b2c/RESULT.json'
+BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+HELPER=ROOT/'tools/e5_activation_prepare_20261015/activation.py'
+HELPER_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+DEST={g:ROOT/'tools'/name for g,name in {
+ 'core':'e5_nextphase_core_budget_prepare_20261015',
+ 'recovery':'e5_next_recovery_budget_prepare_20261015',
+ 'scanner':'e5_scanner_deploy_budget_prepare_20261015',
+ 'acceptance':'e5_next_acceptance_budget_prepare_20261015'}.items()}
+sha=lambda b:hashlib.sha256(b).hexdigest()
+assert sha(HELPER.read_bytes())==HELPER_SHA
+spec=importlib.util.spec_from_file_location('_budget_copy_builder',HELPER);a=importlib.util.module_from_spec(spec);spec.loader.exec_module(a)
+
+def main():
+ for p in DEST.values():assert not p.exists() and not p.is_symlink()
+ assert not (HERE/'RESULT.json').exists()
+ base=json.loads(a.read(BASE,BASE_SHA));original={k:a.read(v['path'],v['sha256'],v['bytes']) for k,v in base['files'].items()}
+ b=a.Builder(copy.deepcopy(original),DEST)
+ recipe=json.loads((ROOT/'tools/e5_nextphase_core_prepare_20261015/ACTIVATION_RECIPE.json').read_bytes())
+ for key,rule in recipe['literal_gates'].items():
+  if key=='recovery/observe.py':continue  # Exact historical producer, never invoked here.
+  old,new=rule.split(' -> ');name=old.split('=')[0].strip()
+  b.set(key,name,ast.literal_eval(new.strip()),ast.literal_eval(old.split('=')[1].strip()))
+ # Seven behavior files below, including directory-only capture start metadata. Per-request/native/range code is unchanged.
+ b.exact('core/workflow.py','max_seconds = 900 if r["phase"] in {"probe", "activate", "rollback", "install"} else 3600',
+  'max_seconds = {"probe":900,"inventory":3600,"backup":5400,"stage":7200,"activate":5400,"rollback":5400,"install":3600}[r["phase"]]')
+ b.exact('core/android_directory_adapter.py','<=3600,\'finite future transaction deadline of at most 3600 seconds required\'',
+  '<=7200,\'finite future transaction deadline of at most 7200 seconds required\'')
+ b.exact('core/android_directory_adapter.py',"require(0<remaining<=900,'expired or invalid cold lease')", "require(0<remaining<=10800,'expired or invalid directory lease')")
+ b.exact('core/cold_bridge.py','0 < (expiry - now).total_seconds() <= 900','0 < (expiry - now).total_seconds() <= 10800')
+ b.exact('core/bounded_boot_control.py','def __init__(self, seconds, cancel=None, clock=time.monotonic):\n        require(type(seconds) is int and 30 <= seconds <= 900, "transaction deadline range")',
+  'def __init__(self, seconds, cancel=None, clock=time.monotonic, *, install_linux=False):\n        require(type(install_linux) is bool, "fixed budget mode")\n        maximum = 3600 if install_linux else 900\n        require(type(seconds) is int and 30 <= seconds <= maximum, "transaction deadline range")')
+ b.exact('core/bounded_boot_control.py','budget=Budget(r["total_seconds"],cancel)', 'budget=Budget(r["total_seconds"],cancel,install_linux=(r["mode"]=="install-linux"))')
+ b.exact('core/directory_session.py','import stat\n','import stat\nimport time\n')
+ b.exact('core/directory_session.py','def validate_request(path, sha256, now=None):','def validate_request(path, sha256, now=None, *, _review_admitted_at=None):')
+ b.exact('core/directory_session.py','    now = now or _now()\n    request = _json',
+  '    now = now or _now()\n    review_at = now if _review_admitted_at is None else _review_admitted_at\n    require(isinstance(review_at, datetime) and review_at.tzinfo is not None and review_at <= now, "review admission time")\n    request = _json')
+ b.exact('core/directory_session.py','now - timedelta(minutes=15) <= _time(review["reviewed_at"]) <= now,',
+  'review_at - timedelta(minutes=15) <= _time(review["reviewed_at"]) <= review_at,')
+ b.exact('core/directory_session.py','validated = validate_request(request_path, request_sha256)\n        request = validated["request"]',
+  'admitted_at = _now()\n        validated = validate_request(request_path, request_sha256, now=admitted_at)\n        request = validated["request"]')
+ b.exact('core/directory_session.py','obj.adapter, obj.validated, obj.folder = adapter, validated, folder',
+  'obj.adapter, obj.validated, obj.folder = adapter, validated, folder\n        obj._review_admitted_at = admitted_at\n        obj._admitted_request_path, obj._admitted_request_sha = str(request_path), request_sha256\n        obj._phase_deadline = adapter.transaction_deadline')
+ b.exact('core/directory_session.py','        self.validated = validate_request(self.request_path, self.request_sha256)',
+  '        require(self.request_path == self._admitted_request_path and self.request_sha256 == self._admitted_request_sha, "admitted request changed")\n        require(type(self._phase_deadline) in (int,float) and self.adapter.transaction_deadline == self._phase_deadline and time.monotonic() < self._phase_deadline and not self.adapter.cancel_event.is_set(), "admitted phase expired/cancelled")\n        self.validated = validate_request(self.request_path, self.request_sha256, _review_admitted_at=self._review_admitted_at)')
+ not_before=datetime.now(timezone.utc).isoformat()
+ policy_code=f'''DIRECTORY_LEASE_SECONDS=10800
+DIRECTORY_POLICY_NOT_BEFORE={not_before!r}
+def purpose_lease(purpose):
+ require(purpose in ('directory','recovery','rearm-with-sim'),'unknown lease purpose')
+ return DIRECTORY_LEASE_SECONDS if purpose=='directory' else 900
+def directory_budget_policy():
+ return {{'schema':'e5-directory-budget-policy-v1','seconds':DIRECTORY_LEASE_SECONDS,'not_before':DIRECTORY_POLICY_NOT_BEFORE,'contract_sha256':sha(read(Path(__file__).resolve()))}}
+def reviewed_lease(review,at,purpose,evidence_end,evidence_start=None):
+ limit=purpose_lease(purpose);expiry=lease(review,at,limit);captured=c.timestamp(review['captured_at'])
+ require(evidence_end<=captured and (captured-evidence_end).total_seconds()<900,'review must follow actual evidence within fifteen minutes')
+ extended=(expiry-captured).total_seconds()>900
+ if extended:
+  require(purpose=='directory' and review.get('directory_budget_policy')==directory_budget_policy(),'new directory budget policy/source required')
+  require(evidence_end>=c.timestamp(DIRECTORY_POLICY_NOT_BEFORE) and (evidence_start is None or evidence_start>=c.timestamp(DIRECTORY_POLICY_NOT_BEFORE)),'old evidence cannot acquire extended lease')
+ effective=min(expiry,evidence_end+dt.timedelta(seconds=limit if extended else 900))
+ require(at<effective,'evidence effective lease expired')
+ return effective
+def raw_remaining(rec,at,purpose):
+ limit=purpose_lease(purpose);age=(at-c.timestamp(rec['captured_at'])).total_seconds()
+ require(0<=age<limit,'fresh raw snapshot required for purpose');return limit-age
+
+'''
+ b.exact('recovery/evidence_contract.py','def validate_cold(binding,now=None):',policy_code+'def validate_cold(binding,now=None):')
+ b.exact('recovery/evidence_contract.py',"captured=c.timestamp(review['captured_at']);expiry=lease(review,captured)","captured=c.timestamp(review['captured_at']);expiry=reviewed_lease(review,captured,request['purpose'],ended,ended-dt.timedelta(seconds=cold['span_seconds']))")
+ b.exact('recovery/evidence_contract.py',"min(expiry,ended+dt.timedelta(seconds=900)).isoformat(),'evidence_sha256':digest", "min(expiry,ended+dt.timedelta(seconds=purpose_lease(request['purpose']))).isoformat(),'evidence_sha256':digest")
+ b.exact('recovery/evidence_contract.py',"review=obj(pair['review']);review_people(review);expiry=lease(review,at)","review=obj(pair['review']);review_people(review);expiry=reviewed_lease(review,at,request['purpose'],ended,ended-dt.timedelta(seconds=current['span_seconds']))")
+ b.exact('recovery/evidence_contract.py',"0<=(at-ended).total_seconds()<900,'refresh stale'", "0<=(at-ended).total_seconds()<purpose_lease(request['purpose']),'refresh stale'")
+ b.exact('recovery/evidence_contract.py',"min(expiry,ended+dt.timedelta(seconds=900)).isoformat(),'evidence_sha256':sha", "min(expiry,ended+dt.timedelta(seconds=purpose_lease(request['purpose']))).isoformat(),'evidence_sha256':sha")
+ b.exact('recovery/evidence_contract.py',"c.remaining(rec,at);p=profile()", "raw_remaining(rec,at,purpose);p=profile()")
+ b.exact('recovery/evidence_contract.py',"review=obj(env['original_review']);review_people(review);expiry=lease(review,at)","review=obj(env['original_review']);review_people(review)\n if (c.timestamp(review['expires_at'])-c.timestamp(review['captured_at'])).total_seconds()>900:\n  started=c.timestamp(result['capture_started_at']);require(started<=c.timestamp(rec['captured_at']),'raw capture timing order')\n else:started=None\n expiry=reviewed_lease(review,at,cold['purpose'],c.timestamp(rec['captured_at']),started)")
+ b.exact('recovery/evidence_contract.py',"c.timestamp(rec['captured_at'])+dt.timedelta(seconds=900)","c.timestamp(rec['captured_at'])+dt.timedelta(seconds=purpose_lease(cold['purpose']))")
+ b.exact('core/workflow.py','if request["phase"] in {"probe", "activate", "rollback", "install"}:','if request["phase"] in PHASES:')
+ b.exact('recovery/recovery.py'," native=c.backend(m,cold['boot_id'],tx", " capture_started_at=c.now().isoformat()\n native=c.backend(m,cold['boot_id'],tx")
+ b.exact('recovery/recovery.py',"'purpose':cold['purpose'],'reconciliation':", "'purpose':cold['purpose'],**({'capture_started_at':capture_started_at} if cold['purpose']=='directory' else {}),'reconciliation':")
+ # Rebase and pin a complete independent disabled writer set in dependency order.
+ for key in ('recovery/common.py','scanner/runner.py','scanner/stage2_deploy.py'):
+  b.exact(key,'tools/'+Path(base['directories']['core']).name,'tools/'+DEST['core'].name)
+ for key in ('core/cold_bridge.py','scanner/runner.py','scanner/stage2_deploy.py'):
+  b.exact(key,'tools/'+Path(base['directories']['recovery']).name,'tools/'+DEST['recovery'].name)
+ for key,name in [('core/bounded_stage.py','ADAPTER_SHA'),('core/probe_host.py','ADAPTER_SHA')]:
+  b.set(key,name,a.assignment(b.files[key],name)[0],b.digest('core/android_directory_adapter.py'))
+ pins={name:b.digest('core/'+name+'.py') for name in a.assignment(b.files['recovery/common.py'],'PINS')[0]}
+ b.set('recovery/common.py','PINS',a.assignment(b.files['recovery/common.py'],'PINS')[0],pins)
+ rm=b.files_manifest('recovery/MANIFEST.json','recovery')
+ rm.update(default_disabled=False,device_io_enabled=False,enabled=['observe_historical_dependency_only_never_invoked_here'],runtime_directory=str(DEST['core']),runtime_pins=pins,status='PREPARED_WRITERS_DISABLED_OBSERVER_BYTES_PRESERVED',base_budget_manifest=base['files']['recovery/MANIFEST.json'],directory_budget_seconds=10800)
+ b.put('recovery/MANIFEST.json',rm)
+ b.set('core/cold_bridge.py','SOURCE_SHA256',a.assignment(b.files['core/cold_bridge.py'],'SOURCE_SHA256')[0],b.digest('recovery/evidence_contract.py'))
+ b.set('core/cold_bridge.py','DEPENDENCIES',a.assignment(b.files['core/cold_bridge.py'],'DEPENDENCIES')[0],{n:b.digest('recovery/'+n) for n in ('common.py','observe.py')})
+ sm=b.obj('scanner/ARTIFACT_MANIFEST.json');sm['host_execution_disabled']=True;sm['host_source_sha256']=b.digest('scanner/stage2_deploy.py');sm['runner_source_sha256']=b.digest('scanner/runner.py')
+ sm['core']={n:b.binding('core/'+n) for n in sm['core']};sm['cold_contract']=b.binding('recovery/evidence_contract.py');sm['cold_dependencies']={n:b.binding('recovery/'+n) for n in sm['cold_dependencies']}
+ for name in ('archiver','scanner'):
+  key='scanner/'+Path(sm['artifacts'][name]['path']).relative_to(base['directories']['scanner']).as_posix();sm['artifacts'][name]=b.binding(key,True)
+ b.put('scanner/ARTIFACT_MANIFEST.json',sm)
+ b.exact('acceptance/collect.sh',original['acceptance/collect.py'].decode(),b.files['acceptance/collect.py'].decode())
+ am=b.files_manifest('acceptance/MANIFEST.json','acceptance');am['default_disabled']=True;b.put('acceptance/MANIFEST.json',am)
+ cm=b.obj('core/SOURCE_MANIFEST.json');cm['modules']={n:b.digest('core/'+n+'.py') for n in cm['modules']};cm['deployment_manifest']=b.binding('scanner/ARTIFACT_MANIFEST.json');cm['recovery_manifest']=b.binding('recovery/MANIFEST.json');cm['nv_geometry']=b.binding('core/nv_geometry.json');cm['artifacts']['scanner']=copy.deepcopy(sm['artifacts']['scanner']);b.put('core/SOURCE_MANIFEST.json',cm)
+ b.set('core/workflow.py','MANIFEST_SHA',sha(original['core/SOURCE_MANIFEST.json']),b.digest('core/SOURCE_MANIFEST.json'))
+ assert b.files['recovery/observe.py']==original['recovery/observe.py']
+ assert b.files['core/bounded_transport.py']==original['core/bounded_transport.py']
+ for key,raw in b.files.items():
+  if key.endswith('.py'):ast.parse(raw.decode())
+  if key.endswith('.ENABLED'):assert raw==original[key]
+ for p in DEST.values():a.mkdir(p)
+ for key,raw in sorted(b.files.items()):
+  path=Path(b.path(key));parents=[];p=path.parent
+  while p not in DEST.values() and not p.exists():parents.append(p);p=p.parent
+  for p in reversed(parents):a.mkdir(p)
+  a.write_new(path,raw)
+ for k,v in b.files.items():a.read(b.path(k),sha(v),len(v))
+ for k,v in base['files'].items():a.read(v['path'],v['sha256'],v['bytes'])
+ patch=''.join(''.join(difflib.unified_diff(original[k].decode().splitlines(True),v.decode().splitlines(True),fromfile='frozen/'+k,tofile='budget-prepare/'+k)) for k,v in sorted(b.files.items()) if original[k]!=v)
+ a.write_new(HERE/'CHANGES.patch',patch.encode());a.write_new(HERE/'EDITS.json',a.encode(b.edits))
+ result={'schema':'e5-finite-directory-budget-preparation-v1','base_result':{'path':str(BASE),'sha256':BASE_SHA},'directories':{k:str(v) for k,v in DEST.items()},'files':{k:b.binding(k,True) for k in sorted(b.files)},'phase_caps':{'probe':900,'inventory':3600,'backup':5400,'stage':7200,'activate':5400,'rollback':5400,'install':3600},'directory_evidence_seconds':10800,'policy_not_before':not_before,'writes_deploy_recovery_acceptance_disabled':True,'observer_preserved_enabled_dependency_not_invoked':True,'per_request_seconds_unchanged':{'remote':6,'host':8},'historical_sources_and_state_unchanged':True,'field_evidence_or_review_created':False,'device_io_performed':False,'independent_review_pending':True}
+ a.write_new(HERE/'RESULT.json',a.encode(result));print(sha(a.encode(result)))
+if __name__=='__main__':main()

@@ -1,0 +1,536 @@
+#!/usr/bin/env python3
+"""Prepared Android directory adapter. Device I/O is unconditionally disabled.
+
+No CLI/environment switch enables transport. This module contains the future
+ordinary-file operations, not a flasher. Boot/misc writes and reboot are absent.
+The caller must bind a fresh reviewed transaction, cold-start evidence, a whole
+directory backup and the separately tested state machine before activation.
+"""
+from __future__ import annotations
+from dataclasses import dataclass
+from datetime import datetime, timezone
+import gzip
+import tempfile
+import time
+import uuid
+import bounded_transport as transport_api
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import subprocess
+import tarfile
+
+DEVICE_IO_DISABLED = True
+ROOT = Path(__file__).resolve().parents[2]
+SHARED_STATE_DIR = ROOT / "evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED"
+READ_CHUNK = 16 << 20
+WRITE_CHUNK = 4 << 20
+STAT_FORMAT = "%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T"
+MAX_INVENTORY = 1 << 20
+SERIAL = "DEVICE_SERIAL_REDACTED"
+BB = "/data/adb/magisk/busybox"
+SU = "/debug_ramdisk/su"
+ROLES = {"active": "e5linux", "stage": "e5linux.stage.",
+         "archive": "e5linux.archive.", "failed": "e5linux.failed."}
+MOVES = {"move-active-to-archive": ("active", "archive"),
+         "move-stage-to-active": ("stage", "active"),
+         "move-active-to-failed": ("active", "failed"),
+         "move-archive-to-active": ("archive", "active")}
+STAGE_INPUTS = {"openwrt.ext4.gz", "device-files.tar", "openwrt-install.conf",
+                "boot.img", "fscrypt-probe"}
+RAW_SHA256 = "0000000000000000000000000000000000000000000000000000000000000000"
+PINNED_STAGE = {
+    "openwrt.ext4.gz": (149230668, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "device-files.tar": (60661760, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "openwrt-install.conf": (123, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "boot.img": (67108864, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "fscrypt-probe": (716192, "0000000000000000000000000000000000000000000000000000000000000000"),
+}
+PROFILE = Path(__file__).resolve().parent.parent / "e5_android_install_live_20261013/device-profile.json"
+PROFILE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+
+class Refusal(RuntimeError):
+    pass
+
+class DeviceOperationError(Refusal):
+    def __init__(self, result):
+        super().__init__("device operation uncertain/failed; inspect, do not retry")
+        self.returncode, self.stdout, self.stderr = result.returncode, result.stdout, result.stderr
+
+def require(value, message):
+    if not value:
+        raise Refusal(message)
+
+def sha_file(path):
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+def valid_sha(value):
+    return isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) is not None
+
+@dataclass(frozen=True)
+class Artifact:
+    path: Path
+    size: int
+    sha256: str
+
+    def verify(self):
+        p = Path(self.path)
+        require(p.is_file() and not p.is_symlink(), "input is not a regular file")
+        require(all(not q.is_symlink() for q in p.absolute().parents), "input parent symlink")
+        st = p.stat()
+        require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1, "input type/link count")
+        require(type(self.size) is int and self.size > 0 and st.st_size == self.size,
+                "input size mismatch")
+        require(valid_sha(self.sha256) and sha_file(p) == self.sha256, "input hash mismatch")
+        return p
+
+def tree_digest(rows):
+    return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+def verify_backup_tar(path, snapshot):
+    """Read only: prove a complete archive, never extract untrusted members."""
+    expected = {r["path"]: r for r in snapshot["rows"]}
+    seen = set()
+    with tarfile.open(path, "r:") as archive:
+        for m in archive:
+            name = m.name.rstrip("/") or "."
+            require(name in expected and name not in seen, "archive unknown/duplicate member")
+            seen.add(name); row = expected[name]
+            require((m.isdir() and row["type"] == "d") or (m.isfile() and row["type"] == "f"),
+                    "archive links/types forbidden")
+            require(m.uid == row["uid"] and m.gid == row["gid"] and m.mode == int(row["mode"], 8),
+                    "archive ownership/mode mismatch")
+            if m.isfile():
+                require(m.size == row["bytes"], "archive member length mismatch")
+                h = hashlib.sha256()
+                with archive.extractfile(m) as f:
+                    for b in iter(lambda: f.read(1 << 20), b""): h.update(b)
+                require(h.hexdigest() == row["sha256"], "archive member hash mismatch")
+    require(seen == set(expected), "archive missing entries")
+    return {"bytes": Path(path).stat().st_size, "sha256": sha_file(path),
+            "tree_sha256": snapshot["tree_sha256"], "complete": True}
+
+def prepare_raw_image(compressed, output):
+    """Host-only bounded-memory decompression. Keeps partial output on failure."""
+    compressed.verify();output=Path(output)
+    require(output.is_absolute() and not output.exists() and not output.is_symlink() and all(not q.is_symlink() for q in output.parents),'new raw host path required')
+    require(os.statvfs(output.parent).f_bavail*os.statvfs(output.parent).f_frsize>(2<<30)+(64<<20),'host raw space')
+    before=compressed.path.stat();h=hashlib.sha256();size=0
+    fd=os.open(output,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as dest,gzip.open(compressed.path,'rb') as source:
+        for data in iter(lambda:source.read(1<<20),b''):
+            size+=len(data);require(size<=2<<30,'raw image too large');h.update(data);dest.write(data)
+        dest.flush();os.fsync(dest.fileno())
+    transport_api.fsync_dir(output.parent)
+    require(compressed.path.stat()==before and size==2<<30 and h.hexdigest()==RAW_SHA256,'raw pristine image differs')
+    return Artifact(output,size,h.hexdigest())
+
+def parse_stat(raw):
+    p=raw.decode('ascii').split('|');require(len(p)==14,'stat fields')
+    mode=int(p[0],16)
+    return dict(mode_bits=mode,dev=int(p[1]),inode=int(p[2]),bytes=int(p[3]),mode=p[4],uid=int(p[5]),gid=int(p[6]),
+        nlink=int(p[7]),mtime=p[8],ctime=p[9],mtime_text=p[10],ctime_text=p[11],rdev_major=int(p[12],16),rdev_minor=int(p[13],16),
+        type='f' if stat.S_ISREG(mode) else 'd' if stat.S_ISDIR(mode) else 'b' if stat.S_ISBLK(mode) else 'unknown')
+
+def relative(name):
+    require(name=='.' or isinstance(name,str) and re.fullmatch(r'\./[A-Za-z0-9_./-]+',name) and
+            '..' not in name.split('/') and '//' not in name,'unsafe relative path')
+    return name
+
+def fail_closed(method):
+    def wrapped(self,*args,**kwargs):
+        try:return method(self,*args,**kwargs)
+        except BaseException as exc:
+            self._hash_cache.clear()
+            if self.transport is not None:
+                try:self.transport.mark_uncertain(type(exc).__name__+': '+str(exc))
+                except BaseException:pass
+            raise
+    wrapped.__name__=method.__name__
+    return wrapped
+
+class AndroidDirectoryAdapter:
+    def __init__(self,adb,helper,txid,boot_id,*,scanner,io_helper,evidence_dir,cancel_event=None,transaction_deadline=None):
+        require(re.fullmatch(r'[a-f0-9]{16}',txid) is not None,'txid')
+        require(re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',boot_id) is not None,'boot ID')
+        self.adb,self.helper,self.scanner,self.io_helper=adb,helper,scanner,io_helper
+        self.txid,self.boot_id=txid,boot_id;self.evidence_dir=Path(evidence_dir);self.cancel_event=cancel_event
+        self.transaction_deadline=transaction_deadline;self.transport=None;self.rename_lease=None;self._part=None;self._hash_cache={}
+        self.remote_helper='/data/local/tmp/e5-clean-helper.'+txid
+        self.remote_scanner='/data/local/tmp/e5-clean-scanner.'+txid
+        self.remote_io='/data/local/tmp/e5-clean-io.'+txid
+        self.lock='/data/local/tmp/e5-clean-directory.lock'
+    def path(self,role):
+        require(role in ROLES,'unknown role');return '/data/'+ROLES[role]+('' if role=='active' else self.txid)
+    def _enabled(self):
+        require(not DEVICE_IO_DISABLED,'DEVICE_IO_DISABLED: preparation only')
+    def _ensure_transport(self):
+        self._enabled()
+        require(type(self.transaction_deadline) in (int,float) and math.isfinite(self.transaction_deadline) and
+                0<self.transaction_deadline-time.monotonic()<=7200,'finite future transaction deadline of at most 7200 seconds required')
+        require(self.cancel_event is not None and callable(getattr(self.cancel_event,'is_set',None)) and
+                not self.cancel_event.is_set(),'explicit unset cancellation event required')
+        if self.transport is None:
+            self.adb.verify()
+            if not SHARED_STATE_DIR.exists():SHARED_STATE_DIR.mkdir(mode=0o700);transport_api.fsync_dir(SHARED_STATE_DIR.parent)
+            self.transport=transport_api.BoundedTransport(self.evidence_dir,SHARED_STATE_DIR,SERIAL,self.boot_id,self.txid,cancel_event=self.cancel_event)
+        return self.transport
+    def _guard(self):
+        return f'''set -eu
+set -o pipefail
+set -C
+test "$(id -u)" = 0
+test "$(getprop ro.serialno)" = {SERIAL}
+test "$(getprop ro.boot.slot_suffix)" = _a
+test "$(getprop sys.boot_completed)" = 1
+test "$(getprop gsm.sim.state)" = ABSENT,ABSENT
+test "$(getprop ro.product.model)" = E5
+test "$(getprop ro.board.platform)" = ums9621
+test "$(getprop ro.build.display.id)" = TS305_V03_20241128_2301
+test "$(cat /proc/sys/kernel/random/boot_id)" = {self.boot_id}
+test ! -L /data; test ! -L /data/local; test ! -L /data/local/tmp
+test "$(readlink -f /data)" = /data
+test "$(awk '$2=="/data" {{n++}} END {{print n+0}}' /proc/mounts)" = 1
+data_source=$(awk '$2=="/data" {{print $1}}' /proc/mounts)
+case "$data_source" in /dev/block/by-name/userdata|/dev/block/mmcblk0p70) ;; *) exit 83;; esac
+test "$(readlink -f "$data_source")" = /dev/block/mmcblk0p70
+test "$(readlink -f /dev/block/by-name/userdata)" = /dev/block/mmcblk0p70
+test "$(readlink -f /dev/block/mmcblk0p70)" = /dev/block/mmcblk0p70
+test -b /dev/block/mmcblk0p70
+test "$(stat -c '%t:%T' /dev/block/mmcblk0p70)" = 103:3f
+test "$(cat /sys/class/block/mmcblk0p70/dev)" = 259:63
+test "$(awk '$2=="/data" {{print $3}}' /proc/mounts)" = f2fs
+awk '$2=="/data" && $4 ~ /(^|,)rw(,|$)/ && $4 !~ /(^|,)ro(,|$)/ {{ok++}} END {{exit !(ok==1)}}' /proc/mounts
+'''
+    def _locked(self):
+        return f'test -d {self.lock}; test ! -L {self.lock}; test ! -L {self.lock}/owner; test "$(cat {self.lock}/owner)" = {self.txid}\n'
+    def _request(self,label,script,*,payload=b'',limit=MAX_INVENTORY,validator=lambda b:b,mutating=False,followup=None,op_id=None):
+        self._enabled();t=self._ensure_transport();op_id=op_id or uuid.uuid4().hex
+        command=self._guard()+script
+        if not mutating:
+            command=BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(command)
+        argv=[str(self.adb.path),'-s',SERIAL,'shell','-T',SU+' -c '+shlex.quote(command)]
+        if self._part is not None:
+            require(not mutating and followup is None,'nested mutation forbidden')
+            return self._part(label,argv,payload=payload,output_limit=limit,validator=validator,metadata={'op_id':op_id})
+        def finish(ack,part):
+            self._part=part
+            try:return followup(ack) if followup is not None else ack
+            finally:self._part=None
+        return t.request(label,argv,payload=payload,output_limit=limit,validator=validator,mutating=mutating,
+            followup=finish if followup is not None else None,op_id=op_id,transaction_deadline=self.transaction_deadline)
+    def _shell(self,script,payload=None,timeout=8):
+        self._enabled()
+        raise Refusal('legacy free-form shell interface removed; use fixed operations')
+    def _clock(self):
+        def parse(raw):
+            p=raw.decode().split();require(len(p)==2 and re.fullmatch(r'[0-9]+(?:\.[0-9]+)?',p[0]),'remote clock');return int(float(p[0])*1000)
+        return self._request('clock','cat /proc/uptime\n',limit=128,validator=parse)
+    def _deadline(self):return self._clock()+5000
+    def _check_path(self,path):
+        require(isinstance(path,str) and re.fullmatch(r'/[A-Za-z0-9_./-]+',path) and '..' not in path.split('/'),'read path')
+        if path in (self.remote_helper,self.remote_scanner,self.remote_io):return 'f'
+        for role in ROLES:
+            base=self.path(role)
+            if path.startswith(base+'/'):relative('./'+path[len(base)+1:]);return 'f'
+        profile=self._profile()
+        if path=='/dev/block/mmcblk0' or path in {v['node'] for k,v in profile['partitions'].items() if k in set(profile['protected_hashes'])|{'boot_b','misc'}}:return 'b'
+        raise Refusal('read path outside scope')
+    def _read_once(self,path,offset,length,hash_only=False):
+        typ=self._check_path(path);require(type(offset) is int and offset>=0 and offset%4096==0 and 0<length<=READ_CHUNK,'read range')
+        if typ=='b':
+            if path=='/dev/block/mmcblk0':maximum=32768
+            else:maximum=next(v['bytes'] for v in self._profile()['partitions'].values() if v['node']==path)
+            require(offset+length<=maximum,'read beyond fixed partition')
+        op=uuid.uuid4().hex;pipe=f' | {BB} sha256sum' if hash_only else '' 
+        checks=f'test ! -L {path}; test "$(readlink -f {path})" = {path}; test -{typ} {path}\n'
+        if typ=='f':checks+=f'test "$(stat -c %h {path})" = 1\n'
+        script=checks+f'''printf 'META\\t{op}\\t{self.boot_id}\\t{path}\\t{offset}\\t{length}\\t'
+stat -c '{STAT_FORMAT}' {path}
+{BB} dd if={path} bs=4096 skip={offset//4096} count={length} iflag=count_bytes status=none{pipe}
+printf '\\nEND\\t{op}\\t%s\\t{path}\\t{offset}\\t{length}\\t' "$(cat /proc/sys/kernel/random/boot_id)"
+stat -c '{STAT_FORMAT}' {path}
+'''
+        payload_length=68 if hash_only else length
+        def parse(raw):
+            first,sep,body=raw.partition(b'\n');require(sep and len(body)>payload_length,'short read')
+            data,tail=body[:payload_length],body[payload_length:]
+            require(tail.startswith(b'\nEND\t') and tail.endswith(b'\n') and tail.count(b'\n')==2,'read framing')
+            a=first.split(b'\t',6);b=tail[1:-1].split(b'\t',6)
+            require(len(a)==len(b)==7 and a[0]==b'META' and a[1:]==b[1:] and a[1:6]==[op.encode(),self.boot_id.encode(),path.encode(),str(offset).encode(),str(length).encode()],'read identity/offset')
+            meta=parse_stat(a[6]);require(meta['type']==typ and (typ!='f' or meta['nlink']==1),'read inode type')
+            if typ=='b' and path!='/dev/block/mmcblk0':
+                found=[v for v in self._profile()['partitions'].values() if v['node']==path];require(len(found)==1 and f"{meta['rdev_major']}:{meta['rdev_minor']}"==found[0]['dev'],'block device identity')
+            return data,meta
+        return self._request('hash-chunk' if hash_only else 'read-chunk',script,limit=payload_length+4096,validator=parse,op_id=op)
+    def _read_twice(self,path,offset,length,expected=None):
+        # Each call is bounded; enclosing mutation followup keeps ACTIVE until both pass.
+        data,meta=self._read_once(path,offset,length)
+        line,again=self._read_once(path,offset,length,True)
+        require(meta==again and (expected is None or meta==expected),'file metadata changed')
+        require(re.fullmatch(rb'[a-f0-9]{64}  -\n',line) and line[:64].decode()==hashlib.sha256(data).hexdigest(),'independent chunk SHA differs')
+        return data,meta
+    def _hash(self,path,size,expected=None,sink=None):
+        h=hashlib.sha256();first=expected
+        for offset in range(0,size,READ_CHUNK):
+            data,meta=self._read_twice(path,offset,min(READ_CHUNK,size-offset),first)
+            require(meta['type']!='f' or meta['bytes']==size,'full file length differs')
+            first=meta;h.update(data)
+            if sink is not None:sink.write(data);sink.flush();os.fsync(sink.fileno())
+        return h.hexdigest(),first
+    def _profile(self):
+        require(PROFILE.is_file() and not PROFILE.is_symlink() and sha_file(PROFILE)==PROFILE_SHA,'profile changed')
+        return json.loads(PROFILE.read_text())
+    def _native_records(self,raw,op,deadline,schema=None):
+        rows=[json.loads(line) for line in raw.splitlines()]
+        require(2<=len(rows)<=256,'native record count')
+        for r in rows:
+            require(r.get('op_id',r.get('opid'))==op and r.get('boot_id')==self.boot_id and r.get('txid')==self.txid,'native identity')
+            require(r.get('deadline_ms')==deadline,'native deadline binding')
+            if schema is not None:require(r.get('schema')==schema,'native schema')
+        return rows
+    def occupancy(self):
+        self._enabled();self.verify_file(self.remote_scanner,self.scanner.size,self.scanner.sha256)
+        op=uuid.uuid4().hex;deadline=self._deadline()
+        def parse(raw):
+            rows=self._native_records(raw,op,deadline,'e5-native-occupancy-v1');last=rows[-1]
+            require(last.get('complete') is True and last.get('event')=='RESULT' and last.get('unknown')==[],'incomplete occupancy scan')
+            require(all(type(last.get(k)) is int and last[k]>=0 for k in ('processes','fds','namespaces','loops','tree_entries','read_bytes')) and last['processes']>0 and last['namespaces']>0,'scanner coverage counters')
+            return last
+        return self._request('occupancy',f'{self.remote_scanner} scan {self.txid} {self.boot_id} {op} {deadline}\n',limit=262144,validator=parse,op_id=op)
+    def _inventory(self,role):
+        p=self.path(role)
+        script=f'''test ! -L {p}; test -d {p}; test "$(readlink -f {p})" = {p}
+cd {p}
+{BB} find . -xdev -print0 | {BB} sort -z | while IFS= read -r -d '' f; do
+ case "$f" in *[!a-zA-Z0-9_./-]*) exit 83;; esac
+ test ! -L "$f"
+ if test -f "$f"; then test "$(stat -c %h "$f")" = 1; elif test -d "$f"; then :; else exit 84; fi
+ printf '%s\\0' "$f"; stat -c '{STAT_FORMAT}' "$f" | tr -d '\\n'; printf '\\0'
+done
+'''
+        def parse(raw):
+            parts=raw.split(b'\0');require(parts[-1]==b'' and len(parts)%2==1 and 2<=len(parts)<=8193,'inventory NUL structure')
+            rows=[{'path':relative(parts[i].decode('ascii')),**parse_stat(parts[i+1])} for i in range(0,len(parts)-1,2)]
+            require(rows and rows[0]['path']=='.' and rows[0]['type']=='d' and len({r['path'] for r in rows})==len(rows) and len({r['dev'] for r in rows})==1,'inventory identity')
+            require(all(r['type'] in ('d','f') and (r['type']=='d' or r['nlink']==1) for r in rows),'inventory special/link')
+            require(sum(r['bytes'] for r in rows if r['type']=='f')<=16<<30,'inventory bytes')
+            return rows
+        return self._request('inventory',script,validator=parse)
+    @fail_closed
+    def inspect(self,role):
+        self._enabled();self.occupancy();before=self._inventory(role);rows=[];new_cache={}
+        old_identities={(boot,json.loads(meta)['dev'],json.loads(meta)['inode']):meta for boot,meta in self._hash_cache}
+        for row in before:
+            if row['type']=='f':
+                meta=json.dumps({k:v for k,v in row.items() if k!='path'},sort_keys=True,separators=(',',':'))
+                prior=old_identities.get((self.boot_id,row['dev'],row['inode']))
+                if prior is not None and prior!=meta:self._hash_cache.clear();break
+        for row in before:
+            h='-'
+            if row['type']=='f':
+                meta={k:v for k,v in row.items() if k!='path'}
+                key=(self.boot_id,json.dumps(meta,sort_keys=True,separators=(',',':')))
+                h=self._hash_cache.get(key)
+                if h is None:h,_=self._hash(self.path(role)+'/'+row['path'][2:],row['bytes'],meta)
+                new_cache[key]=h
+            rows.append({**{k:row[k] for k in ('path','type','dev','inode','bytes','mode','uid','gid')},'sha256':h})
+        if self._inventory(role)!=before:
+            self._hash_cache.clear();raise Refusal('directory changed during inspect')
+        self.occupancy()
+        # Only this instance's previously double-read full hashes, keyed by exact
+        # inode and nanosecond stat + boot. Never used for write readback/backup.
+        self._hash_cache.update(new_cache)
+        return dict(schema='e5-device-directory-inventory-v1',role=role,txid=self.txid,boot_id=self.boot_id,rows=rows,tree_sha256=tree_digest(rows))
+    @fail_closed
+    def inventory_optional(self,role):
+        self._enabled();p=self.path(role)
+        raw=self._request('exists',f'test ! -L {p}; if test -e {p}; then test -d {p}; echo PRESENT; else echo ABSENT; fi\n',limit=32)
+        require(raw in (b'PRESENT\n',b'ABSENT\n'),'unknown existence');return self.inspect(role) if raw==b'PRESENT\n' else None
+    @fail_closed
+    def check_baseline(self):
+        self._enabled();p=self._profile();expected={**p['protected_hashes'],'boot_b':p['original_boot_b_sha256'],'misc':p['original_misc_sha256']}
+        for name,h in expected.items():
+            part=p['partitions'][name];got,_=self._hash(part['node'],part['bytes']);require(got==h,'original B/misc/protection differs: '+name)
+        return dict(boot_id=self.boot_id,serial=SERIAL,original_B_misc_restored=True,profile_sha256=PROFILE_SHA,hashes=expected)
+    @fail_closed
+    def fresh_gate(self,binding):
+        self._enabled();self.rename_lease=None
+        require(binding.get('txid')==self.txid and binding.get('boot_id')==self.boot_id and valid_sha(binding.get('request_sha256')),'fresh gate binding')
+        expires=datetime.fromisoformat(binding['expires_at']);require(expires.tzinfo and datetime.now(timezone.utc)<expires,'cold expiry')
+        receipt=self.check_baseline();p=self._profile()
+        # Geometry bounded one partition per request, no all-table long shell.
+        for name,item in sorted(p['partitions'].items()):
+            leaf=item['node'].rsplit('/',1)[-1]
+            script=f'readlink -f /dev/block/by-name/{name}\ncat /sys/class/block/{leaf}/dev\ncat /sys/class/block/{leaf}/size\ncat /sys/class/block/{leaf}/start\n'
+            raw=self._request('geometry',script,limit=512).decode().splitlines()
+            require(raw==[item['node'],item['dev'],str(item['bytes']//512),str(item['start_lba'])],'geometry differs')
+        data,_=self._read_twice('/dev/block/mmcblk0',0,32768)
+        require(hashlib.sha256(data).hexdigest()==p['gpt_prefix_sha256'],'GPT differs')
+        self.occupancy();now=datetime.now(timezone.utc);remaining=(expires-now).total_seconds()-5
+        require(0<remaining<=10800,'expired or invalid directory lease')
+        self.rename_lease=dict(expires_at=expires,request_sha256=binding['request_sha256'],uptime_limit=self._clock()+int(remaining*1000))
+        receipt.update(txid=self.txid,request_sha256=binding['request_sha256'],captured_at=now.isoformat(),expires_at=binding['expires_at'],gpt_prefix_sha256=p['gpt_prefix_sha256'],geometry_verified=True,partitions=p['partitions'],data={'node':'/dev/block/mmcblk0p70','fstype':'f2fs','rw':True})
+        return receipt
+    def _short_mutation(self,label,script,verify):
+        self._enabled();deadline=self._deadline();op=uuid.uuid4().hex
+        guarded=f"awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime\n"+script
+        return self._request(label,guarded,limit=4096,mutating=True,validator=lambda raw:raw,
+                             followup=lambda ack:verify(ack),op_id=op)
+    @fail_closed
+    def acquire(self):
+        self._enabled()
+        # Small bootstrap operation only; an interrupted mkdir/owner write is uncertain.
+        script=f'umask 077; mkdir {self.lock}; printf "%s\\n" {self.txid} > {self.lock}/owner\n'
+        return self._short_mutation('acquire',script,lambda ack:self._request('lock-readback',self._locked()+'printf "LOCK_OK\\n"\n',limit=32,
+            validator=lambda raw:raw if raw==b'LOCK_OK\n' else (_ for _ in ()).throw(Refusal('lock readback'))))
+    def _bootstrap(self,artifact,dest):
+        self._enabled();artifact.verify();require(0<artifact.size<=WRITE_CHUNK,'bootstrap size cap')
+        payload=artifact.path.read_bytes();require(len(payload)==artifact.size and hashlib.sha256(payload).hexdigest()==artifact.sha256,'bootstrap changed')
+        deadline=self._deadline()
+        script=self._locked()+f'''test ! -e {dest}; test ! -L {dest}
+awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime
+umask 077; cat > {dest}
+test "$(stat -c %s {dest})" = {artifact.size}
+'''
+        def verify(ack):
+            got,_=self._hash(dest,artifact.size);require(got==artifact.sha256,'bootstrap readback SHA')
+            return True
+        self._request('bootstrap-helper',script,payload=payload,limit=4096,mutating=True,followup=verify)
+        self._short_mutation('bootstrap-mode',self._locked()+f'chmod 700 {dest}\n',lambda ack:self._request('mode-readback',f'stat -c %a {dest}\n',limit=32,
+            validator=lambda raw:raw if raw==b'700\n' else (_ for _ in ()).throw(Refusal('bootstrap mode'))))
+    @fail_closed
+    def upload_helper(self):
+        self._enabled()
+        for item,dest in ((self.scanner,self.remote_scanner),(self.io_helper,self.remote_io),(self.helper,self.remote_helper)):
+            self._bootstrap(item,dest)
+    @fail_closed
+    def verify_file(self,remote,size,sha):
+        self._enabled();self._check_path(remote);require(type(size) is int and size>=0 and valid_sha(sha),'file binding')
+        got,_=self._hash(remote,size);require(got==sha,'file full SHA differs');return True
+    def _stage_identity(self):
+        p=self.path('stage')
+        def parse(raw):
+            words=raw.decode().split();require(len(words)==2 and all(w.isdigit() for w in words),'stage identity');return tuple(map(int,words))
+        return self._request('stage-identity',f'test ! -L {p}; test -d {p}; stat -c "%d %i" {p}\n',limit=128,validator=parse)
+    def _write_file_chunk(self,name,item,offset,payload,inode,stage_identity):
+        self._enabled();require(name in PINNED_STAGE or name in ('openwrt.ext4','boot-os','openwrt-default-boot'),'fixed stage filename')
+        require(len(payload)<=WRITE_CHUNK and len(payload)>0 and offset%WRITE_CHUNK==0 and offset+len(payload)<=item.size,'write chunk range')
+        self.occupancy();self.verify_file(self.remote_io,self.io_helper.size,self.io_helper.sha256)
+        op=uuid.uuid4().hex;deadline=self._deadline();d1,d2=stage_identity
+        script=self._locked()+f'{self.remote_io} write-file {self.txid} {self.boot_id} {op} {deadline} {d1} {d2} {inode} {offset} {len(payload)} {item.size} {name}\n'
+        def parse(raw):
+            records=self._native_records(raw,op,deadline);require(len(records)==2 and records[0].get('event')=='START' and records[0].get('action')=='write-file','native write START')
+            ack=records[-1]
+            require(ack.get('event')=='DONE' and ack.get('ok') is True and ack.get('action')=='write-file' and
+                ack.get('offset')==offset and ack.get('bytes')==len(payload) and ack.get('total')==item.size and
+                ack.get('size')==offset+len(payload) and ack.get('dev')==d1 and type(ack.get('inode')) is int and ack['inode']>0 and
+                (inode==0 or ack['inode']==inode) and ack.get('fsync_completed') is True,'native write incomplete/mismatched')
+            return ack
+        def verify(ack):
+            data,meta=self._read_twice(self.path('stage')+'/'+name,offset,len(payload))
+            require(data==payload and meta['inode']==ack['inode'] and meta['dev']==d1 and meta['bytes']==offset+len(payload),'stage chunk readback mismatch')
+            return ack
+        return self._request('write-stage-chunk',script,payload=payload,limit=8192,validator=parse,mutating=True,followup=verify,op_id=op)
+    @fail_closed
+    def stage(self,artifacts,raw_bytes,raw_sha256,*,raw_image=None):
+        self._enabled();require(set(artifacts)==STAGE_INPUTS and raw_bytes==2<<30 and raw_sha256==RAW_SHA256,'fixed candidate scope')
+        for name,item in artifacts.items():require((item.size,item.sha256)==PINNED_STAGE[name],'candidate changed');item.verify()
+        fields=dict(re.findall(r"^(E5_[A-Z_]+)='([^'\r\n]*)'$",artifacts['openwrt-install.conf'].path.read_text(),re.M))
+        require(fields.get('E5_DEFAULT_BOOT')=='android','default must remain Android')
+        # Expand on the Mac before creating any remote stage. Never gzip on device.
+        local=self.evidence_dir.parent/('raw-pristine-'+self.txid+'.ext4')
+        raw_image=raw_image or prepare_raw_image(artifacts['openwrt.ext4.gz'],local)
+        require((raw_image.size,raw_image.sha256)==(raw_bytes,raw_sha256),'raw input binding');raw_image.verify()
+        self.occupancy();p=self.path('stage')
+        required=(raw_bytes+sum(i.size for i in artifacts.values())+(1<<30)+1023)//1024
+        script=self._locked()+f'''test -d {self.path('active')}; test ! -L {self.path('active')}
+test ! -e {p}; test ! -L {p}
+test "$(df -Pk /data | tail -n 1 | awk '{{print $4}}')" -ge {required}
+umask 077; mkdir {p}
+'''
+        self._short_mutation('create-stage',script,lambda ack:self._stage_identity());identity=self._stage_identity()
+        inputs={**artifacts,'openwrt.ext4':raw_image}
+        for name,data in (('boot-os',b'openwrt\n'),('openwrt-default-boot',b'android\n')):
+            host=self.evidence_dir/(name+'.input');transport_api.save(host,data);inputs[name]=Artifact(host,len(data),hashlib.sha256(data).hexdigest())
+        for name in sorted(inputs):
+            item=inputs[name];item.verify();before=item.path.stat();inode=0;h=hashlib.sha256()
+            with item.path.open('rb') as f:
+                for offset in range(0,item.size,WRITE_CHUNK):
+                    payload=f.read(min(WRITE_CHUNK,item.size-offset));require(len(payload)==min(WRITE_CHUNK,item.size-offset),'short host input')
+                    h.update(payload);ack=self._write_file_chunk(name,item,offset,payload,inode,identity);inode=ack['inode']
+            require(item.path.stat()==before and h.hexdigest()==item.sha256,'host stage source changed')
+        probe=p+'/fscrypt-probe'
+        for name in ('',*sorted(inputs)):
+            target=p+('/'+name if name else '')
+            self._request('fscrypt-check',f'test "$({probe} {target})" = unencrypted\nprintf "UNENCRYPTED\\n"\n',limit=128,
+                validator=lambda raw:raw if raw==b'UNENCRYPTED\n' else (_ for _ in ()).throw(Refusal('fscrypt policy')))
+        return self.inspect('stage')
+    @fail_closed
+    def backup_to_mac(self,role,snapshot,output):
+        self._enabled();require(snapshot['role']==role and snapshot['txid']==self.txid and snapshot['boot_id']==self.boot_id,'backup identity')
+        require(self.inspect(role)==snapshot,'tree differs before backup');output=Path(output)
+        require(output.is_absolute() and not output.exists() and not output.is_symlink() and all(not p.is_symlink() for p in output.parents),'new host tar required')
+        before=self._inventory(role);files={}
+        require(os.statvfs(output.parent).f_bavail*os.statvfs(output.parent).f_frsize > 2*sum(r['bytes'] for r in before if r['type']=='f')+(64<<20),'insufficient host backup space')
+        # Ordinary host temporary files are kept if failure: no deletion of evidence.
+        folder=output.with_name(output.name+'.files');folder.mkdir(mode=0o700);transport_api.fsync_dir(folder.parent)
+        for n,row in enumerate(before):
+            if row['type']=='f':
+                dest=folder/f'{n:04d}.bin';fd=os.open(dest,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+                with os.fdopen(fd,'wb') as f:
+                    h,_=self._hash(self.path(role)+'/'+row['path'][2:],row['bytes'],{k:v for k,v in row.items() if k!='path'},f)
+                expected=next(x for x in snapshot['rows'] if x['path']==row['path']);require(h==expected['sha256'],'backup content differs')
+                files[row['path']]=dest
+        require(self._inventory(role)==before,'backup tree drift');self.occupancy()
+        fd=os.open(output,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+        with os.fdopen(fd,'wb') as raw,tarfile.open(fileobj=raw,mode='w',format=tarfile.PAX_FORMAT) as archive:
+            for row in before:
+                m=tarfile.TarInfo(row['path']);m.mode=int(row['mode'],8);m.uid=row['uid'];m.gid=row['gid'];m.mtime=int(row['mtime'])
+                if row['type']=='d':m.type=tarfile.DIRTYPE;archive.addfile(m)
+                else:
+                    m.size=row['bytes']
+                    with files[row['path']].open('rb') as f:archive.addfile(m,f)
+            archive.close();raw.flush();os.fsync(raw.fileno())
+        transport_api.fsync_dir(output.parent);verified=verify_backup_tar(output,snapshot)
+        verified.update(schema='e5-full-directory-backup-v1',txid=self.txid,boot_id=self.boot_id,role=role,path=str(output))
+        transport_api.save_json(output.with_name(output.name+'.verified.json'),verified);return verified
+    def _helper_call(self,action,source,snapshot):
+        self._enabled();require(action=='seal' or action in MOVES,'helper action')
+        require(snapshot['txid']==self.txid and snapshot['boot_id']==self.boot_id and snapshot['role']==source,'snapshot binding')
+        if action!='seal':require(self.rename_lease and datetime.now(timezone.utc)<self.rename_lease['expires_at'],'no fresh rename lease')
+        require(self.inspect(source)==snapshot,'source changed');self.verify_file(self.remote_helper,self.helper.size,self.helper.sha256)
+        self.occupancy();parent=self._request('data-identity','stat -c "%d %i" /data\n',limit=128).decode().split()
+        require(len(parent)==2 and all(s.isdigit() for s in parent),'data identity')
+        root=snapshot['rows'][0];require(int(parent[0])==root['dev'],'source filesystem')
+        op=uuid.uuid4().hex;deadline=self._deadline()
+        if action!='seal':require(datetime.now(timezone.utc)<self.rename_lease['expires_at'] and deadline<=self.rename_lease['uptime_limit'],'rename lease expired')
+        args=[action,self.txid,self.boot_id,op,str(deadline),*parent,str(root['dev']),str(root['inode']),source]
+        def parse(raw):
+            rows=self._native_records(raw,op,deadline,'e5-native-directory-v3');ack=rows[-1]
+            require(ack.get('ok') is True and ack.get('event')=='RESULT' and ack.get('fsync_completed') is True and ack.get('action')==action and ack.get('renamed') is (action!='seal'),'native helper result')
+            return ack
+        target=source if action=='seal' else MOVES[action][1]
+        def verify(ack):
+            after=self.inspect(target);require(after['rows']==snapshot['rows'],'directory helper readback differs')
+            return after,ack
+        return self._request('directory-helper',self._locked()+self.remote_helper+' '+' '.join(args)+'\n',limit=262144,validator=parse,mutating=True,followup=verify,op_id=op)
+    @fail_closed
+    def seal(self,role,snapshot):return self._helper_call('seal',role,snapshot)[1]
+    @fail_closed
+    def move(self,action,snapshot):
+        self._enabled();require(action in MOVES,'move action');self.check_baseline();source,destination=MOVES[action]
+        dst=self.path(destination);self._request('destination-absent',self._locked()+f'test ! -e {dst}; test ! -L {dst}\n',limit=64)
+        result=self._helper_call(action,source,snapshot);self.check_baseline();return result
+
+if __name__=='__main__':
+    print(json.dumps({'status':'PREPARATION_ONLY','device_io_enabled':False,'no_cli_activation':True}))

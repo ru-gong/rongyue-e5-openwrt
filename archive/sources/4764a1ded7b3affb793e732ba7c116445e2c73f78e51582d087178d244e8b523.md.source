@@ -1,0 +1,11 @@
+# Closed descriptor compatibility repair
+
+The Oct19 native failure discarded three entire tables after ENOENT. Its final PID551/FD156 cursor does not identify the lost descriptor or the syscall. Prior code and prior live packages remain unchanged.
+
+An ENOENT acquisition now enters a bounded closed-slot witness: same retained live task identity before/after, NOFOLLOW lstat of the proc symlink returning ENOENT, and readlink returning ENOENT. A present proc link, dangling target, permission/error, task exit or reuse does not establish closure. The same still-open FD directory is rewound after collection: a pending slot must not reappear and every present numeric slot must have been inspected. Pending slots are then witnessed absent again. Unconfirmed errors retain the original discard/stop behavior. Protected paths/inodes remain sticky EBUSY.
+
+Two complete snapshots of the strict nonstream projection are still required within the original three rounds, 5 seconds, 32 MiB and 131072 acquisition observations/KCMP caps. The additional numeric re-enumeration has a separate global 131072-name cap. At most1024 pending slots per snapshot, 8 diagnostic records overall. These remain finite non-atomic observations; no proof of absent hidden references, future stability, power-loss safety or actual Android compatibility is claimed.
+
+The isolated Linux control is the pinned old scanner with only test synchronization inserted, so all three old attempts encounter a real close. Old control stops, repaired scanner completes with explicit confirmation counters. Reuse, new uninspected slots, sticky protected objects, failed acquisition while a link remains, permission errors, timeout/cancel and task exit are separately asserted. Test macros and test environment strings are absent in production ARM ELF.
+
+Continuation uses a new transaction and an archived exact STOP; it never replays the failed operation. A same-boot directory reconciliation is allowed only after source-validated fresh same-boot observation, linked to the original raw cold evidence, exact new state and the fixed last read-only STOP boot. Historical evidence gains no renewed lease by itself. Existing recovery proposal guards remain unchanged. Installation ranges and original B+BC32 recovery remain unchanged.

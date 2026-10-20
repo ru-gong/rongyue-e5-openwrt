@@ -1,0 +1,191 @@
+"""Independent mock-only adapter checks; no transport or subprocess allowed."""
+import hashlib
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import android_directory_adapter as a
+
+
+def sentinel(event, args):
+    if event.startswith("socket.") or event in (
+        "subprocess.Popen", "os.system", "os.posix_spawn", "os.posix_spawnp", "os.exec"
+    ):
+        raise AssertionError("independent review prohibits process/network")
+
+
+sys.addaudithook(sentinel)
+TX = "0123456789abcdef"
+BOOT = "00000000-0000-4000-8000-000000000001"
+
+
+class IndependentAdapterTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        p = Path(self.temp.name).resolve() / "never-executable"
+        p.write_bytes(b"host fixture only")
+        self.artifact = a.Artifact(p, p.stat().st_size, a.sha_file(p))
+        self.ad = a.AndroidDirectoryAdapter(self.artifact, self.artifact, TX, BOOT)
+        self.profile = json.loads(a.PROFILE.read_text())
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def baseline_output(self):
+        expected = dict(self.profile["protected_hashes"])
+        expected.update(boot_b=self.profile["original_boot_b_sha256"],
+                        misc=self.profile["original_misc_sha256"])
+        return "".join(h + "  " + self.profile["partitions"][n]["node"] + "\n"
+                       for n, h in sorted(expected.items())).encode()
+
+    def binding(self):
+        return dict(txid=TX, boot_id=BOOT, request_sha256="a" * 64,
+                    expires_at=(datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat())
+
+    def test_final_guard_and_disabled_gate(self):
+        self.assertIs(a.DEVICE_IO_DISABLED, True)
+        script = self.ad._guard()
+        for text in ("set -C", "print $4; print $5", "/proc/[0-9]*/mountinfo",
+                     "*e5linux*", "/proc/[0-9]*/fd/*", BOOT):
+            self.assertIn(text, script)
+        for role in a.ROLES:
+            self.assertIn(self.ad.path(role), script)
+        with patch.dict(os.environ, {"DEVICE_IO_DISABLED": "0", "E5_LIVE": "1"}):
+            for fn in (
+                self.ad.check_baseline,
+                lambda: self.ad.inventory_optional("active"),
+                lambda: self.ad.fresh_gate(self.binding()),
+                lambda: self.ad.move("move-active-to-archive", {}),
+            ):
+                with self.assertRaisesRegex(a.Refusal, "DEVICE_IO_DISABLED"):
+                    fn()
+
+    def test_fixed_artifact_map_matches_candidate(self):
+        root = Path(__file__).resolve().parents[2]
+        c = json.loads((root / "research/author-clean-reinstall-20261014/candidate.json").read_text())
+        names = {"openwrt.ext4.gz": "rootfs_gz", "device-files.tar": "device_files_tar",
+                 "openwrt-install.conf": "install_conf", "boot.img": "boot", "fscrypt-probe": "fscrypt_probe"}
+        self.assertEqual(set(a.PINNED_STAGE), set(names))
+        for dst, key in names.items():
+            self.assertEqual(a.PINNED_STAGE[dst],
+                             (c["artifacts"][key]["bytes"], c["artifacts"][key]["sha256"]))
+        self.assertEqual(a.RAW_SHA256, c["attestation"]["rootfs_checked_sha256"])
+
+    def test_baseline_success_is_readonly_and_binds_originals(self):
+        with patch.object(self.ad, "_shell", return_value=self.baseline_output()) as fake:
+            got = self.ad.check_baseline()
+        self.assertIs(got["original_B_misc_restored"], True)
+        self.assertEqual(got["boot_id"], BOOT)
+        self.assertEqual(len(got["hashes"]), 15)
+        script = fake.call_args.args[0]
+        self.assertNotIn(" of=", script)
+        self.assertEqual(script.count("sha256sum"), 15)
+
+    def test_baseline_bad_hash_stops(self):
+        bad = self.baseline_output().splitlines()
+        bad[0] = b"0" * 64 + bad[0][64:]
+        with patch.object(self.ad, "_shell", return_value=b"\n".join(bad) + b"\n") as fake:
+            with self.assertRaisesRegex(a.Refusal, "original B/misc"):
+                self.ad.check_baseline()
+            self.assertEqual(fake.call_count, 1)
+
+    def test_wrong_binding_precedes_baseline(self):
+        with patch.object(self.ad, "check_baseline", side_effect=AssertionError("must not run")):
+            with self.assertRaisesRegex(a.Refusal, "binding"):
+                self.ad.fresh_gate(dict(self.binding(), boot_id="another boot"))
+
+    def test_geometry_failure_precedes_gpt(self):
+        with patch.object(self.ad, "check_baseline", return_value={}), \
+             patch.object(self.ad, "_shell", return_value=b"wrong geometry\n") as fake:
+            with self.assertRaisesRegex(a.Refusal, "geometry"):
+                self.ad.fresh_gate(self.binding())
+            self.assertEqual(fake.call_count, 1)
+
+    def helper_fixture(self):
+        return dict(txid=TX, boot_id=BOOT, role="active",
+                    rows=[dict(dev=1, inode=2)], tree_sha256="a" * 64)
+
+    def test_helper_false_or_mismatched_receipt_refused(self):
+        snap = self.helper_fixture()
+        valid = dict(ok=True, fsync_completed=True, action="seal", renamed=False,
+                     power_loss_safety_proven=False)
+        for key, value in (("ok", False), ("fsync_completed", False),
+                           ("action", "move-active-to-archive"), ("renamed", True),
+                           ("power_loss_safety_proven", True)):
+            receipt = dict(valid, **{key: value})
+            with self.subTest(key=key), patch.object(self.ad, "inspect", return_value=snap), \
+                 patch.object(self.ad, "verify_file"), \
+                 patch.object(self.ad, "_shell", side_effect=[b"1 9\n", json.dumps(receipt).encode()]) as fake:
+                with self.assertRaisesRegex(a.Refusal, "helper result"):
+                    self.ad._helper_call("seal", "active", snap)
+                self.assertEqual(fake.call_count, 2)
+
+    def test_unknown_stage_hash_stops_without_transport(self):
+        inputs = {name: self.artifact for name in a.STAGE_INPUTS}
+        with patch.object(self.ad, "_shell", side_effect=AssertionError("must not run")):
+            with self.assertRaisesRegex(a.Refusal, "fixed clean-author"):
+                self.ad.stage(inputs, 2 << 30, a.RAW_SHA256)
+            with self.assertRaisesRegex(a.Refusal, "pristine rootfs"):
+                self.ad.stage(inputs, 2 << 30, "0" * 64)
+
+    def test_no_lease_prevents_rename_dispatch(self):
+        with patch.object(self.ad, "inspect", side_effect=AssertionError("must not hash")), \
+             patch.object(self.ad, "_shell", side_effect=AssertionError("must not dispatch")):
+            with self.assertRaisesRegex(a.Refusal, "no fresh reviewed rename lease"):
+                self.ad._helper_call("move-active-to-archive", "active", self.helper_fixture())
+
+    def test_expired_gate_revokes_old_lease_before_readback(self):
+        self.ad.rename_lease = dict(expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+                                   request_sha256="a" * 64, uptime_limit=1234.567)
+        expired = dict(self.binding(), expires_at=(datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat())
+        with patch.object(self.ad, "check_baseline", side_effect=AssertionError("must not read")):
+            with self.assertRaisesRegex(a.Refusal, "expired"):
+                self.ad.fresh_gate(expired)
+        self.assertIsNone(self.ad.rename_lease)
+
+    def test_invalid_binding_revokes_old_lease(self):
+        self.ad.rename_lease = dict(expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+                                   request_sha256="a" * 64, uptime_limit=1234.567)
+        with patch.object(self.ad, "check_baseline", side_effect=AssertionError("must not read")):
+            with self.assertRaisesRegex(a.Refusal, "binding"):
+                self.ad.fresh_gate(dict(self.binding(), request_sha256="invalid"))
+        self.assertIsNone(self.ad.rename_lease)
+
+    def test_hash_outlasting_lease_never_dispatches_helper(self):
+        before = datetime.now(timezone.utc)
+        expires = before + timedelta(seconds=1)
+        self.ad.rename_lease = dict(expires_at=expires, request_sha256="a" * 64, uptime_limit=1234.567)
+        snap = self.helper_fixture()
+        with patch.object(a, "datetime") as clock, \
+             patch.object(self.ad, "inspect", return_value=snap), \
+             patch.object(self.ad, "verify_file"), \
+             patch.object(self.ad, "_shell", return_value=b"1 9\n") as fake:
+            clock.now.side_effect = [before, expires + timedelta(seconds=1)]
+            with self.assertRaisesRegex(a.Refusal, "expired during full directory verification"):
+                self.ad._helper_call("move-active-to-archive", "active", snap)
+            self.assertEqual(fake.call_count, 1)
+            self.assertEqual(fake.call_args.args[0], "stat -c '%d %i' /data\n")
+
+    def test_rename_dispatch_carries_monotonic_deadline(self):
+        self.ad.rename_lease = dict(expires_at=datetime.now(timezone.utc) + timedelta(minutes=10),
+                                   request_sha256="a" * 64, uptime_limit=1234.567)
+        snap = self.helper_fixture()
+        receipt = dict(ok=True, fsync_completed=True, action="move-active-to-archive", renamed=True,
+                       power_loss_safety_proven=False)
+        with patch.object(self.ad, "inspect", return_value=snap), \
+             patch.object(self.ad, "verify_file"), \
+             patch.object(self.ad, "_shell", side_effect=[b"1 9\n", json.dumps(receipt).encode()]) as fake:
+            self.ad._helper_call("move-active-to-archive", "active", snap)
+        script = fake.call_args.args[0]
+        self.assertIn("awk '{exit !($1 < 1234.567)}' /proc/uptime\n", script)
+        self.assertTrue(script.endswith("move-active-to-archive " + TX + " 1 9 1 2 1234567\n"))
+        self.assertLess(script.index("/proc/uptime"), script.index(self.ad.remote_helper))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

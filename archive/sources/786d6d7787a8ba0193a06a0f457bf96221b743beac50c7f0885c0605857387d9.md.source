@@ -1,0 +1,24 @@
+# Android native-hang：仅离线准备
+
+`triage.py` 只有 `plan` 与 `parse-health` 两种主机模式，没有 ADB、USB、SSH、socket、subprocess、backend 导入或执行入口。`read-only-plan.json` 中的 shell 片段是供主代理另行审阅的请求数据，**本目录不会发送它们**。本轮没有设备运行；7 项测试均为合成 stdout／静态边界测试。
+
+本机已出现新的 Android native_hang_monitor 内核 panic，原 B 与 misc32 恢复尚未完成。这里的“通过”最多表示一条保存的 stdout 结构可解析，不代表冷启动、无卡、持续稳定、根因已解决或可以恢复。实际 identity、SIM、旧/新 pstore、保护区与独立风险评估继续由 `tools/e5_resume_prepare_20261013` 的计划器及主代理核验。
+
+## 主机用法
+
+- `python3 -B triage.py plan`：打印固定请求计划，不执行。
+- `python3 -B triage.py parse-health --saved-stdout <本地文件>`：解析已保存的一条轻量健康输出，不执行。
+- `python3 -B test_triage.py`：仅合成测试，audit hook 拒绝外部进程和网络。
+
+脚本明文仅读取属性、进程状态、挂载表、`/proc/monitor_enable` 和有界历史日志。没有块设备读取或写入；不调用 dumpsys、fsck、AT、ioctl、SysRq、kill、reboot、setprop、模块加载或任何 watchdog 控制。未来执行者必须使用单个完整引用的 root shell；不能重演只有 `id` 在 su 内、后续命令落回普通 shell 的引用错误。
+
+## 明日采集边界
+
+1. 用户确认已正常关机、冷启动和两 SIM 取出；仅新 boot ID 不足以证明冷启动。主代理确认授权与当前物理状态，先观察 Android 界面；不自动切 Linux。
+2. 从启动 120 秒以内开始，在同一 boot ID 下每 30 秒采一条轻量健康记录，跨度至少 600 秒。界面仍在启动、缺 root 授权或未解锁时标为等待／未满足；不能静默当作通过。
+3. 主机未来 transport 必须一次一条、最长 8 秒、应用各记录输出上限，并保存开始/结束时间、原始 stdout/stderr/退出码；本工具本身**没有实现这些执行上限**。一次超时即停整个采集，不开启另一并发命令或自动重试。杀掉主机 ADB 子进程不保证设备端卡住任务已结束。
+4. 启动后尽早保存 pstore；缺少某 pstore 文件应记录真实缺失，不能伪造空成功或清除旧日志。历史 panic 与本次新 panic 需靠 boot/时间/用户冷启动事实独立判读。请求失败、未知输出格式或日志截断均保留，不用替代命令绕过。
+5. `/proc/monitor_enable` 是只读 seq_show 状态；若缺失、禁用、计数非正或读超时则停止自动准入。不要写 `off`/`panic-off`/`timeout`，不要打开 `/dev/native_hang_monitor` 发 ioctl。计数回升可支持心跳在工作，单个正数不能证明一直正常。
+6. 只有此窗口及独审通过后，才另行讨论真实 GPT/13 保护分区/B/misc 读取；它们不在本计划中。分区读取阶段如再次超时、出现 I/O 错误或 boot ID 改变，停止写入准备。
+
+10 分钟是本次保守观察门，不是供应商稳定性保证。根因未知，不因短时通过而宣称已修复，也不自动生成 live-restore 请求或授权。

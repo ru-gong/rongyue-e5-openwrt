@@ -1,0 +1,105 @@
+#!/usr/bin/env python3
+"""HOST-ONLY actual cpio/ext4 static invocation inventory and AVB explanation.
+No mount, process, network, device or target program execution.
+"""
+from pathlib import Path
+import hashlib
+import importlib.util
+import json
+import stat
+import struct
+import sys
+
+def deny(event,args):
+    if event.startswith('socket.') or event in ('subprocess.Popen','os.system','os.posix_spawn','os.exec','pty.spawn'):
+        raise RuntimeError('host-readonly audit: forbidden process/network')
+sys.addaudithook(deny)
+import prepare as p
+
+PARSER=p.ROOT/'tools/e5_clean_author_prepare_v3_20261014/candidate_manifest.py'
+PARSER_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+PATTERNS=(b'fsck',b'f2fs_repair',b'repair_userdata')
+
+def text_hits(data):
+    # Preserve only matching lines; no unrelated settings or secret contents.
+    return [{'line':n,'text':line.decode('utf-8','replace')} for n,line in enumerate(data.splitlines(),1)
+            if any(token in line.lower() for token in PATTERNS)]
+
+def main():
+    p.input_file(PARSER,PARSER_SHA)
+    spec=importlib.util.spec_from_file_location('_fixed_host_ext4_reader',PARSER)
+    parser=importlib.util.module_from_spec(spec);spec.loader.exec_module(parser)
+    candidate=json.loads((p.OUT/'candidate.json').read_text());raw=p.OUT/'files/openwrt.ext4'
+    p.input_file(raw,candidate['outer_file_set']['openwrt.ext4']['sha256'],2<<30)
+    inventory={'regular_files':0,'regular_bytes':0,'directories':0,'symlinks':0,'other':0,'text_hits':{},'binary_token_hits':{},'skipped':[]}
+    with raw.open('rb') as source:
+        fs=parser.Ext4Reader(source,2<<30)
+        def payload(n):
+            i=fs.inode(n);size=fs.u32(i,4)+(fs.u32(i,108)<<32)
+            p.need(size<=256<<20,'unexpected huge rootfs member')
+            if size==0:return b''
+            p.need(fs.u32(i,32)&0x80000,'non-extent regular member')
+            out=bytearray(size)
+            for logical,count,physical in fs.extents(i[40:100]):
+                offset=logical*fs.bs;amount=min(count*fs.bs,max(0,size-offset))
+                if amount:out[offset:offset+amount]=fs.read(physical*fs.bs,amount)
+            return bytes(out)
+        def walk(n,path,seen):
+            i=fs.inode(n);mode=fs.u16(i,0)&0xf000
+            if mode==stat.S_IFDIR:
+                p.need(n not in seen,'directory inode cycle');inventory['directories']+=1
+                for name,child in fs.entries(n).items():walk(child,path+'/'+name,seen|{n})
+            elif mode==stat.S_IFREG:
+                b=payload(n);inventory['regular_files']+=1;inventory['regular_bytes']+=len(b)
+                if any(token in b.lower() for token in PATTERNS):
+                    item={'bytes':len(b),'sha256':p.sha(b)}
+                    if b'\0' not in b:
+                        item['lines']=text_hits(b);inventory['text_hits'][path]=item
+                    else:inventory['binary_token_hits'][path]=item
+            elif mode==stat.S_IFLNK:inventory['symlinks']+=1
+            else:inventory['other']+=1
+        walk(2,'',set())
+        selected={}
+        for name in ('etc/config/fstab','etc/init.d/fstab','etc/hotplug.d/block/10-mount','etc/init.d/e5-boot-ok','etc/uci-defaults/92-e5-default-boot','opt/e5/e5-next-boot'):
+            try:b=fs.file(name)
+            except parser.Missing:selected[name]={'present':False};continue
+            selected[name]={'present':True,'bytes':len(b),'sha256':p.sha(b)}
+            # Only these explicitly non-secret runtime policy files are saved.
+            dest=p.OUT/'path-audit-selected'/name;dest.parent.mkdir(parents=True,exist_ok=True)
+            p.save(dest,b)
+    old=(p.BASE/'boot.img').read_bytes();new=(p.OUT/'files/boot.img').read_bytes()
+    a=p.parse_boot(old);b=p.parse_boot(new);rows,_=p.parse_cpio(p.decompress_legacy(b['ramdisk']))
+    boot_hits={r['name']:{'bytes':len(r['data']),'sha256':p.sha(r['data']),'lines':text_hits(r['data'])}
+               for r in rows if stat.S_IFMT(r['fields'][1])==stat.S_IFREG and b'\0' not in r['data'] and any(x in r['data'].lower() for x in PATTERNS)}
+    # Parse the actual preserved AVB hash descriptor, without asserting signature
+    # validity or running an image tool. Header offsets follow libavb format.
+    vb=b['vbmeta'];p.need(vb[:4]==b'AVB0','vbmeta magic')
+    auth=struct.unpack_from('>Q',vb,12)[0];aux=struct.unpack_from('>Q',vb,20)[0]
+    desc_off,desc_len=struct.unpack_from('>QQ',vb,96)
+    pos=256+auth+desc_off;end=pos+desc_len;p.need(end<=len(vb) and 256+auth+aux<=len(vb),'vbmeta descriptor bounds')
+    descriptors=[]
+    while pos<end:
+        tag,length=struct.unpack_from('>QQ',vb,pos);stop=pos+16+length;p.need(stop<=end and stop>pos,'descriptor length')
+        item={'tag':tag,'bytes':stop-pos}
+        if tag==2:
+            image_size=struct.unpack_from('>Q',vb,pos+16)[0];algorithm=vb[pos+24:pos+56].split(b'\0',1)[0].decode()
+            pn,sn,dn,flags=struct.unpack_from('>IIII',vb,pos+56)
+            at=pos+132;p.need(at+pn+sn+dn<=stop,'hash descriptor payload')
+            name=vb[at:at+pn].decode();salt=vb[at+pn:at+pn+sn];digest=vb[at+pn+sn:at+pn+sn+dn]
+            p.need(image_size<=len(new) and algorithm in ('sha256','sha512'),'hash descriptor algorithm/length')
+            current=hashlib.new(algorithm,salt+new[:image_size]).digest()
+            previous=hashlib.new(algorithm,salt+old[:image_size]).digest()
+            item.update(partition=name,image_size=image_size,algorithm=algorithm,flags=flags,stored_digest=digest.hex(),
+                        new_calculated_digest=current.hex(),old_linux_calculated_digest=previous.hex(),
+                        matches_new_boot=current==digest,matches_old_linux_boot=previous==digest)
+        descriptors.append(item);pos=stop
+    report={'schema':'e5-no-auto-fsck-path-avb-audit-v1','device_io':False,'programs_executed':False,'network_io':False,
+        'rootfs':{'sha256':p.file_sha(raw),'reader_sha256':PARSER_SHA,**inventory,'selected':selected},
+        'boot_text_hits':boot_hits,'boot_sha256':p.sha(new),'vbmeta_blob_sha256':p.sha(vb),'vbmeta_unchanged':a['vbmeta']==vb,
+        'avb_descriptors':descriptors,'signature_verified':False,'new_signature_generated':False,
+        'boot_validation_dependency':'Uses the existing device-specific unlocked/verification-bypass chain. Preserving the old vbmeta is NOT a valid new AVB signature or hash verification.',
+        'automatic_repair_conclusion':'No init invocation/source of f2fs repair remains. Dormant repair script/binaries remain exact. Rootfs scan is a complete static token inventory, not proof about arbitrary compiled/kernel/proprietary paths.',
+        'independent_review_pending':True}
+    p.json_save(p.OUT/'path-and-avb-audit.json',report)
+    print(json.dumps({'regular_files':inventory['regular_files'],'text_hit_paths':list(inventory['text_hits']),'binary_hit_paths':list(inventory['binary_token_hits']),'descriptors':descriptors},indent=2))
+if __name__=='__main__':main()

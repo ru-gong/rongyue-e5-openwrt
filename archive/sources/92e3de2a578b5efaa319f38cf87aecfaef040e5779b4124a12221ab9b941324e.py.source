@@ -1,0 +1,50 @@
+"""Pure host seven-file overlay producer. Never imports a device runtime."""
+import ast, difflib, hashlib, json
+from pathlib import Path
+from retained_templates import STAGE, PHASE
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent
+BASE=ROOT/'tools/e5_activation_bundle_f588375605828811/RESULT.json'
+BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+sha=lambda b:hashlib.sha256(b).hexdigest()
+pin=lambda p:{'path':str(p),'bytes':p.stat().st_size,'sha256':sha(p.read_bytes())}
+def replace_function(source,name,new):
+    tree=ast.parse(source);matches=[n for n in ast.walk(tree) if isinstance(n,ast.FunctionDef) and n.name==name]
+    assert len(matches)==1;node=matches[0];lines=source.splitlines(True)
+    return ''.join(lines[:node.lineno-1])+new+'\n'+''.join(lines[node.end_lineno:])
+def replace_assignment(source,name,new):
+    t=ast.parse(source);matches=[n for n in t.body if isinstance(n,ast.Assign) and any(isinstance(x,ast.Name) and x.id==name for x in n.targets)]
+    assert len(matches)==1;node=matches[0];lines=source.splitlines(True)
+    return ''.join(lines[:node.lineno-1])+new+'\n'+''.join(lines[node.end_lineno:])
+assert sha(BASE.read_bytes())==BASE_SHA
+base=json.loads(BASE.read_bytes());case=json.loads((HERE/'CASE.json').read_bytes())
+oldpath=ROOT/'tools/e5_postdeployment_probe_stop_prepare_20261016/closure.py';oldsha='0000000000000000000000000000000000000000000000000000000000000000'
+assert sha(oldpath.read_bytes())==oldsha
+newpath=HERE/'closure.py';newsha=sha(newpath.read_bytes());casepath=HERE/'CASE.json';casesha=sha(casepath.read_bytes())
+paths={x['label']:x['path'] for x in case['retained_read_items']};assert len(paths)==24
+keys=['core/bounded_transport.py','core/bounded_boot_control.py','core/uncertainty_recovery.py','core/workflow.py','core/phase_evidence.py','recovery/common.py','scanner/stage2_deploy.py']
+out=HERE/'overlay';out.mkdir(exist_ok=True);files={};diff=[]
+for key in keys:
+    b=base['files'][key];p=Path(b['path']);raw=p.read_bytes();assert sha(raw)==b['sha256'];old=raw.decode()
+    s=old.replace(str(oldpath),str(newpath)).replace(oldsha,newsha)
+    if key=='core/bounded_boot_control.py':s=s.replace('DEVICE_IO_DISABLED = False','DEVICE_IO_DISABLED = True')
+    elif key=='core/workflow.py':s=s.replace('WORKFLOW_IO_DISABLED = False','WORKFLOW_IO_DISABLED = True')
+    elif key=='core/uncertainty_recovery.py':s=s.replace('RECOVERY_TRANSITION_DISABLED = False','RECOVERY_TRANSITION_DISABLED = True').replace('RECOVERY_POSTDEPLOY_TRANSITION.json','RECOVERY_CLOSED_FD_TRANSITION.json')
+    elif key=='recovery/common.py':s=s.replace("'RECOVERY_POSTDEPLOY_TRANSITION.json')","'RECOVERY_POSTDEPLOY_TRANSITION.json','RECOVERY_CLOSED_FD_TRANSITION.json')")
+    elif key=='scanner/stage2_deploy.py':
+        s=s.replace('DEVICE_IO_DISABLED=False','DEVICE_IO_DISABLED=True').replace("OLD_TX='4d6efbbcd48f2d73'","OLD_TX='171634616886fc1a'").replace("OLD_BOOT='00000000-0000-4000-8000-000000000001'","OLD_BOOT='00000000-0000-4000-8000-000000000001'")
+        s=replace_function(s,'_preserved_partial',STAGE)
+        s=replace_assignment(s,'RETAINED_PATHS','RETAINED_PATHS = '+repr(paths))
+    elif key=='core/phase_evidence.py':
+        s=s.replace("OLD_TX = '4d6efbbcd48f2d73'","OLD_TX = '171634616886fc1a'")
+        s=replace_assignment(s,'RETAINED_PATHS','RETAINED_PATHS = '+repr(paths))
+        s=replace_function(s,'partial_retained_proof',PHASE.replace('CASE_PATH',repr(str(casepath))).replace('CASE_SHA',repr(casesha)))
+    if key=='scanner/stage2_deploy.py':
+        target=" and request['boot_id']!=OLD_BOOT"
+        assert s.count(target)==1;s=s.replace(target,'')
+    assert s!=old,key;compile(s,key,'exec');dest=out/key;dest.parent.mkdir(parents=True,exist_ok=True);dest.write_text(s)
+    files[key]={**pin(dest),'base_path':str(p),'base_sha256':sha(raw)}
+    diff.extend(difflib.unified_diff(old.splitlines(True),s.splitlines(True),fromfile=str(p),tofile=str(dest)))
+(HERE/'consumer-overlay.patch').write_text(''.join(diff))
+manifest={'schema':'e5-postdeployment-probe-stop-consumer-overlay-v1','status':'DISABLED_PREPARATION_ONLY','base':pin(BASE),'files':files,'closure':pin(newpath),'case':pin(casepath),'prior_closure':pin(oldpath),'patch':pin(HERE/'consumer-overlay.patch'),'device_io_performed':False,'actual_state_modified':False,'retained_read_items_per_group':24,'requires_bundle_source_resealing':True}
+(HERE/'OVERLAY_MANIFEST.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+print(json.dumps({'files':len(files),'manifest':pin(HERE/'OVERLAY_MANIFEST.json')}))

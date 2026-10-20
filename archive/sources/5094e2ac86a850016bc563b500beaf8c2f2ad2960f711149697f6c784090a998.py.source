@@ -1,0 +1,61 @@
+import hashlib
+import io
+import unittest
+import zlib
+from receive_snapshot import validate_chunks
+
+
+def gz(b):
+    c = zlib.compressobj(wbits=31)
+    return c.compress(b) + c.flush()
+
+
+class SnapshotValidation(unittest.TestCase):
+    raw = b'userdata-offline-test\0' * 100000
+
+    def check(self, data=None, *, expected=None, digest=None, cap=10 << 20):
+        data = gz(self.raw) if data is None else data
+        return validate_chunks((data[i:i + 17] for i in range(0, len(data), 17)), io.BytesIO(),
+                               expected_bytes=len(self.raw) if expected is None else expected,
+                               expected_sha256=digest or hashlib.sha256(self.raw).hexdigest(),
+                               compressed_cap=cap)
+
+    def test_fragmented_roundtrip(self):
+        self.assertEqual(self.check()['raw_bytes'], len(self.raw))
+
+    def test_wrong_source_sha(self):
+        with self.assertRaises(ValueError): self.check(digest='0' * 64)
+
+    def test_truncated_trailer(self):
+        with self.assertRaises(ValueError): self.check(gz(self.raw)[:-1])
+
+    def test_crc_error(self):
+        b = bytearray(gz(self.raw)); b[-8] ^= 1
+        with self.assertRaises(zlib.error): self.check(bytes(b))
+
+    def test_trailing_data(self):
+        with self.assertRaises(ValueError): self.check(gz(self.raw) + b'trailing')
+
+    def test_concatenated_gzip(self):
+        with self.assertRaises(ValueError): self.check(gz(self.raw) + gz(b'other'))
+
+    def test_size_overflow(self):
+        with self.assertRaises(ValueError): self.check(expected=len(self.raw) - 1)
+
+    def test_short_raw(self):
+        with self.assertRaises(ValueError): self.check(expected=len(self.raw) + 1)
+
+    def test_compressed_cap(self):
+        with self.assertRaises(ValueError): self.check(cap=10)
+
+    def test_empty_stream(self):
+        with self.assertRaises(ValueError): self.check(b'')
+
+    def test_large_single_chunk_bounded_decompression(self):
+        raw = b'\0' * (21 << 20)
+        result = validate_chunks([gz(raw)], io.BytesIO(), expected_bytes=len(raw),
+                                 expected_sha256=hashlib.sha256(raw).hexdigest(), compressed_cap=1 << 20)
+        self.assertEqual(result['raw_bytes'], len(raw))
+
+
+if __name__ == '__main__': unittest.main()

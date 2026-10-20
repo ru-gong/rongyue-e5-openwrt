@@ -1,0 +1,45 @@
+set -eu
+set -o pipefail
+set -C
+test "$(id -u)" = 0
+test "$(getprop ro.serialno)" = DEVICE_SERIAL_REDACTED
+test "$(getprop ro.boot.slot_suffix)" = _a
+test "$(getprop sys.boot_completed)" = 1
+test "$(getprop gsm.sim.state)" = ABSENT,ABSENT
+test "$(getprop ro.product.model)" = E5
+test "$(getprop ro.board.platform)" = ums9621
+test "$(getprop ro.build.display.id)" = TS305_V03_20241128_2301
+test "$(cat /proc/sys/kernel/random/boot_id)" = 00000000-0000-4000-8000-000000000001
+test ! -L /data; test ! -L /data/local; test ! -L /data/local/tmp
+test "$(readlink -f /data)" = /data
+test "$(awk '$2=="/data" {n++} END {print n+0}' /proc/mounts)" = 1
+data_source=$(awk '$2=="/data" {print $1}' /proc/mounts)
+case "$data_source" in /dev/block/by-name/userdata|/dev/block/mmcblk0p70) ;; *) exit 83;; esac
+test "$(readlink -f "$data_source")" = /dev/block/mmcblk0p70
+test "$(readlink -f /dev/block/by-name/userdata)" = /dev/block/mmcblk0p70
+test "$(readlink -f /dev/block/mmcblk0p70)" = /dev/block/mmcblk0p70
+test -b /dev/block/mmcblk0p70
+test "$(stat -c '%t:%T' /dev/block/mmcblk0p70)" = 103:3f
+test "$(cat /sys/class/block/mmcblk0p70/dev)" = 259:63
+test "$(awk '$2=="/data" {print $3}' /proc/mounts)" = f2fs
+awk '$2=="/data" && $4 ~ /(^|,)rw(,|$)/ && $4 !~ /(^|,)ro(,|$)/ {ok++} END {exit !(ok==1)}' /proc/mounts
+test -d /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock/owner; test "$(cat /data/local/tmp/e5-clean-directory.lock/owner)" = 314ff262fa18c842
+test ! -L /data/e5linux.stage.314ff262fa18c842; test -d /data/e5linux.stage.314ff262fa18c842
+test "$(stat -c '%d %i' /data/e5linux.stage.314ff262fa18c842)" = '66367 19785'
+test ! -L /data/e5linux.stage.314ff262fa18c842/openwrt.ext4; test -f /data/e5linux.stage.314ff262fa18c842/openwrt.ext4; test "$(readlink -f /data/e5linux.stage.314ff262fa18c842/openwrt.ext4)" = /data/e5linux.stage.314ff262fa18c842/openwrt.ext4
+test "$(stat -c %h /data/e5linux.stage.314ff262fa18c842/openwrt.ext4)" = 1
+printf "CDATA\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t"; stat -c '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T' /data/e5linux.stage.314ff262fa18c842/openwrt.ext4
+/data/adb/magisk/busybox dd if=/data/e5linux.stage.314ff262fa18c842/openwrt.ext4 bs=4096 skip=19456 count=4194304 iflag=count_bytes status=none
+printf "\nCMID\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t"; stat -c '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T' /data/e5linux.stage.314ff262fa18c842/openwrt.ext4
+test -d /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock/owner; test "$(cat /data/local/tmp/e5-clean-directory.lock/owner)" = 314ff262fa18c842
+test ! -L /data/e5linux.stage.314ff262fa18c842; test -d /data/e5linux.stage.314ff262fa18c842
+test "$(stat -c '%d %i' /data/e5linux.stage.314ff262fa18c842)" = '66367 19785'
+test ! -L /data/e5linux.stage.314ff262fa18c842/openwrt.ext4; test -f /data/e5linux.stage.314ff262fa18c842/openwrt.ext4; test "$(readlink -f /data/e5linux.stage.314ff262fa18c842/openwrt.ext4)" = /data/e5linux.stage.314ff262fa18c842/openwrt.ext4
+test "$(stat -c %h /data/e5linux.stage.314ff262fa18c842/openwrt.ext4)" = 1
+printf "CDIGEST\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t"; /data/adb/magisk/busybox dd if=/data/e5linux.stage.314ff262fa18c842/openwrt.ext4 bs=4096 skip=19456 count=4194304 iflag=count_bytes status=none | /data/adb/magisk/busybox sha256sum
+test -d /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock; test ! -L /data/local/tmp/e5-clean-directory.lock/owner; test "$(cat /data/local/tmp/e5-clean-directory.lock/owner)" = 314ff262fa18c842
+test ! -L /data/e5linux.stage.314ff262fa18c842; test -d /data/e5linux.stage.314ff262fa18c842
+test "$(stat -c '%d %i' /data/e5linux.stage.314ff262fa18c842)" = '66367 19785'
+test ! -L /data/e5linux.stage.314ff262fa18c842/openwrt.ext4; test -f /data/e5linux.stage.314ff262fa18c842/openwrt.ext4; test "$(readlink -f /data/e5linux.stage.314ff262fa18c842/openwrt.ext4)" = /data/e5linux.stage.314ff262fa18c842/openwrt.ext4
+test "$(stat -c %h /data/e5linux.stage.314ff262fa18c842/openwrt.ext4)" = 1
+printf "CVERIFY\taaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\t%s\t" "$(cat /proc/sys/kernel/random/boot_id)"; stat -c '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T' /data/e5linux.stage.314ff262fa18c842/openwrt.ext4

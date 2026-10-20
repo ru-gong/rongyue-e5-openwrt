@@ -1,0 +1,141 @@
+"""Offline regressions against real probe and stopped-run evidence."""
+import copy
+import importlib.util
+import json
+import sys
+import types
+import unittest
+from pathlib import Path
+
+
+def no_device_or_network(event, args):
+    if event.startswith(('subprocess.', 'socket.')) or event in ('os.system', 'os.posix_spawn', 'os.fork'):
+        raise AssertionError(event)
+
+
+sys.addaudithook(no_device_or_network)
+import repair as r
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.case, cls.corrected, cls.history = r.load_and_verify_history()
+        cls.after = json.loads((r.OLD/'probe-execution/COMPLETE.json').read_bytes())['result']['after']
+        cls.original = cls.case['retained_device_state']['current_lock']
+        cls.real = r.current_readonly_replay()
+        p = r.ROOT/'tools/e5_scanner_deploy_next_live_20890624cf33b6b6/stage2_deploy.py'
+        spec = importlib.util.spec_from_file_location('_offline_stage2_time_guard', p)
+        cls.guard = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.guard)
+
+    def guard_with(self, corrected, change=None):
+        fixture = copy.deepcopy(self.case)
+        fixture['retained_device_state']['current_lock'] = copy.deepcopy(corrected)
+        fake = types.SimpleNamespace(_load=lambda: types.SimpleNamespace(c=fixture))
+        old = self.guard._closure_api
+        self.guard._closure_api = lambda: fake
+        actor = self.guard.Stage2Deploy.__new__(self.guard.Stage2Deploy)
+        expected = {v['label']:v for v in fixture['retained_read_items']}
+        calls = []
+        def request(label, script, **kwargs):
+            calls.append(label)
+            raw = ('\n'.join(expected[label]['expected_lines'])+'\n').encode()
+            return kwargs['validator'](raw)
+        actor._request = request
+        before = {}
+        for target, source in (('old_lock','new_lock'), ('old_owner','new_owner')):
+            row = copy.deepcopy(self.corrected[source])
+            row['mode_bits'] = int(row['mode_bits'], 16)
+            before[target] = row
+        if change:
+            change(before)
+        try:
+            result = actor._preserved_partial(before)
+            return result, calls
+        finally:
+            self.guard._closure_api = old
+
+    def test_real_history_full_raw_replay(self):
+        self.assertTrue(self.history['historical_deployment_and_probe_replayed'])
+        self.assertGreater(self.history['historical_files_rehashed'], 500)
+
+    def test_current_62_requests_all_readonly_complete(self):
+        self.assertEqual(self.real['current_requests'], 62)
+        self.assertEqual(self.real['current_mutations'], 0)
+
+    def test_stale_case_reproduces_actual_production_guard_refusal(self):
+        with self.assertRaisesRegex(self.guard.Refusal, 'old_lock/mtime'):
+            self.guard_with(self.original)
+
+    def test_correct_history_passes_existing_guard_and_all_30_retained_reads(self):
+        records, calls = self.guard_with(self.corrected)
+        self.assertEqual(len(records), 30)
+        self.assertEqual(calls, list(self.guard.RETAINED_PATHS))
+
+    def test_only_lock_time_fields_change(self):
+        changes = [(role,key) for role in self.original for key in self.original[role]
+                   if self.original[role][key] != self.corrected[role][key]]
+        self.assertEqual(set(changes), {('new_lock',key) for key in r.TIME_FIELDS})
+
+    def test_input_not_modified(self):
+        before = copy.deepcopy(self.original)
+        r.corrected_lock(before, self.after)
+        self.assertEqual(before, self.original)
+
+    def test_unknown_current_directory_times_rejected(self):
+        for key in r.TIME_FIELDS:
+            with self.subTest(field=key):
+                def change(rows): rows['old_lock'][key] += '0'
+                with self.assertRaises(self.guard.Refusal):
+                    self.guard_with(self.corrected, change)
+
+    def test_unknown_current_owner_times_rejected(self):
+        for key in r.TIME_FIELDS:
+            with self.subTest(field=key):
+                def change(rows): rows['old_owner'][key] += '0'
+                with self.assertRaises(self.guard.Refusal):
+                    self.guard_with(self.corrected, change)
+
+    def test_unknown_current_inode_owner_link_permissions_rejected(self):
+        for role in ('old_lock','old_owner'):
+            for key in ('dev','inode','uid','gid','bytes','nlink','mode_bits'):
+                with self.subTest(role=role,field=key):
+                    def change(rows): rows[role][key] += 1
+                    with self.assertRaises(self.guard.Refusal):
+                        self.guard_with(self.corrected, change)
+
+    def test_historical_identity_change_is_not_excused_as_probe_time(self):
+        for role in ('lock','owner'):
+            for key in ('dev','inode','uid','gid','bytes','nlink','mode','mode_bits'):
+                with self.subTest(role=role,field=key):
+                    bad = copy.deepcopy(self.after)
+                    bad[role][key] += 1
+                    with self.assertRaises(ValueError):
+                        r.corrected_lock(self.original, bad)
+
+    def test_historical_owner_time_change_rejected(self):
+        bad = copy.deepcopy(self.after)
+        bad['owner']['mtime'] = str(int(bad['owner']['mtime'])+1)
+        with self.assertRaises(ValueError):
+            r.corrected_lock(self.original, bad)
+
+    def test_historical_owner_bytes_hash_change_rejected(self):
+        bad = copy.deepcopy(self.after)
+        bad['owner_sha256'] = '0'*64
+        with self.assertRaises(ValueError):
+            r.corrected_lock(self.original, bad)
+
+    def test_backwards_probe_time_rejected(self):
+        bad = copy.deepcopy(self.after)
+        bad['lock']['mtime'] = '0'
+        with self.assertRaises(ValueError):
+            r.corrected_lock(self.original, bad)
+
+    def test_prepare_has_no_grant_or_cleanup(self):
+        for key in ('device_execution_enabled', 'shared_stop_or_uncertainty_cleared', 'current_installed_family_changed'):
+            self.assertFalse(self.real[key])
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

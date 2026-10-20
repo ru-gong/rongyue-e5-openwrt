@@ -1,0 +1,81 @@
+# E5 Android 受限安装准备工具（2026-10-13）
+
+**当前仅供离线准备与审阅，LIVE_DISABLED=True，所有实机入口及每次 ADB subprocess 调用都拒绝执行（离线转换器与隔离测试可运行）。没有环境变量或命令行绕过参数。没有执行 ADB/USB，也没有运行上游安装器。**
+
+这是有真实 ADB backend 的 Python 工具，不是仅打印计划的模型。设备串号固定 `DEVICE_SERIAL_REDACTED`；源代码固定 `569f13d4ce15585f70817c2a1e03bb574a84720b` 及该提交全部 12 个 gitlink。使用前必须完成独立代码审查、实际产物绑定和用户后续刷写授权；解除门属于需要重新哈希、审核的源代码修改。
+
+## 实现范围
+
+- `e5_install.py`：冻结设备 profile、整包 manifest SHA 校验、gzip 全量解压长度/SHA/CRC、boot v4/AVB 数据末尾不越 56 MiB、静态 ARM64 probe 格式检查、设备归属的 firmware/vendor tar 审核、机身与槽位检查、裸 F2FS 和明文策略检查、首次文件安装、boot_b/misc 写与完整读取验证、限定恢复、fsync journal。
+- `collect-own-device.sh`：未来仅从本机固定路径采集 Android 64 位 vendor/property 区和固件原件，生成两个 tar；只在 `/data/local/tmp/e5-collect-20261013` 写资料，不写任何原始分区，不采入 NV。没有运行收集到的二进制。
+- `fscrypt_policy_probe.c`：只读打开对象并调用 `FS_IOC_GET_ENCRYPTION_POLICY_EX`。仅 `ENODATA` 判定无策略；有策略或不支持 ioctl 一律失败。已由父任务在 ARM64 Linux 静态编译；产物 SHA256 `0000000000000000000000000000000000000000000000000000000000000000`、无 PT_INTERP 已核对，安装器固定此哈希；没有在设备运行。
+- `prepare_device_files.py`：从两个采集 tar 开始，严格解包、校验本机 DSP/参数格式，调用两份固定 SHA 的上游 Python BT/audio 数据转换器，生成 root:root、固定 mtime 的 `device-files.tar` 及逐文件输入/输出哈希来源记录。合成夹具不能通过安装验收。
+- `boot-init-persist-cap.patch`：给固定 init 的诊断 dd 增加 `count=1024`，直接在写端限制 `boot_b[56 MiB,60 MiB)`。此工具未直接修改主构建树；父任务已将补丁应用到新 bundle 的固定源码，构建应标注 dirty。
+- `device-profile.json`：节点、major:minor、GPT 起始 LBA/长度、原件与当前已补丁 A/B 引导链 SHA，文件自身 SHA 写死在代码中。B 四项已经与候选相同，工具没有复制或修改它们的入口。
+
+实机代码的唯一裸块写目标为：
+
+| 操作 | 固定设备 | 偏移 | 长度 |
+|---|---|---:|---:|
+| 安装或恢复 Android B 启动镜像 | `/dev/block/mmcblk0p37` | 0 | 67,108,864 B |
+| 试启动或恢复本机 boot control | `/dev/block/mmcblk0p3` | 2,048 | 32 B |
+
+绝不使用 FDL；没有 super、userdata、metadata、miscdata、NV、persist、GPT 或 A 槽裸块写。这里的 userdata 文件创建仍会改变 userdata 内容，不能描述为“只有两个分区有任何变化”。
+
+## 事务边界
+
+1. 固定 `adb -s DEVICE_SERIAL_REDACTED shell -T`，二进制 stdout 与 stderr 分离。`su -c` 的完整命令使用 `shlex.quote` 作为一个远端参数；无 host shell，无重试。非零退出、stderr、短读、超时均抛错。
+2. `preflight` 检查 Android A/orange/root/构建号/串号；冻结各节点、sysfs major:minor/start/size，完整 32 KiB GPT 前缀，以及 13 个受保护引导分区全量 SHA。安装时 `/data` 必须是物理 p70 的 rw F2FS，不接受 dm 映射。恢复不依赖 /data 可用。
+3. 第一次安装才允许；目标 `/data/e5linux`、stage 目录或独占锁已经存在就停止。上传的压缩包、boot、设备 tar、设置、probe 在实际读取待发送字节后再次比对批准长度/SHA，远端也必须与批准值相符。解压后验证完整原始长度/SHA；保留 1 GiB 空间余量。probe 对目录及文件返回明文后，完整 stage 目录一次 rename 提交，任何失败不继续启动分区写。
+4. 主机先持久保存完整 boot_b 和 misc 写前镜像。临发送时对实际读入内存的 boot 字节再比批准 SHA，随后写 boot_b 一次，整分区二进制回读；重新检查全部受保护引导链（含 boot_a）及 misc 未变。最后写本机 CRC 校验后动态生成的试 B 32 B，完整 misc 回读，验证 **misc 中这 32 B 之外没有变化**，再次检查受保护引导链。
+5. evidence 新建后 fsync 本目录及父目录；journal/备份/读回文件及其目录项均持久化，BEGIN 在写前 fsync；失败只 STOP，不自动回滚、重写、切槽或重启。文件与锁保留以供诊断。单次完成也不自动 reboot。
+
+`restore_transaction` 只恢复冻结的**本机原 boot_b 与原 misc 内 32 B**，检查当前明确批准的 preimage SHA；如果 misc 其他字节与原件不同则拒绝。它需要 Android A root/ADB，**不是无 ADB 救砖工具**。无 ADB 的 FDL 成对 boot 恢复由另一套受限工具设计，本工具没有相关入口。
+
+## 三种 boot control 必须分开
+
+本机当前原 32 B：A info=`ff`。上游 host `flash.py` 的首次试 B 保留 A tries，得到 A=`fe`、B=`2f`。固定 `boot/build-boot-image.py` 生成的运行回 A 模板将 A tries 设 1，A=`9f`；运行 B 重试模板 A=`9e`、B=`2f`。所有模板重新计算 CRC，并保留原对象其他字段。
+
+本代码分别实现两种变换；manifest 绑定当前完整 misc、原 32 B 和两份 builder 运行模板，不能声称三个对象相同。后续 misc 当前值若变动会停，不自动重生模板绕过已批准哈希。
+
+## 与新版 NV、firmware 和运行写范围的接口
+
+设备 `device-files.tar` 必须来自这台串号、这个原 Android 构建的采集，并经固定源码的 BT/audio 转换后单独审阅和记录 SHA。collector 输出是 raw 材料，**不能直接作为成品 tar**；现已用 `prepare_device_files.py` 完成固定 BT/audio 转换封装。只在独立审阅后把原始 `collection.json` 的 SHA 与生成的 `device-files.provenance.json`、tar 一并绑定 bundle；安装器逐项核对 tar 成员与输出清单，拒绝合成/来源漂移/未审阅材料。不能把其他设备 NV、MAC 或 firmware 合入。
+
+新版本由 `stage_nv` 将 NV 准备程序加入 rootfs；Linux 首启在 vendor 服务之前对九个物理 NV 设置内核只读，并在 `/opt/e5/nv` 建本机工作副本，再将 vendor 别名指向 loop。Android 安装器不提前塞入 NV。最终 rootfs 审计必须确认 staging 确实落入成品、NV store 未预填，首启还需验九个 NV 的只读/物理 SHA/loop 来源；源码存在不等于本机实测通过。
+
+最终执行范围还须单独列明以下自动运行写，不能拿 host 写集替代：Linux 在 `boot_b[56 MiB,60 MiB)` 保存诊断；启动/回退/重试改 misc 的 32 B；无 TF 的 userdata 普通挂载、rootfs/配置与 NV 工作副本写；挂载失败时 `f2fs-repair.sh` 可能修复 userdata，随后重设 B 试启动并重启。Android 去加密、格式化初始化及 metadata 的处理属于父任务的大分区方案，**本工具没有实现或暗中调用这些操作**。FDL 对 miscdata 下载标志的副作用也不由本工具豁免。
+
+首轮配置强制 `E5_DEFAULT_BOOT='android'`，完整镜像内默认值也必须为空或 android，并绑定 audit 结果；首次验证后如需长期默认 Linux，应另由已审执行范围处理。
+
+## 完成前仍缺的材料
+
+- 实际完整同版本 boot/rootfs、gzip 原始与压缩 SHA，固定源码及构建变更；本机模板和诊断上限补丁须确实在最终 boot 镜像中。
+- ADB 可执行文件 SHA；未来实机 shell-v2 退出码、固定 `/data/adb/magisk/busybox` 存在性及 dd 选项兼容性的只读确认。fscrypt probe 编译产物已经完成，实机执行与结果尚未验证。
+- 本机 collector 原件、固定转换产物及来源记录；设备 tar 和用户设置也要纳入最终 manifest SHA，不能在写入前临时替换。
+- rootfs ext4 离线检查记录和独立 runtime audit（含 A 写边界、NV 隔离、默认 Android、misc 模板与诊断硬上限）。审计 JSON 的布尔值是经人工审阅的证据声明，不能由“构建成功”自动全填 true。
+- 去加密/重建完成后的新鲜 data 明文、重启持久性验收，以及整包/恢复具体写集确认。原厂家密 userdata 的恢复风险不能靠此工具消除。
+
+参考 `bundle-manifest.UNBOUND.example.json`。示例故意不通过校验；没有“先用旧包填空”的路径。
+
+## 离线测试
+
+在此目录运行 `python3 -m unittest -v test_e5_install test_persist_cap test_prepare_device_files test_bind_bundle`。当前核心 39 项通过（26 backend、4 诊断上限、9 转换/来源）；最终绑定器另外 10 项通过。只操作内存、已有本地证据和隔离的普通临时文件。覆盖 CRC/OTA、错误串号/映射/GPT/F2FS、上传前失败、半写与断连、A 意外变化、misc 越界、限定恢复、旧 journal 拒绝、危险 tar、引用路径、su 引号和 LIVE 硬禁；patch 测试只对临时副本 dry-run，dd 测试只写临时普通文件。
+
+来源固定于 `upstream/manifest.json`，本地克隆的 `source-lock.json` 记录源码 gitlink。实机代码从未运行，模拟成功不能表述为实机安装或恢复验证。
+
+## 构建测试专用适配
+
+`infoscreen-usb-test-fixture.patch` 与 `infoscreen-wifi-test-dependency.patch` 只修改上游测试：USB mock 补当前状态契约并验证非法动作无派发；Wi-Fi 提取 wrapper 注入新版 hotspot 配置依赖，完整 network API 测试载入真实固定 hotspot 模块。父任务 VM 的 USB、Wi-Fi 状态、网络 API、报告脱敏及 USB reset mock 全通过，证据 `materials/openwrt-build-20261013-569f13d4/source-tests-06.log`。生产 `settings.uc`、`api.uc`、`hotspot.uc` 未因此改动。
+
+独立 runtime 审计绑定的是最终 boot/rootfs 字节，不能由此工具的模拟测试替代。未来所有 LIVE 入口仍拒绝执行，测试通过不构成刷写授权。
+
+## 从 base 到最终绑定包
+
+`bind_bundle.py` 实现完整离线绑定；不调用 ADB，不解除 LIVE。`bundle-base.UNBOUND.example.json` 的固定 schema 要求 base 只有 boot、rootfs_gz、runtime_audit 三个 artifact，保留本机 boot/misc 写前哈希、BC 模板、主提交/12个子模块以及唯一生产补丁 SHA。`binding-review.UNBOUND.example.json` 是技术资料审阅记录，**不等于用户授权刷写**；各 SHA 必须填真实值，工具不代填 reviewed。
+
+输入还包括本机 `collection.json` 与两个原 tar、转换产生的 `device-files.provenance.json`/tar、设置文件、实际 ADB 文件；每份清单和设置/ADB 都用独立的固定 SHA 参数绑定。绑定器会重新执行两份固定的数据转换器，从原采集材料生成临时 tar，与原 provenance 的输入/输出清单及 tar 哈希逐项比较。然后在新目录逐文件复制并同步计算批准哈希，加入固定静态 probe，保存小型审阅证据，调用 `validate_bundle` 对所有真实镜像与设置完整验收。只有通过后才把 candidate 发布为 `final-manifest.json` 并返回该文件 SHA。
+
+`binding-result.json` 在 final 发布前持久化；任何失败保留 `FAILED_NOT_INSTALLABLE`，核心 validator 拒绝这个标记所在目录。文件转换/复制可在 Mac 完成，不需要临时开发，也没有从 base 自动掺入其他设备 tar 的路径。
+
+绑定器的 10 个单元测试使用临时合成文件，mock 最后的镜像 validator 以专测契约、哈希、重现和失败发布边界；测试明确核对完整 validator 必须被调用，**这些测试不是实际 boot/rootfs 的完整通过记录**。实际新包仍须独立运行真正的 `validate_bundle` 与 runtime audit。

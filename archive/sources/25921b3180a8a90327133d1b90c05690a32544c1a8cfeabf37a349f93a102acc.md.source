@@ -1,0 +1,37 @@
+# D1 用户态离线候选（2026-10-13）
+
+**状态：仅准备候选，未部署、未证明修复 AT 超时或 CP 异常。先做 D0 被动 CP 取证，再按证据决定是否试 D1。** 本工具没有设备、ADB、SSH、网络、块设备、挂载、重启或部署入口，不接受目标 rootfs 路径。它只把固定的实际构建产物转换成普通本地审阅文件。
+
+## 精确范围
+
+| 目标 | 候选变化 | 刻意保留的行为 |
+| --- | --- | --- |
+| `/etc/init.d/e5-sipc-wwan` | 两个实际 `insmod` 分支 `tx_gap_ms=100 → 300` | SIM 选择、模块、端口发现及所有其他逻辑 |
+| `/opt/e5/t551m-atd` | `Channel.__init__(fd, gap=0.1) → gap=0.3` | `CHANNELS=(2,6,7)` 由 `serve(number)` 中唯一 `Channel(fd)` 实例化；命令、重同步、超时、重开行为不改 |
+| `/etc/rc.d/S96t551m-sim-status` | 仅声明删除此一条启动软链，原目标 `../init.d/t551m-sim-status` | init 脚本和 helper 不删；手动启动仍可能，D0/D1 测量中不允许使用 |
+| `/usr/share/e5-infoscreen/api.uc` | 自动 `modem_status` 和插件 `ctx.cells()` 两处 `mmcli --get-cell-info` 都停用；工程 cell/neighbours 为 null；元数据 `cell_collection.enabled=false` | MM 基本属性与 signal 缓存读取、QoS、AT 终端、外部 MM D-Bus 方法均保留 |
+| 同上 | 换用 `modem-d1` 状态缓存键；缺失/过期的每卡状态不再以 unknown 覆盖 MM 缓存 | 仅表示当前 MM 缓存状态，不声称具有双卡分别刷新或精确服务小区信息 |
+| `/usr/share/e5-infoscreen/www/app.js` | 邻区显示“暂停采集”/“Paused”/“Duraklatıldı” | 基础网络状态、其他显示逻辑 |
+
+输出是 **4 个文件替换意图 + 1 个精确软链删除意图**。不执行删除动作，不生成系统级 patch/apply 命令。`review.patch` 是审阅差异，其中软链删除以显式注释列出；不能单独应用它而漏掉启动软链计划。候选文件全部以普通 `0644` 保存，部署所需原始模式单列在 manifest 中。
+
+这是各通道分别最短 300 ms 间隔，**不是全局 CP 串行化或所有 AT 静默**。`qos_status` 约 60 秒缓存到期仍可能 AT 查询；MM 三秒双卡 voice polling、MM signal polling、短信监听、启动时 data-priority/boot-replay 都保持原样。原 MM 二进制/插件、内核、boot/initramfs、NV、频段/RF策略、CP reset 代码未修改。D2 的 voice 轮询试验不在本候选内。外部 MM cell 方法、AT 终端、手动每卡状态 helper 技术上仍可调用，诊断期间不使用。
+
+## 来源与严格输入
+
+固定主项目 `569f13d4ce15585f70817c2a1e03bb574a84720b` 的实际产物，而非未构建模板；原 2 GiB rootfs SHA256 `0000000000000000000000000000000000000000000000000000000000000000`。逐路径 byte/SHA/type/mode 见 `source-extraction.json` 和生成的 `PREPARED.json`。S96 在实际 ext4 是软链，本地 `inputs` 仅保存其 26 字节目标文本，不能把这个普通文件当作实际原始类型。
+
+脚本内固定 5 个输入的路径、长度和哈希，并验证原提取证据哈希。缺失、多余、内容变化、软链输入/父目录、非普通文件、输出已存在、路径逃逸均拒绝。脚本不读取运行中的设备或保留在设备上的已运行 ext4，也不证明该运行镜像的文件仍与构建版相同。
+
+未来若考虑部署，必须先在另一个获审流程中保全**当前已运行的 ext4 与 NV 工作副本**，验证当前四文件和 S96 的 bytes/type/mode，以及不存在另一条 sim-status 启动路径。只能在这份完整运行镜像副本上作精确差异，不得拿原始未播种 rootfs 覆盖现有工作状态。若任一目标已漂移，停下重新审阅；本工具不会通配替换。启动服务变化面向后续完整 Linux 启动，不是热补丁；不得以清理锁文件等方式重用旧 first-install 工具。
+
+## 已生成与复核方法
+
+- [候选清单](/REDACTED_HOST_PATH
+- [精确差异](/REDACTED_HOST_PATH
+- [离线变换器](/REDACTED_HOST_PATH
+- [离线测试](/REDACTED_HOST_PATH
+
+在工具目录运行 `python3 -B prepare_candidate.py --name another-review` 只创建新的 `results/another-review`，不会接触设备。已存在名称拒绝。`python3 -B -m unittest -v test_candidate.py` 运行离线测试；audit hook 禁 socket/通用子进程，只放行固定 `/opt/homebrew/bin/node --input-type=commonjs` 读取内存中的局部 JS 语义夹具。不执行候选中的 shell/Python/完整屏幕应用，不启动 VM。
+
+13 项检查覆盖输入拒绝、精确变更集合、loader 两分支、ATD 三通道入口、无工程查询、MM 缓存/过期状态回退、暂停显示、保留 QoS、无设备入口及输出完整性。局部 Ucode 函数使用其与 JavaScript 共通语法做 Node 语义测试；主机没有 Ucode 运行时，**尚未进行完整 Ucode 编译/原 RPC 环境测试、真实 AT 节流验收或蜂窝稳定性试验**。这一局限不应被 Node 测试成功掩盖。

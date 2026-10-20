@@ -1,0 +1,49 @@
+# Boot 历史绑定兼容修复：禁用准备包
+
+本目录独立复制 `tools/e5_next_recovery_prepare_20261015`。旧 prepare/live、设备上的 helper、共享 ACTIVE/UNCERTAIN/ledger 均未改；本包无新增设备动作。`observe.py` 的 `DEVICE_IO_ENABLED=False`、`recovery.py` 的 `RECOVERY_IO_DISABLED=True` 与 `rearm.py` 的 `REARM_IO_DISABLED=True` 保持禁用。核心路径及 source PINS 继续原 prepare；父线程若创建执行副本，应独立重封其既有已审 core 绑定。本目录不做启用构建。
+
+## 修复内容
+
+旧监听将“最近实际看到的 boot”强制要求属于旧停止 marker/ledger 的 boot 集合。当前两者不同：固定的只读完成记录观察到 `00000000-0000-4000-8000-000000000001`，旧停止状态仍关联 `00000000-0000-4000-8000-000000000001`。这个差异是历史，不是清理停止状态的理由。
+
+新 `e5-next-cold-request-v2` 保留独立的 `state_snapshot`，新增 `previous_observation={path,sha256}`。`previous_boot_id` 由该证据推导，CLI 不再接受自由 UUID。监听排除集合为真实历史链中的 boot 与当前 snapshot 的 marker/ledger boots 的并集。`observe.validate_request` 和主机 `cold_evidence` 重放使用相同排除规则；实际监听在第一次 root 校验前就跳过两类旧 boot。
+
+历史身份验证在原来已有清单保护的 `common.py`，没有额外动态模块：
+
+- 首次仅接受固定历史 READONLY_RESULT（SHA `0000000000000000000000000000000000000000000000000000000000000000`），同时校验固定 cold COMPLETE、cold 独审、read 独审四份文件的 SHA 与互相引用及设备/boot 身份，并校验其原有 reconciliation 引用。
+- 后续允许本包固定生产源生成的实际 21 样本 `COMPLETE.json`。主机重放原始健康/诊断和命令回执，递归追溯到初始锚；完整历史读取不要求旧共享状态仍相同，也不要求旧观察仍处于 15 分钟窗口，因为它只用于排除已看过的 boot。
+- 本包 `READONLY_RESULT.json` 也可作为来源：需源 SHA、cold 原始证据链、同 boot 的已完成 reconciliation 和 transport binding 一致。这里不重读历史 177 MiB 分区内容，不把历史只读镜像当新恢复 preimage。
+- 最大 8 层，循环、缺原始记录、STOP、错误 hash/serial/boot、任意复制的旧 schema、仅批准布尔，以及 same-boot refresh 冒充新观察全部拒绝。
+
+## CLI 契约
+
+默认 `plan` 不连接设备。将来在已审独立执行副本中，调用方用下面的参数代替旧 `--previous-boot`；路径及 SHA 必须来自实际历史记录，不能填合成测试文件。
+
+```text
+python3 -B recovery.py state-request \
+  --tool-manifest-sha <该执行副本的清单SHA> \
+  --previous-evidence <实际 READONLY_RESULT.json 或 COMPLETE.json 绝对路径> \
+  --previous-evidence-sha <该真实文件SHA> \
+  --purpose recovery \
+  --output <全新主机证据目录>
+```
+
+该操作仅生成主机 request/state snapshot。监听、reconcile、恢复执行仍各自需要独立启用和既有真实证据门，不因 request 生成而获准。没有在本目录生成真实请求、独审通过凭据或恢复 grant。
+
+## 不变的门及范围
+
+首次新 boot 的非 root/首次 root 健康观察仍须处于 120 秒内；21 样本/至少 600 秒、每次主机 8 秒/远端 6 秒、rc255 停止、保存原始 stdout/stderr、16 raw 双遍、900 秒新 preimage 期限、两层恢复独审以及原 B 64 MiB + misc@2048 的 32 B 写集均不变。A、NV、super、userdata、目录和旧锁不在本修复的写集。`rearm.py` 未改且仍禁用。
+
+软件 reboot 后也可以采集原有 21 样本 COMPLETE，作为下一次监听的历史排除来源；它仍带 `physical_cold_power_removal_not_proven_by_boot_id=true`。不能将其包装为已完成物理断电、不能填写物理冷启动确认或产生新的 cold-envelope 许可。历史验证函数始终返回 `historical_only=true`、`freshness_or_execution_granted=false`。
+
+调用者负责选择最近真实记录；本修复不会扫描整个证据目录推断“最新”，也不会用当前时间为历史记录延长权限。未来恢复后的新冷启动仍须用户真实断电配合与新只读验收。
+
+## 本地验证
+
+```text
+python3 -B -m unittest -v test_next test_lineage
+```
+
+42 项原回归保留原断言，只更新 fixture 的 v2 request/固定 anchor；新增 19 项检查真实锚、旧 marker/最新 boot 组合、连续 COMPLETE/READONLY 衍生、实际 listener 跳过旧 boots、121 秒拒绝、rc255 留证和错误/缺失来源拒绝。导入前拒绝全部外部进程和 socket；只有主机临时 fixture，没有设备调用或 VM。fixture 通过不代表真实监听、冷启动或恢复成功。
+
+完整差异、文件 SHA、原件未变核对及测试日志见本目录 `MANIFEST.json`、`changes.patch` 与 `final-tests.log`。

@@ -1,0 +1,50 @@
+"""Host-only frozen-case index producer. Reads evidence, never state mutation."""
+from pathlib import Path
+import json,hashlib,shlex
+R=Path(__file__).resolve().parents[2];H=Path(__file__).resolve().parent
+E=R/'evidence/author-clean-resume-20261016/scanner-execution-7d125fa2bd1c4e63'
+S=R/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+L=R/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+def sha(x):return hashlib.sha256(x).hexdigest()
+def pin(p):return {'bytes':p.stat().st_size,'sha256':sha(p.read_bytes())}
+def obj(p):return json.loads(p.read_bytes())
+def rel(p):return str(p.relative_to(R))
+review=R/'evidence/author-clean-resume-20261016/SCANNER_STOP_INDEPENDENT_REVIEW_B36A.json'
+assert sha(review.read_bytes())=='0000000000000000000000000000000000000000000000000000000000000000'
+j=obj(review);ledger=L.read_bytes();rows=[json.loads(x) for x in ledger.splitlines()]
+c={'schema':'e5-fixed-partial-deployment-case-v1','serial':'DEVICE_SERIAL_REDACTED','txid':j['txid'],'boot_id':j['boot_id'],
+   'state':rel(S),'ledger':rel(L),'global_lock':'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock','execution':rel(E),
+   'archive_rel':'partial-deployment-closures/'+j['txid'],'review':{'path':rel(review),'sha256':sha(review.read_bytes())},
+   'ledger_bytes':len(ledger),'ledger_sha256':sha(ledger),'ledger_rows':len(rows),'ledger_head':rows[-1]['chain_sha256'],
+   'markers':{n:pin(S/n) for n in ('ACTIVE.json','UNCERTAIN.json')},'operations':[],'files':{},
+   'completed_baseline':{p.name:pin(p) for p in sorted((S/'completed').iterdir())},
+   'expected_error':'TransportError: transport failed/uncertain','mutations':j['mutations'],
+   'prior_closure_source':{'path':str(R/'tools/e5_readonly_closure_prepare_20261016/closure.py'),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'},
+   'retained_device_state':{'programs':j['uploaded_programs'],'archived_old_lock':obj(E/'result/OLD_LOCK_ARCHIVED.json')}}
+for folder in sorted(p for p in (E/'transport').iterdir() if p.is_dir()):
+ b=obj(folder/'IN_FLIGHT.json');parts=[]
+ def request(p):
+  v=obj(p/'IN_FLIGHT.json');shell=shlex.split(v['argv'][-1]);assert len(shell)==3 and shell[:2]==['/debug_ramdisk/su','-c']
+  return {'folder':rel(p),'op_id':v['op_id'],'label':v['label'],'argv_sha256':v['argv_sha256'],'script_sha256':sha(shell[2].encode()),'mutating':v['mutating'],'payload_bytes':v['payload_bytes'],'payload_sha256':v['payload_sha256']}
+ for p in sorted(folder.glob('part-*')):parts.append(request(p))
+ q=request(folder);q['parts']=parts;q['completed']=not folder.name.startswith('000083-');c['operations'].append(q)
+for p in E.rglob('*'):
+ if p.is_file():c['files'][rel(p)]=pin(p)
+for p in (review,R/'evidence/author-clean-resume-20261016/review-scanner-stop-b36a-host.py',S/'STATE_BINDING.json'):
+ c['files'][rel(p)]=pin(p)
+m=obj(Path(j['input']['manifest']['path']))
+sources=[Path(j['input'][k]['path']) for k in j['input']]
+sources += [Path(x['path']) for x in m['artifacts'].values()]+[Path(x['path']) for x in m['core'].values()]
+sources += [R/'tools/e5_scanner_deploy_next_live_b36a719a15cd4241/stage2_deploy.py',R/'tools/e5_scanner_deploy_next_live_b36a719a15cd4241/runner.py']
+for p in sources:c['files'][rel(p)]=pin(p)
+# Bind actual final old/new lock stat rows, without executing parsers or tools.
+states=[]
+for p in sorted((E/'transport').glob('*/part-*/stdout.bin')):
+ raw=p.read_bytes()
+ if raw.startswith(b'STATE\t') and b'NEW_OWNER\t7d125fa2bd1c4e63\n' in raw:states.append((p,raw))
+assert states
+p,raw=states[-1];c['retained_device_state']['last_lock_frame']={'path':rel(p),**pin(p)}
+def st(s):
+ a=s.decode().split('|');return dict(zip(('mode_bits','dev','inode','bytes','mode','uid','gid','nlink','mtime','ctime','mtime_text','ctime_text','rdev_major','rdev_minor'),a))
+c['retained_device_state']['current_lock']={line.split(b'\t',1)[0].decode():st(line.split(b'\t',1)[1]) for line in raw.splitlines() if line.startswith((b'new_lock\t',b'new_owner\t'))}
+p=H/'CASE.json';p.write_text(json.dumps(c,sort_keys=True,indent=2)+'\n');print(json.dumps({'case':pin(p),'operations':len(c['operations']),'parts':sum(len(x['parts']) for x in c['operations']),'files':len(c['files'])}))

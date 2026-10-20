@@ -1,0 +1,137 @@
+"""Pure fake tests; deny subprocess and socket, no device/native execution."""
+import copy,json,sys,tempfile,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+import probe_host as p
+
+def deny(e,a):
+ if e.startswith(('subprocess.','socket.')) or e in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('external operation forbidden')
+sys.addaudithook(deny)
+TX='0123456789abcdef';BOOT='00000000-0000-4000-8000-000000000001'
+def meta(i,mode=0o40700,size=4096):return dict(mode_bits=mode,dev=9,inode=i,bytes=size,mode=mode&0o777,uid=0,gid=0,nlink=1,mtime='1',ctime='2',mtime_ns_text='1.000000001',ctime_ns_text='2.000000002',rdev_major=0,rdev_minor=0)
+def snap():return {**{k:meta(i) for k,i in [('data',1),('local',2),('tmp',3),('lock',4)]},'owner':meta(5,0o100600,17),'owner_sha256':p.sha((TX+'\n').encode())}
+def statline(m):return '|'.join([format(m['mode_bits'],'x'),str(m['dev']),str(m['inode']),str(m['bytes']),format(m['mode'],'o'),str(m['uid']),str(m['gid']),str(m['nlink']),m['mtime'],m['ctime'],m['mtime_ns_text'],m['ctime_ns_text'],'0','0'])
+def native(op,deadline):
+ common=dict(schema='e5-noreplace-probe-v1',txid=TX,boot_id=BOOT,opid=op,deadline_ms=deadline,self_pid=123,self_starttime=100,cancel_signal=0,data_dev=9,data_ino=1,lock_dev=9,lock_ino=4,complete=False)
+ rows=[dict(common,event='BEGIN',phase='arguments',checked_boottime_ms=1000)]
+ rows += [dict(common,event='PHASE',phase=phase,checked_boottime_ms=1001+i) for i,phase in enumerate(p.PHASES)]
+ rows.append(dict(common,event='RESULT',phase='complete',checked_boottime_ms=1010,complete=True,outcome='COMPLETED',errno=0,power_loss_safety_proven=False,existing_dest_eexist=True,existing_inodes_unchanged=True,missing_dest_rename=True,cleanup_completed=True,mutation_attempted=True,f2fs_confirmed=True,source_inode=10,destination_inode=11))
+ return rows
+def encode(rows):return ('\n'.join(json.dumps(x) for x in rows)+'\n').encode()
+class Artifact:
+ def __init__(self,path):self.path=path;self.size=path.stat().st_size;self.sha256=p.sha(path.read_bytes())
+ def verify(self):
+  if self.size!=self.path.stat().st_size or self.sha256!=p.sha(self.path.read_bytes()):raise p.Refusal('artifact differs')
+class Fake:
+ def __init__(self,folder):
+  self.txid=TX;self.boot_id=BOOT;self.lock='/data/local/tmp/e5-clean-directory.lock';self.active=False;self.events=[];self.failure=None;self.mutate=None;self.scripts=[]
+  self.transport=SimpleNamespace(evidence=folder,poisoned=False,recovery_context=None,reconciliation_only=False,mark_uncertain=self.poison)
+ def poison(self,why):self.transport.poisoned=True;self.events.append('UNKNOWN')
+ def _locked(self):return 'test owner\n'
+ def _deadline(self):return 6000
+ def _request(self,label,script,**kw):
+  self.events.append(label);self.scripts.append((label,script));self.active=True
+  try:
+   if label==self.failure:raise p.Refusal('timeout or lost acknowledgement')
+   if label=='upload-noreplace-probe':raw=b''
+   elif label=='noreplace-probe':
+    words=script.splitlines()[-1].split();rows=native(words[4],int(words[5]))
+    if self.mutate:self.mutate(rows)
+    raw=encode(rows)
+   else:raise AssertionError(label)
+   out=kw['followup'](kw['validator'](raw));self.events.append(label+':COMPLETE');self.active=False;return out
+  except BaseException:self.poison('request');raise
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve();f=self.root/'helper';f.write_bytes(b'fixture\0\xffbinary')
+  self.art=Artifact(f);self.a=Fake(self.root);self.w=p.ProbeHost(self.a,self.art,approved_sha256=self.art.sha256,approved_bytes=self.art.size)
+ def run_fake(self,state=None,verify=None):
+  def snapshot():
+   if self.a.active:self.a.events.append('state-active')
+   return snap()
+  def helper():
+   if self.a.active:self.a.events.append('helper-active')
+   return meta(7,0o100700,self.art.size)
+  with patch.object(p,'PROBE_IO_DISABLED',False),patch.object(self.w,'_production_contract',return_value=self.a.transport),patch.object(self.w,'_snapshot',side_effect=state or snapshot),patch.object(self.w,'_verify_helper',side_effect=verify or helper):return self.w.run()
+ def test_disabled_precedes_contract(self):
+  with patch.object(self.w,'_production_contract',side_effect=AssertionError('no call')),self.assertRaisesRegex(p.Refusal,'PROBE_IO_DISABLED'):self.w.run()
+  self.assertFalse(self.a.events)
+ def test_real_contract_rejects_fake_without_device(self):
+  with self.assertRaisesRegex(p.Refusal,'exact live adapter'):self.w._production_contract()
+ def test_success_active_through_readbacks_and_durable_result(self):
+  r=self.run_fake();self.assertFalse(r['approved_to_activate']);self.assertFalse(r['native_intermediate_states_independently_observed_by_host']);self.assertTrue((self.root/'NOREPLACE_HOST_RESULT.json').is_file())
+  self.assertEqual(self.a.events.count('state-active'),2);self.assertEqual(self.a.events.count('helper-active'),2);self.assertFalse(self.a.transport.poisoned)
+ def test_repeat_refused(self):
+  self.run_fake();old=list(self.a.events)
+  with patch.object(p,'PROBE_IO_DISABLED',False),self.assertRaisesRegex(p.Refusal,'no replay'):self.w.run()
+  self.assertEqual(old,self.a.events)
+ def test_recovery_modes_refused(self):
+  for k,v in [('recovery_context',{}),('reconciliation_only',True)]:
+   self.w.used=False;setattr(self.a.transport,k,v)
+   with self.assertRaisesRegex(p.Refusal,'recovery/reconciliation'):self.run_fake()
+   setattr(self.a.transport,k,None if k=='recovery_context' else False)
+  self.assertNotIn('upload-noreplace-probe',self.a.events)
+ def test_upload_timeout_no_native(self):
+  self.a.failure='upload-noreplace-probe'
+  with self.assertRaises(p.Refusal):self.run_fake()
+  self.assertNotIn('noreplace-probe',self.a.events);self.assertTrue(self.a.transport.poisoned)
+ def test_probe_timeout_no_cleanup_or_complete(self):
+  self.a.failure='noreplace-probe'
+  with self.assertRaises(p.Refusal):self.run_fake()
+  self.assertNotIn('noreplace-probe:COMPLETE',self.a.events);self.assertFalse((self.root/'NOREPLACE_HOST_RESULT.json').exists())
+ def test_upload_hash_failure_no_native(self):
+  with self.assertRaises(p.Refusal):self.run_fake(verify=lambda:(_ for _ in ()).throw(p.Refusal('hash')))
+  self.assertNotIn('noreplace-probe',self.a.events)
+ def test_after_owner_drift_unknown(self):
+  count=0
+  def snapshot():
+   nonlocal count;count+=1;x=snap()
+   if count==4:x['owner']['mtime']='different'
+   return x
+  with self.assertRaisesRegex(p.Refusal,'owner'):self.run_fake(state=snapshot)
+  self.assertNotIn('noreplace-probe:COMPLETE',self.a.events)
+ def test_remaining_probe_path_unknown(self):
+  count=0
+  def snapshot():
+   nonlocal count;count+=1
+   if count==4:raise p.Refusal('probe path remains')
+   return snap()
+  with self.assertRaisesRegex(p.Refusal,'remains'):self.run_fake(state=snapshot)
+  self.assertTrue(self.a.transport.poisoned)
+ def test_data_lock_identity_drift(self):
+  for k in ('data','local','tmp','lock'):
+   x=snap();x[k]['inode']+=1
+   with self.assertRaises(p.Refusal):p.same_bindings(snap(),x)
+ def test_native_invalid_sequence_binding_deadline_and_fields(self):
+  cases=[lambda r:r.pop(2),lambda r:r[-1].update(opid='f'*32),lambda r:r[-1].update(f2fs_confirmed=False),lambda r:r[-1].update(cleanup_completed=False),lambda r:r[3].update(self_pid=999),lambda r:r[-1].update(checked_boottime_ms=6000),lambda r:r[-1].update(destination_inode=10)]
+  for fn in cases:
+   rows=native('a'*32,6000);fn(rows)
+   with self.assertRaises(p.Refusal):self.w._native_parse(encode(rows),'a'*32,6000,snap())
+ def test_bad_ack_keeps_unknown(self):
+  self.a.mutate=lambda r:r[-1].update(complete=False)
+  with self.assertRaises(p.Refusal):self.run_fake()
+  self.assertTrue(self.a.transport.poisoned);self.assertFalse((self.root/'NOREPLACE_HOST_RESULT.json').exists())
+ def test_material_changed_before_upload(self):
+  self.art.path.write_bytes(b'changed')
+  with self.assertRaises(p.Refusal):self.run_fake()
+  self.assertNotIn('upload-noreplace-probe',self.a.events)
+ def test_disk_failure_no_success(self):
+  with patch.object(p,'durable_result',side_effect=OSError('disk full')),self.assertRaises(OSError):self.run_fake()
+  self.assertNotIn('noreplace-probe:COMPLETE',self.a.events)
+ def test_snapshot_parser_and_fixed_absence_checks(self):
+  def answer(label,script,**kw):
+   op=kw['op_id'];x=snap();lines=[f'SNAP\t{op}\t{BOOT}']+[k+'\t'+statline(x[k]) for k in ('data','local','tmp','lock','owner')]+['OWNER\t'+x['owner_sha256']+'  '+self.a.lock+'/owner',f'END\t{op}\t{BOOT}']
+   for name in self.w.probe_names:self.assertIn('test ! -e '+name,script)
+   return kw['validator'](('\n'.join(lines)+'\n').encode())
+  with patch.object(self.a,'_request',side_effect=answer):self.assertEqual(self.w._snapshot(),snap())
+ def test_raw_helper_and_second_hash_frames(self):
+  def answer(label,script,**kw):
+   op=kw['op_id'];data=self.art.path.read_bytes() if label=='probe-helper-read' else (self.art.sha256+'  -\n').encode();s=statline(meta(7,0o100700,self.art.size))
+   head=f'META\t{op}\t{BOOT}\t{self.w.remote}\t{self.art.size}\t{s}\n'.encode();tail=f'\nEND\t{op}\t{BOOT}\t{self.w.remote}\t{self.art.size}\t{s}\n'.encode()
+   return kw['validator'](head+data+tail)
+  with patch.object(self.a,'_request',side_effect=answer):self.assertEqual(self.w._verify_helper()['inode'],7)
+ def test_upload_noclobber_timeout_and_after_eof_deadline(self):
+  self.run_fake();script=self.a.scripts[0][1]
+  self.assertIn('timeout -s TERM 6',script);self.assertIn('set -C',script);self.assertLess(script.index('cat >'),script.rindex('awk'));self.assertLess(script.rindex('awk'),script.index('chmod 700'))
+if __name__=='__main__':unittest.main(verbosity=2)

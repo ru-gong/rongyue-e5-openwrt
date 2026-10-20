@@ -1,0 +1,101 @@
+"""Offline binder contract tests; synthetic data, never a hardware package.
+Core full image validation has its own tests; these tests spy on that handoff.
+"""
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+import bind_bundle as b
+import e5_install as e
+import prepare_device_files as p
+from test_prepare_device_files import collection
+
+class BindingTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name)
+        c,self.csha=collection(self.root);self.collection=c
+        # Deliberately synthetic test inputs in a disposable directory. Override
+        # the fixture label solely to exercise the non-device binder contract;
+        # full kernel/rootfs validation is mocked, and no final output survives.
+        data=json.loads(c.read_text());data["synthetic_fixture"]=False;c.write_text(json.dumps(data));self.csha=e.file_hash(c)
+        p.prepare(c,self.csha,self.root/"converted")
+        self.provenance=self.root/"converted/device-files.provenance.json";self.psha=e.file_hash(self.provenance)
+        base=json.loads((e.ROOT/"bundle-manifest.UNBOUND.example.json").read_text())
+        base["artifacts"]={}
+        for key,name in (("boot","boot.img"),("rootfs_gz","rootfs.gz"),("runtime_audit","audit.json")):
+            path=self.root/name;path.write_bytes(("synthetic "+key).encode())
+            base["artifacts"][key]={"path":name,"bytes":path.stat().st_size,"sha256":e.file_hash(path)}
+        self.base=self.root/"base.json";self.base.write_text(json.dumps(base));self.bsha=e.file_hash(self.base)
+        self.conf=self.root/"settings";self.conf.write_bytes(b"synthetic settings");self.confsha=e.file_hash(self.conf)
+        self.adb=self.root/"fake-adb-not-executable";self.adb.write_bytes(b"this is data, not an executable");self.adbsha=e.file_hash(self.adb)
+        self.review=self.root/"review.json";self.update_review()
+    def update_review(self):
+        self.review.write_text(json.dumps({"schema":1,"serial":e.SERIAL,"technical_review_complete":True,
+            "base_manifest_sha256":self.bsha,"collection_manifest_sha256":self.csha,
+            "provenance_sha256":self.psha,"install_conf_sha256":self.confsha,"adb_sha256":self.adbsha}))
+        self.rsha=e.file_hash(self.review)
+    def bind(self):
+        return b.bind(self.base,self.bsha,self.collection,self.csha,self.provenance,self.psha,self.conf,self.confsha,
+                      self.review,self.rsha,self.adb,self.adbsha,self.root/"final")
+    def test_copies_reproduces_and_calls_complete_validator_before_publication(self):
+        def validate(path,sha):
+            self.assertEqual(e.file_hash(path),sha)
+            self.assertFalse((path.parent/"final-manifest.json").exists())
+            m=json.loads(path.read_text());self.assertEqual(len(m["artifacts"]),7)
+            for record in m["artifacts"].values():e.artifact(path.parent,record)
+        with patch.object(e,"validate_bundle",side_effect=validate) as validate:
+            result=self.bind();validate.assert_called_once()
+        self.assertTrue(result["live_disabled"]);self.assertFalse(result["ready_for_device"])
+        self.assertTrue(result["conversion_reproduced"])
+        self.assertEqual(e.file_hash(result["manifest"]),result["sha256"])
+        self.assertTrue((self.root/"final/collection.input.json").is_file())
+    def test_final_validator_refusal_never_publishes_manifest(self):
+        with patch.object(e,"validate_bundle",side_effect=e.Refusal("synthetic image is not valid")):
+            with self.assertRaisesRegex(e.Refusal,"not valid"):self.bind()
+        self.assertFalse((self.root/"final/final-manifest.json").exists())
+        self.assertTrue((self.root/"final/FAILED_NOT_INSTALLABLE").is_file())
+    def test_result_write_failure_never_publishes_final_manifest(self):
+        original=e.durable_write
+        def fail_result(path,data):
+            if Path(path).name=="binding-result.json":raise OSError("result disk write failed")
+            return original(path,data)
+        with patch.object(e,"validate_bundle",return_value=None),patch.object(e,"durable_write",side_effect=fail_result):
+            with self.assertRaisesRegex(OSError,"result disk"):self.bind()
+        self.assertFalse((self.root/"final/final-manifest.json").exists())
+        self.assertTrue((self.root/"final/FAILED_NOT_INSTALLABLE").is_file())
+    def test_failed_final_directory_sync_marks_bundle_unusable(self):
+        original=e.fsync_directory;out=self.root/"final"
+        def fail_published(path):
+            if Path(path)==out and (out/"final-manifest.json").exists() and not (out/"FAILED_NOT_INSTALLABLE").exists():
+                raise OSError("final publication fsync failed")
+            return original(path)
+        with patch.object(e,"validate_bundle",return_value=None),patch.object(e,"fsync_directory",side_effect=fail_published):
+            with self.assertRaisesRegex(OSError,"publication fsync"):self.bind()
+        manifest=out/"final-manifest.json"
+        self.assertTrue(manifest.is_file());self.assertTrue((out/"FAILED_NOT_INSTALLABLE").exists())
+        with self.assertRaisesRegex(e.Refusal,"FAILED_NOT_INSTALLABLE"):e.validate_bundle(manifest,e.file_hash(manifest))
+    def test_settings_changed_after_review_refused_before_output(self):
+        self.conf.write_bytes(b"tampered")
+        with self.assertRaisesRegex(e.Refusal,"settings changed"):self.bind()
+        self.assertFalse((self.root/"final").exists())
+    def test_stale_technical_review_does_not_bind_replaced_base(self):
+        data=json.loads(self.base.read_text());data["status"]="changed";self.base.write_text(json.dumps(data));self.bsha=e.file_hash(self.base)
+        with self.assertRaisesRegex(e.Refusal,"review does not bind"):self.bind()
+    def test_collection_changed_cannot_be_reproduced(self):
+        with (self.root/"firmware-raw.tar").open("ab") as f:f.write(b"changed")
+        with self.assertRaisesRegex(e.Refusal,"input changed"):self.bind()
+        self.assertFalse((self.root/"final/final-manifest.json").exists())
+    def test_conversion_output_claim_must_reproduce_from_raw_inputs(self):
+        prov=json.loads(self.provenance.read_text());prov["inputs"][0]["sha256"]="0"*64
+        self.provenance.write_text(json.dumps(prov));self.psha=e.file_hash(self.provenance);self.update_review()
+        with self.assertRaisesRegex(e.Refusal,"reproduction differs"):self.bind()
+    def test_checked_copy_detects_source_replaced_after_validation(self):
+        source=self.root/"copy-source";source.write_bytes(b"before")
+        record={"bytes":6,"sha256":e.file_hash(source)};source.write_bytes(b"after!")
+        with self.assertRaisesRegex(e.Refusal,"changed after review"):b.checked_copy(source,self.root/"copy-target",record)
+    def test_base_cannot_embed_foreign_device_tar(self):
+        data=json.loads(self.base.read_text());data["artifacts"]["device_files_tar"]={};self.base.write_text(json.dumps(data));self.bsha=e.file_hash(self.base)
+        with self.assertRaisesRegex(e.Refusal,"only boot/rootfs"):self.bind()
+
+if __name__=="__main__":unittest.main()

@@ -1,0 +1,114 @@
+"""Data-only fixtures; no device I/O. Synthetic outputs are not installable."""
+import copy
+import hashlib
+import io
+import json
+from pathlib import Path
+import tarfile
+import tempfile
+import unittest
+from unittest import mock
+import e5_install as e
+import prepare_device_files as p
+
+def write_tar(path, entries):
+    with tarfile.open(path,"w") as t:
+        for name,data in entries.items():
+            i=tarfile.TarInfo(name);i.size=len(data);i.mode=0o644;t.addfile(i,io.BytesIO(data))
+
+def collection(base, overrides=None, vendor_override=None):
+    raw={"wcnmodem.bin":b"synthetic-wcn", "bt_configure_pskey.xpe.ini":b"#[0.0]__/L=6\ndevice_addr=0,0,0,0,0,0\n",
+         "bt_configure_rf.xpe.ini":b"#[0.0]__/L=1\nrf=1\n", "btmac.txt":b"00:00:00:00:00:00\n",
+         "l_agdsp_a.img":b"SharkL5_AUD"+bytes(6291456-len(b"SharkL5_AUD")), "codec.xml":b"<codec/>",
+         "wifi_board_config.xpe.ini":b"synthetic-wifi"}
+    for tag in ("audio_structure","dsp_vbc","cvs"):
+        raw[tag+".xml"]=(f'<{tag} num_mode="1" struct_size="4"><mode mode="0"><field id="0" t="u32" val="1"/></mode></{tag}>').encode()
+    raw.update(overrides or {})
+    vendor={"opt/e5/android/vendor/bin/modem_control":b"synthetic-not-executable",
+            "opt/e5/android/dev/__properties__/property_info":b"synthetic-property"}
+    vendor.update(vendor_override or {})
+    write_tar(base/"android-subset.tar",vendor);write_tar(base/"firmware-raw.tar",raw)
+    result={"serial":e.SERIAL,"source_build":"TS305_V03_20241128_2301","nv_included":False,
+            "synthetic_fixture":True,"script_sha256":e.file_hash(e.ROOT/"collect-own-device.sh"),
+            "files":[{"name":name,"bytes":(base/name).stat().st_size,"sha256":e.file_hash(base/name)}
+                     for name in ("android-subset.tar","firmware-raw.tar")]}
+    path=base/"collection.json";path.write_text(json.dumps(result))
+    return path,e.file_hash(path)
+
+class PackageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name)
+    def tearDown(self): self.tmp.cleanup()
+    def prepare(self, overrides=None, vendor_override=None):
+        path,sha=collection(self.base,overrides,vendor_override)
+        return p.prepare(path,sha,self.base/"out",fixture=True)
+    def test_end_to_end_deterministic_conversion_and_provenance(self):
+        r=self.prepare();path=self.base/"out/device-files.tar"
+        e.safe_tar(path)
+        with tarfile.open(path) as t:
+            ps=t.extractfile("lib/firmware/sprd/marlin3lite_pskey.bin").read()
+            rf=t.extractfile("lib/firmware/sprd/marlin3lite_rf.bin").read()
+            dsp=t.extractfile("lib/firmware/dsp_vbc").read()
+            self.assertEqual(ps,bytes.fromhex("070605040302")+bytes(170))
+            self.assertEqual(rf,b"\x01"+bytes(251))
+            self.assertEqual(dsp,b"audio_profile"+bytes(3)+b"\x01\0\0\0\x04\0\0\0\x01\0\0\0")
+            self.assertTrue(all(m.uid==m.gid==m.mtime==0 for m in t))
+        c=self.base/"collection.json"
+        r2=p.prepare(c,e.file_hash(c),self.base/"out2",fixture=True)
+        self.assertEqual(r["device_files_tar"]["sha256"],r2["device_files_tar"]["sha256"])
+        self.assertEqual(r["outputs"],r2["outputs"])
+        self.assertTrue(r["synthetic_fixture"]);self.assertFalse(r["reviewed"])
+        with self.assertRaisesRegex(e.Refusal,"synthetic"):
+            e.validate_device_provenance(path,self.base/"out/device-files.provenance.json",
+                {"reviewed":True,"collection_manifest_sha256":e.file_hash(c)})
+    def test_provenance_rejects_unreviewed_changed_converter_and_missing_output(self):
+        self.prepare();pp=self.base/"out/device-files.provenance.json";r=json.loads(pp.read_text())
+        # In this isolated fixture only, exercise remaining provenance gates.
+        r["synthetic_fixture"]=False;pp.write_text(json.dumps(r));tar=self.base/"out/device-files.tar"
+        approval={"reviewed":True,"collection_manifest_sha256":r["collection_manifest_sha256"]}
+        e.validate_device_provenance(tar,pp,approval)
+        with self.assertRaisesRegex(e.Refusal,"unreviewed"):
+            e.validate_device_provenance(tar,pp,{**approval,"reviewed":False})
+        bad=copy.deepcopy(r);bad["converter_hashes"]["sprd-bt-config.py"]="0"*64;pp.write_text(json.dumps(bad))
+        with self.assertRaisesRegex(e.Refusal,"source mismatch"):e.validate_device_provenance(tar,pp,approval)
+        bad=copy.deepcopy(r);bad["outputs"].pop();pp.write_text(json.dumps(bad))
+        with self.assertRaisesRegex(e.Refusal,"members differ"):e.validate_device_provenance(tar,pp,approval)
+    def test_collector_hash_and_transfer_hash_are_bound(self):
+        path,sha=collection(self.base)
+        with (self.base/"firmware-raw.tar").open("ab") as f:f.write(b"changed")
+        with self.assertRaisesRegex(e.Refusal,"input changed"):p.prepare(path,sha,self.base/"out",fixture=True)
+        r=json.loads(path.read_text());r["script_sha256"]="0"*64;path.write_text(json.dumps(r))
+        with self.assertRaisesRegex(e.Refusal,"source not frozen"):p.prepare(path,e.file_hash(path),self.base/"out",fixture=True)
+    def test_cli_default_refuses_synthetic_fixture(self):
+        path,sha=collection(self.base)
+        with self.assertRaisesRegex(e.Refusal,"provenance mismatch"):p.prepare(path,sha,self.base/"out")
+        self.assertFalse((self.base/"out").exists())
+    def test_invalid_audio_dtd_rejected_before_converter(self):
+        with mock.patch.object(p,"run_converter") as run:
+            with self.assertRaisesRegex(e.Refusal,"DTD"):
+                self.prepare({"dsp_vbc.xml":b'<!DOCTYPE dsp_vbc><dsp_vbc/>'})
+            run.assert_not_called()
+        self.assertTrue((self.base/"out/FAILED_NOT_INSTALLABLE").is_file())
+    def test_converter_warning_is_failure(self):
+        # Declared array has one mode; field lies beyond it => upstream warning.
+        with self.assertRaisesRegex(e.Refusal,"failed/warned"):
+            self.prepare({"dsp_vbc.xml":b'<dsp_vbc num_mode="1" struct_size="4"><mode mode="0"><f id="8" t="u32" val="1"/></mode></dsp_vbc>'})
+        self.assertFalse((self.base/"out/device-files.provenance.json").exists())
+    def test_donor_nv_and_path_traversal_rejected(self):
+        with self.assertRaisesRegex(e.Refusal,"NV/block"):
+            self.prepare(vendor_override={"opt/e5/android/nv/calinV":b"donor"})
+        bad=self.base/"bad.tar";write_tar(bad,{"../escape":b"bad"});target=self.base/"target";target.mkdir()
+        with self.assertRaisesRegex(e.Refusal,"traversal"):p.unpack_data(bad,target,False)
+        self.assertFalse((self.base/"escape").exists())
+    def test_symlink_rejected_without_extraction(self):
+        path=self.base/"link.tar"
+        with tarfile.open(path,"w") as t:
+            m=tarfile.TarInfo("opt/e5/android/link");m.type=tarfile.SYMTYPE;m.linkname="/etc/passwd";t.addfile(m)
+        target=self.base/"target";target.mkdir()
+        with self.assertRaisesRegex(e.Refusal,"link/device"):p.unpack_data(path,target,True)
+    def test_bundled_converter_drift_refused_before_subprocess(self):
+        with mock.patch.object(e,"file_hash",return_value="0"*64),mock.patch.object(p.subprocess,"run") as run:
+            with self.assertRaisesRegex(e.Refusal,"source hash"):p.run_converter("sprd-bt-config.py",[])
+            run.assert_not_called()
+
+if __name__=="__main__":unittest.main()

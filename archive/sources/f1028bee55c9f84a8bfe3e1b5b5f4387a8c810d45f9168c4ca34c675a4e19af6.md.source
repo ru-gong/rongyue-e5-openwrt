@@ -1,0 +1,81 @@
+# Fixed-source clean candidate: host preparation only
+
+`candidate_manifest.py` hashes the already saved candidate files, validates the
+original vendor tar member-by-member, decompresses the pinned pristine gzip to an
+automatically removed **host temporary file**, and reads selected ext4 metadata
+and files. It never mounts an image, starts a VM, imports a device backend, runs
+firmware, sends ADB/SSH/AT, or modifies input files. There is no live execute API.
+
+The candidate is the existing local build from source commit
+`569f13d4ce15585f70817c2a1e03bb574a84720b`, including the already reviewed
+`boot/init` diagnostic `count=1024` cap and upstream mobile4 kernel adaptations.
+It is **not an upstream release binary** and does not add W1, D1 or OpenClash.
+
+The generated schema is `e5-clean-author-candidate-v1`. `artifacts` contains fixed
+absolute paths, lengths and SHA-256; `attestation` is limited to the precise
+pristine rootfs. All `pending_live_gates` stay pending and
+`approved_for_device_execution` is false. The file is not an installer request.
+
+```
+python3 -B tools/e5_clean_author_prepare_20261014/candidate_manifest.py --output <new-host-json-path>
+python3 -B -m unittest discover -s tools/e5_clean_author_prepare_20261014 -p test_candidate_manifest.py -v
+```
+
+Output creation is exclusive. A previous result is not silently replaced. The
+ext4 reader is intentionally limited, rejects unsupported/unknown layouts, and
+is used only after both compressed and full uncompressed SHA/size match fixed
+pins. These are host tests and artifact checks, not hardware acceptance.
+
+## File selection and default boot
+
+The proposed new active directory has **eight initial files**:
+
+| File | Source |
+|---|---|
+| `boot.img` | Pinned 64 MiB boot; SHA `153af211…` |
+| `openwrt.ext4.gz` | Pinned pristine gzip; SHA `7aa7c714…` |
+| `openwrt.ext4` | Exact 2 GiB decompression; SHA `d96c0623…` |
+| `device-files.tar` | Existing own-device collection; SHA `e61d64b5…` |
+| `openwrt-install.conf` | Existing pinned settings, `E5_DEFAULT_BOOT='android'`; values stay private |
+| `fscrypt-probe` | Pinned probe copied from `fscrypt-policy-probe`; it is not executed by this tool |
+| `boot-os` | Literal `openwrt\n`: select this Linux rootfs for a B trial |
+| `openwrt-default-boot` | Literal `android\n`: return to Android by default |
+
+`boot-os=openwrt` does not mean persistent default-Linux. The clean image has no
+inner Linux default marker, and the fixed `92-e5-default-boot` script only changes
+the default for an explicit Linux setting. `90-e5` imports the outer settings
+into `/etc/e5/install.conf` and removes the outer settings file during first boot;
+the later normal directory therefore may have seven files. Do not copy a stale
+`boot-os-next`, `.new` image, hash sidecar, old configuration, or pending update.
+The transaction must preserve the old directory separately rather than merge it.
+
+## Vendor and fresh NV initialization
+
+The pristine image has an empty `/opt/e5/android` and no `/opt/e5/nv`, previous
+`factory-sha256.json`, install configuration, device-files stamp, or default boot
+marker. `boot/init` takes the own-device archive from the active outer directory,
+loads early firmware, and injects vendor files before `switch_root`. That archive
+contains runtime/WCN/GNSS/audio files, not NR partition images or private NV.
+
+At the first boot of the **new** image, S20 `e5-vendor` invokes
+`t551m-nv-prepare` before vendor processes. The program protects the nine actual
+physical NV partitions, records their hashes, initializes isolated working
+copies, reconciles valid primary/backup working pairs if necessary, and binds
+loop devices. The old image's working NV and origin must never be imported.
+Subsequent vendor writes may change working copies; their later equality to the
+physical source is not a valid universal requirement.
+
+The future operator still needs the immediate preboot physical-nine baseline,
+first-boot origin and read-only flags, exact geometry, loop mappings and
+`t551m-nv-verify`, followed by physical hashes. This candidate does not create that
+evidence or declare it passed. Preserve the old image for review and rollback;
+do not run `--refresh` against it as part of this candidate preparation.
+
+## Remaining gates
+
+Actual free space, current A/root/boot ID, no-SIM cold observation and AP panic
+risk review, B/misc/GPT/protected preimages, inactive directory and loop/open-file
+checks, whole old-directory backup, safe directory switch, slot switching and
+rollback remain separate reviewed operations. Existing frozen first-install
+code rejects an already present active directory; this tool never bypasses it.
+No addresses, available-space observations or fresh device hashes are invented.

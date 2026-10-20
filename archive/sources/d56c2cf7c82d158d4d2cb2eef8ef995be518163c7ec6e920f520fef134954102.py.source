@@ -1,0 +1,86 @@
+"""Host-only settlement of an exact positively terminated read-only refusal.
+
+No device operation, marker deletion, transaction retirement or fresh grant.
+The existing transaction continues only through a separately source-bound
+prefix-checked runner; the stopped original request remains unusable.
+"""
+import argparse
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+
+HOST_SETTLEMENT_ENABLED=False
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+CASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+STATE=ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+LEDGER=ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+CLOSURE=ROOT/'tools/e5_lock_lineage_stop_live_20261020/closure.py'
+CLOSURE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+RECEIPT='READONLY_REFUSAL_ARCHIVED_NOT_READY.json'
+
+def need(ok,why):
+    if not ok:raise RuntimeError(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def api():
+    raw=CLOSURE.read_bytes();need(sha(raw)==CLOSURE_SHA,'fixed closure')
+    spec=importlib.util.spec_from_file_location('_settlement_prior',CLOSURE);m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m);return m
+def case():
+    raw=(HERE/'CASE.json').read_bytes();need(sha(raw)==CASE_SHA,'fixed prefix case');return json.loads(raw)
+def receipt(c):
+    return {'schema':'e5-ack-prefix-host-checkpoint-settlement-v1','case_sha256':CASE_SHA,
+            'serial':c['serial'],'txid':c['txid'],'boot_id':c['boot_id'],
+            'all_mutations_completed':True,'readonly_failure_acknowledged_not_success':True,'acknowledged_payload_bytes':c['acknowledged_payload_bytes'],
+            'prefix_requires_fresh_full_double_read':True,'original_STOP_preserved':True,
+            'old_phase_not_completed':True,'device_operation_or_freshness_granted':False}
+def verify(c,m):
+    m.validate_closed(STATE,LEDGER)
+    # Historical permanent markers are checked by validate_closed above.
+    need(not m.exists(STATE/'RECOVERY_ONLY.json'),'no new recovery action')
+    for relative,pin in c['files'].items():m.read(ROOT/relative,pin)
+    m.read(LEDGER,c['ledger'])
+    archive=STATE/c['archive_rel']
+    for name,key in [('ACTIVE.json','active'),('UNCERTAIN.json','uncertainty')]:
+        locations=[STATE/name,archive/name]
+        need(sum(m.exists(p) for p in locations)==1,'each exact failed-read marker must occur once')
+        m.read(next(p for p in locations if m.exists(p)),c[key])
+    stop=Path(c['original_stop'])
+    need(stop.exists() and not (stop.parent/'COMPLETE.json').exists(),'original stop must remain incomplete')
+    return archive
+def settle(resume=False):
+    need(HOST_SETTLEMENT_ENABLED,'host settlement disabled')
+    c=case();m=api();fds=[]
+    try:
+        for p in (ROOT/'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock',STATE/'LOCK'):
+            fd=os.open(p,os.O_RDWR|os.O_NOFOLLOW);fds.append(fd);fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        archive=verify(c,m)
+        need(resume if archive.exists() else not resume,'explicit exact resume only; no replay')
+        for p in (archive.parent,archive):
+            if not p.exists():p.mkdir(mode=0o700);m.sync(p.parent)
+            m.directory(p);need(p.stat().st_dev==STATE.stat().st_dev,'same state filesystem')
+        need(all(p.name in ('ACTIVE.json','UNCERTAIN.json',RECEIPT,RECEIPT+'.preparing') for p in archive.iterdir()),'foreign archive data')
+        for name in ('ACTIVE.json','UNCERTAIN.json'):
+            if m.exists(STATE/name):m.noreplace(STATE/name,archive/name)
+        verify(c,m)
+        for p in (archive,archive.parent,STATE):m.sync(p)
+        m.durable(archive/RECEIPT,m.encoded(receipt(c)))
+        m.normal_gate(STATE,LEDGER,c['boot_id'],c['txid'])
+        return {'receipt':{'path':str(archive/RECEIPT),'sha256':sha((archive/RECEIPT).read_bytes())},
+                'device_commands':False,'fresh_device_checks_still_required':True}
+    finally:
+        for fd in reversed(fds):os.close(fd)
+def validate_settled():
+    c=case();m=api();archive=STATE/c['archive_rel']
+    m.read(archive/'ACTIVE.json',c['active'])
+    m.read(archive/'UNCERTAIN.json',c['uncertainty'])
+    need(m.read(archive/RECEIPT)==m.encoded(receipt(c)),'settlement receipt')
+    m.normal_gate(STATE,LEDGER,c['boot_id'],c['txid'])
+    return {'path':str(archive/RECEIPT),'sha256':sha((archive/RECEIPT).read_bytes())}
+
+if __name__=='__main__':
+    p=argparse.ArgumentParser();p.add_argument('mode',choices=('plan','settle','resume'),nargs='?',default='plan');a=p.parse_args()
+    if a.mode=='plan':print(json.dumps({'status':'VERIFIED_ACKNOWLEDGED_READONLY_REFUSAL_NOT_READY','archive':str(verify(case(),api())),'device_commands':False}))
+    else:print(json.dumps(settle(a.mode=='resume')))

@@ -1,0 +1,98 @@
+"""Host text-only producer for consumer overlays; never imports device code."""
+from pathlib import Path
+import hashlib,json,difflib
+
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parents[1]
+SOURCE=HERE/'closure.py'
+
+def main():
+    digest=hashlib.sha256(SOURCE.read_bytes()).hexdigest()
+    helper='''
+# Fixed host-only closure support. This gate never clears an operation marker.
+def _closure_api():
+    import hashlib as _h, stat as _s, types as _t
+    _p = Path(%r)
+    if _p.is_symlink() or any(x.is_symlink() for x in _p.parents):
+        raise RuntimeError('unsafe fixed closure source')
+    _before = _p.stat(); _raw = _p.read_bytes(); _after = _p.stat()
+    _identity = lambda s: (s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+    if not (_s.S_ISREG(_before.st_mode) and _before.st_nlink == 1 and
+            _identity(_before) == _identity(_after) and _h.sha256(_raw).hexdigest() == %r):
+        raise RuntimeError('fixed closure source pin changed')
+    _m = _t.ModuleType('_e5_fixed_readonly_closure'); _m.__file__ = str(_p)
+    exec(compile(_raw,str(_p),'exec'),_m.__dict__)
+    return _m
+
+''' % (str(SOURCE),digest)
+    ledger=ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+    bases={'core':ROOT/'tools/e5_nextphase_core_live_6c405cb2e5c4447e','recovery':ROOT/'tools/e5_next_recovery_live_6c405cb2e5c4447e','scanner':ROOT/'tools/e5_scanner_deploy_next_live_6c405cb2e5c4447e'}
+    out=HERE/'overlay';out.mkdir(exist_ok=True);files={};diff=[]
+    def edit(group,name,replacements):
+        p=bases[group]/name;original=p.read_text();text=original
+        for old,new in replacements:
+            assert text.count(old)==1,(group,name,old[:100],text.count(old))
+            text=text.replace(old,new,1)
+        # Append before no CLI main? Definitions are present on import, and all
+        # these frozen consumers are imported libraries rather than CLI helpers.
+        indices=[text.find(x) for x in ("if __name__=='__main__':",'if __name__ == "__main__":','if __name__=="__main__":')]
+        idx=min((x for x in indices if x>=0),default=-1)
+        text=text[:idx]+helper+text[idx:] if idx>=0 else text+helper
+        dest=out/group/name;dest.parent.mkdir(exist_ok=True);dest.write_text(text)
+        files[group+'/'+name]={'path':str(dest),'sha256':hashlib.sha256(dest.read_bytes()).hexdigest(),'bytes':dest.stat().st_size,
+                              'base_path':str(p),'base_sha256':hashlib.sha256(p.read_bytes()).hexdigest()}
+        diff.extend(difflib.unified_diff(original.splitlines(True),text.splitlines(True),fromfile=str(p),tofile=str(dest)))
+    edit('core','bounded_transport.py',[(
+        "        require(not self.recovery_pending.exists() and not self.recovery_pending.is_symlink(),'unfinished recovery transition')",
+        "        _closure_api().transport_gate(self.state,Path("+repr(str(ledger))+"),self.serial,self.boot_id,self.txid)")])
+    edit('core','bounded_boot_control.py',[(
+        'DEVICE_IO_DISABLED = False','DEVICE_IO_DISABLED = True'),(
+        '        require(not (self.transport.state/"RECOVERY_PENDING.json").exists(),"unfinished recovery transition")',
+        '        _closure_api().transport_gate(self.transport.state,Path('+repr(str(ledger))+'),SERIAL,self.boot_id,self.txid)')])
+    p=bases['core']/'uncertainty_recovery.py';original=p.read_text()
+    # Temporary future recovery transitions get their own marker. The permanent
+    # readonly closure PENDING must never be moved or overwritten by recovery.
+    modified=original.replace('RECOVERY_PENDING.json','RECOVERY_TRANSITION.json')
+    # Use an exact one-shot large original replacement, then narrow insertions.
+    replacements=[(original,modified.replace('RECOVERY_TRANSITION_DISABLED = False','RECOVERY_TRANSITION_DISABLED = True'))]
+    replacements.extend([(
+        "    old_boots=set()",
+        "    closure=_closure_api().transport_gate(state,ledger_path(),boot.SERIAL,context['boot_id'],context['txid'])\n    old_boots=set()"),(
+        "    require(old_boots and context['boot_id'] not in old_boots,'a newly observed Android boot is required; no same-boot retry')",
+        "    old_boots.add(closure['excluded_boot_id'])\n    require(old_boots and context['boot_id'] not in old_boots,'a newly observed Android boot is required; no same-boot retry')"),(
+        "    grant=json.loads(read(state/'RECOVERY_ONLY.json'))",
+        "    _closure_api().transport_gate(state,ledger_path(),serial,context['boot_id'],context['txid'])\n    grant=json.loads(read(state/'RECOVERY_ONLY.json'))")])
+    edit('core','uncertainty_recovery.py',replacements)
+    edit('core','workflow.py',[(
+        'WORKFLOW_IO_DISABLED = False','WORKFLOW_IO_DISABLED = True'),(
+        'def verify_support_bindings(manifest):',
+        '''def verify_support_bindings(manifest):
+    closure = _closure_api()
+    for key, path, digest in (("closure", Path(closure.__file__), '''+repr(digest)+'''),
+                              ("closure_case", closure.HERE / "CASE.json", closure.CASE_SHA256)):
+        require(manifest.get(key) == {"path": str(path), "sha256": digest, "bytes": path.stat().st_size} and
+                hash_file(safe_file(path)) == digest, "closure support binding differs: " + key)
+'''),(
+        '        for name in ("ACTIVE.json", "UNCERTAIN.json", "RECOVERY_PENDING.json", "RECOVERY_ONLY.json"):\n            require(not (transport.state / name).exists() and not (transport.state / name).is_symlink(), "shared stop state remains")',
+        '        _closure_api().normal_gate(transport.state,Path('+repr(str(ledger))+'),request["boot_id"],request["txid"])')])
+    edit('scanner','stage2_deploy.py',[(
+        'DEVICE_IO_DISABLED=False','DEVICE_IO_DISABLED=True'),(
+        "    for name in ('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','RECOVERY_PENDING.json'):\n        p=STATE/name;require(not p.exists() and not p.is_symlink(),'shared barrier remains: '+name)",
+        "    _closure_api().normal_gate(STATE,Path("+repr(str(ledger))+"))")])
+    edit('recovery','common.py',[(
+        "MARKERS=('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','RECOVERY_PENDING.json')",
+        "MARKERS=('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','RECOVERY_PENDING.json','RECOVERY_TRANSITION.json')"),(
+        " return {'schema':'e5-next-state-v1','serial':SERIAL,'state_path':str(STATE),'state_binding':binding(STATE/'STATE_BINDING.json'),'markers':markers,'ledger_sha256':digest,'ledger_head':head,'ledger_rows':len(rows),'ledger_last_event':rows[-1]['event'] if rows else None,'previous_boots':sorted(boots),'used_txids':sorted(txs)}",
+        " snapshot={'schema':'e5-next-state-v1','serial':SERIAL,'state_path':str(STATE),'state_binding':binding(STATE/'STATE_BINDING.json'),'markers':markers,'ledger_sha256':digest,'ledger_head':head,'ledger_rows':len(rows),'ledger_last_event':rows[-1]['event'] if rows else None,'previous_boots':sorted(boots),'used_txids':sorted(txs)}\n return _closure_api().augment_snapshot(snapshot,STATE,LEDGER)"),(
+        " require(all(v=='ABSENT' for v in s['markers'].values()) and s['ledger_last_event'] in (None,'COMPLETE'),'ordinary path blocked by unresolved state')",
+        " _closure_api().snapshot_gate(s,STATE,LEDGER,normal=True)"),(
+        "def recovery_state(s):require(s['markers']['RECOVERY_PENDING.json']=='ABSENT','torn transition requires separate manual reconciliation')",
+        "def recovery_state(s):_closure_api().snapshot_gate(s,STATE,LEDGER,normal=False)")])
+    (HERE/'consumer-overlay.patch').write_text(''.join(diff))
+    pin=lambda p:{'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'bytes':p.stat().st_size}
+    manifest={'schema':'e5-readonly-closure-consumer-overlay-v1','status':'DISABLED_PREPARATION_ONLY','files':files,
+              'closure':pin(SOURCE),'case':pin(HERE/'CASE.json'),'patch':pin(HERE/'consumer-overlay.patch'),
+              'device_io_performed':False,'old_frozen_sources_modified':False,'requires_bundle_source_resealing':True}
+    (HERE/'OVERLAY_MANIFEST.json').write_text(json.dumps(manifest,indent=2,sort_keys=True)+'\n')
+    print(json.dumps({'overlay_files':len(files),'closure_sha256':digest,'manifest_sha256':hashlib.sha256((HERE/'OVERLAY_MANIFEST.json').read_bytes()).hexdigest()}))
+if __name__=='__main__':main()

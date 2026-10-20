@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+"""Host-only deterministic four-package copy/reseal. Never imports or runs copies."""
+import argparse,ast,copy,difflib,hashlib,json,os,re,stat,sys
+from datetime import datetime,timezone
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+CATALOG_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+GROUPS={'core':'e5_nextphase_core_prepare_20261015','recovery':'e5_next_recovery_prepare_20261015','scanner':'e5_scanner_deploy_next_prepare_20261015','acceptance':'e5_next_acceptance_prepare_20261015'}
+DEST_STEMS={'core':'e5_nextphase_core_live_','recovery':'e5_next_recovery_live_','scanner':'e5_scanner_deploy_next_live_','acceptance':'e5_next_acceptance_live_'}
+class Refusal(RuntimeError):pass
+def need(ok,why):
+ if not ok:raise Refusal(why)
+def sha(b):return hashlib.sha256(b).hexdigest()
+def encode(v):return (json.dumps(v,ensure_ascii=False,sort_keys=True,indent=2)+'\n').encode()
+def read(p,digest=None,size=None):
+ p=Path(p);need(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe input path')
+ s=p.stat();need(stat.S_ISREG(s.st_mode) and s.st_nlink==1,'single regular input');b=p.read_bytes();z=p.stat()
+ need(all(getattr(s,k)==getattr(z,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')),'input changed while reading')
+ need((digest is None or sha(b)==digest) and (size is None or len(b)==size),'source digest/size drift: '+str(p));return b
+def verify_stream(item):
+ p=Path(item['path']);need(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe external input')
+ before=p.stat();need(stat.S_ISREG(before.st_mode) and before.st_nlink==1,'external input type')
+ h=hashlib.sha256();length=0
+ with p.open('rb') as f:
+  for piece in iter(lambda:f.read(1<<20),b''):h.update(piece);length+=len(piece)
+ after=p.stat();need(all(getattr(before,k)==getattr(after,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')),'external input changed')
+ need(h.hexdigest()==item['sha256'] and ('bytes' not in item or item['bytes']==length),'external input hash/length drift')
+def sync(p):
+ fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:os.fsync(fd)
+ finally:os.close(fd)
+def write_new(p,b):
+ p=Path(p);need(not p.exists() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'output exists or symlink')
+ with os.fdopen(os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600),'wb') as f:f.write(b);f.flush();os.fsync(f.fileno())
+ sync(p.parent)
+def mkdir(p):
+ need(not p.exists() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'fresh sibling output required');p.mkdir(mode=0o700);sync(p.parent)
+def assignment(raw,name):
+ text=raw.decode();tree=ast.parse(text);rows=[n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets)]
+ need(len(rows)==1,'assignment must occur exactly once: '+name);n=rows[0];value=ast.literal_eval(n.value);segment=ast.get_source_segment(text,n.value)
+ # All edited assignments are single literal values; no call/eval/import.
+ start=sum(len(x) for x in text.splitlines(True)[:n.value.lineno-1])+n.value.col_offset
+ end=sum(len(x) for x in text.splitlines(True)[:n.value.end_lineno-1])+n.value.end_col_offset
+ need(text[start:end]==segment,'assignment offset');return value,start,end
+class Builder:
+ def __init__(self,files,dest):self.original=copy.deepcopy(files);self.files=copy.deepcopy(files);self.dest=dest;self.edits=[]
+ def set(self,key,name,old,new):
+  raw=self.files[key];value,a,b=assignment(raw,name);need(value==old,'unexpected old value '+key+':'+name)
+  text=raw.decode();self.files[key]=(text[:a]+repr(new)+text[b:]).encode();self.edits.append({'file':key,'kind':'assignment','name':name,'old':old,'new':new})
+ def exact(self,key,old,new,count=1):
+  raw=self.files[key];need(raw.count(old.encode())==count,'replacement occurrence differs '+key+':'+old)
+  self.files[key]=raw.replace(old.encode(),new.encode());self.edits.append({'file':key,'kind':'exact-text','old':old,'new':new,'count':count})
+ def obj(self,key):return json.loads(self.files[key])
+ def put(self,key,obj):self.files[key]=encode(obj)
+ def digest(self,key):return sha(self.files[key])
+ def path(self,key):g,p=key.split('/',1);return str(self.dest[g]/p)
+ def binding(self,key,with_bytes=False):
+  out={'path':self.path(key),'sha256':self.digest(key)}
+  if with_bytes:out['bytes']=len(self.files[key])
+  return out
+ def files_manifest(self,key,package):
+  m=self.obj(key)
+  m['files']={n:v for n,v in m['files'].items() if package+'/'+n in self.files}
+  for name,item in m['files'].items():
+   k=package+'/'+name;need(k in self.files,'manifest file not catalogued: '+k);item['sha256']=self.digest(k);item['bytes']=len(self.files[k])
+   if 'path' in item:item['path']=self.path(k)
+  return m
+
+def reseal(files,dest,recipe):
+ selected={k:v for k,v in files.items() if (k.startswith('core/') and (k.endswith('.py') or k in ('core/SOURCE_MANIFEST.json','core/nv_geometry.json'))) or (k.startswith('recovery/') and k.split('/',1)[1] in ('common.py','observe.py','evidence_contract.py','recovery.py','rearm.py','MANIFEST.json')) or (k.startswith('scanner/') and (k.split('/',1)[1] in ('runner.py','stage2_deploy.py','ARTIFACT_MANIFEST.json') or k.endswith('.ENABLED'))) or k in ('acceptance/collect.py','acceptance/collect.sh','acceptance/contract.json','acceptance/MANIFEST.json')}
+ b=Builder(selected,dest);need(recipe['schema']=='e5-nextphase-activation-recipe-v1' and recipe['execution_authorized_by_recipe'] is False,'recipe scope')
+ for key,change in recipe['literal_gates'].items():
+  left,right=change.split(' -> ');name,old=left.split('=');name=name.strip();old=ast.literal_eval(old.strip());new=ast.literal_eval(right.strip())
+  need(type(old) is bool and type(new) is bool and old!=new,'only literal gate inversion');b.set(key,name,old,new)
+ # All path edits below are fixed preparation package paths, never material/evidence/device paths.
+ core_rel='tools/'+dest['core'].name;rec_rel='tools/'+dest['recovery'].name
+ for key in ('recovery/common.py','scanner/runner.py','scanner/stage2_deploy.py'):
+  b.exact(key,'tools/'+GROUPS['core'],core_rel)
+ b.exact('core/cold_bridge.py','tools/'+GROUPS['recovery']+'/evidence_contract.py',rec_rel+'/evidence_contract.py')
+ b.exact('scanner/runner.py','tools/'+GROUPS['recovery'],rec_rel)
+ b.exact('scanner/stage2_deploy.py','tools/'+GROUPS['recovery']+'/evidence_contract.py',rec_rel+'/evidence_contract.py')
+ adapter=b.digest('core/android_directory_adapter.py');transport=b.digest('core/bounded_transport.py')
+ for k in ('core/bounded_stage.py','core/probe_host.py'):
+  old=assignment(b.files[k],'ADAPTER_SHA')[0];need(old==sha(files['core/android_directory_adapter.py']),'original adapter pin');b.set(k,'ADAPTER_SHA',old,adapter)
+  need(assignment(b.files[k],'TRANSPORT_SHA')[0]==transport,'transport bytes must not change')
+ oldpins=assignment(b.files['recovery/common.py'],'PINS')[0];newpins={n:b.digest('core/'+n+'.py') for n in oldpins}
+ need(all(oldpins[n]==sha(files['core/'+n+'.py']) for n in oldpins),'original runtime pins');b.set('recovery/common.py','PINS',oldpins,newpins)
+ rm=b.files_manifest('recovery/MANIFEST.json','recovery');rm['runtime_directory']=str(dest['core']);rm['runtime_pins']=newpins
+ rm.pop('tests',None);rm['preparation_manifest']={'path':str(ROOT/'tools'/GROUPS['recovery']/'MANIFEST.json'),'sha256':sha(files['recovery/MANIFEST.json'])}
+ rm.update(status='ENABLED_HOST_COPY_PENDING_INDEPENDENT_REVIEW',device_io_enabled=True,production_approval_generated=False,activation_does_not_authorize_device_execution=True);b.put('recovery/MANIFEST.json',rm)
+ old=assignment(b.files['core/cold_bridge.py'],'SOURCE_SHA256')[0];need(old==sha(files['recovery/evidence_contract.py']),'original verifier pin');b.set('core/cold_bridge.py','SOURCE_SHA256',old,b.digest('recovery/evidence_contract.py'))
+ old=assignment(b.files['core/cold_bridge.py'],'DEPENDENCIES')[0];need(old=={n:sha(files['recovery/'+n]) for n in ('common.py','observe.py')},'old cold dependency pins');b.set('core/cold_bridge.py','DEPENDENCIES',old,{n:b.digest('recovery/'+n) for n in old})
+ sm=b.obj('scanner/ARTIFACT_MANIFEST.json');sm['host_source_sha256']=b.digest('scanner/stage2_deploy.py');sm['runner_source_sha256']=b.digest('scanner/runner.py')
+ sm['core']={n:b.binding('core/'+n) for n in sm['core']};sm['cold_contract']=b.binding('recovery/evidence_contract.py');sm['cold_dependencies']={n:b.binding('recovery/'+n) for n in sm['cold_dependencies']}
+ for name in ('archiver','scanner'):
+  old=sm['artifacts'][name];rel=Path(old['path']).relative_to(ROOT/'tools'/GROUPS['scanner']).as_posix();key='scanner/'+rel
+  need(sha(files[key])==old['sha256'] and len(files[key])==old['bytes'],'native binary original pin');sm['artifacts'][name]=b.binding(key,True)
+ sm['preparation_manifest']={'path':str(ROOT/'tools'/GROUPS['scanner']/'ARTIFACT_MANIFEST.json'),'sha256':sha(files['scanner/ARTIFACT_MANIFEST.json'])}
+ if 'independent_review' in sm:sm['preparation_independent_review']=sm.pop('independent_review')
+ sm.update(host_execution_disabled=False,activation_requires_independent_review=True,approved_to_flash=False);b.put('scanner/ARTIFACT_MANIFEST.json',sm)
+ # Shell is exactly the original embedded Python plus the same gate change.
+ old=files['acceptance/collect.py'].decode();need(b.files['acceptance/collect.sh'].count(old.encode())==1,'embedded collector mismatch')
+ b.exact('acceptance/collect.sh',old,b.files['acceptance/collect.py'].decode())
+ am=b.files_manifest('acceptance/MANIFEST.json','acceptance');am.pop('tests',None);am['preparation_manifest']={'path':str(ROOT/'tools'/GROUPS['acceptance']/'MANIFEST.json'),'sha256':sha(files['acceptance/MANIFEST.json'])};am.update(default_disabled=False,activation_requires_independent_review=True,approved_to_flash=False);b.put('acceptance/MANIFEST.json',am)
+ cm=b.obj('core/SOURCE_MANIFEST.json');cm['modules']={n:b.digest('core/'+n+'.py') for n in cm['modules']}
+ cm['deployment_manifest']=b.binding('scanner/ARTIFACT_MANIFEST.json');cm['recovery_manifest']=b.binding('recovery/MANIFEST.json');cm['nv_geometry']=b.binding('core/nv_geometry.json');cm['artifacts']['scanner']=copy.deepcopy(sm['artifacts']['scanner']);b.put('core/SOURCE_MANIFEST.json',cm)
+ old=assignment(b.files['core/workflow.py'],'MANIFEST_SHA')[0];need(old==sha(files['core/SOURCE_MANIFEST.json']),'workflow original manifest pin');b.set('core/workflow.py','MANIFEST_SHA',old,b.digest('core/SOURCE_MANIFEST.json'))
+ # Parse every Python file without importing or compiling/executing a copy.
+ for k,raw in b.files.items():
+  if k.endswith('.py'):ast.parse(raw.decode(),filename=k)
+ return b
+
+def load_sources():
+ catalog=json.loads(read(HERE/'SOURCE_CATALOG.json',CATALOG_SHA));need(catalog['schema']=='e5-activation-source-catalog-v1','catalog schema');files={}
+ for key,item in catalog['files'].items():
+  group,rel=key.split('/',1);need(group in GROUPS and rel and '..' not in Path(rel).parts and not Path(rel).is_absolute(),'catalog path')
+  files[key]=read(ROOT/'tools'/GROUPS[group]/rel,item['sha256'],item['bytes'])
+ need(sha(files['core/SOURCE_MANIFEST.json'])==catalog['source_manifest_sha256'] and sha(files['core/ACTIVATION_RECIPE.json'])==catalog['recipe_sha256'],'root manifest/recipe pins')
+ for item in catalog['external_inputs']:verify_stream(item)
+ return catalog,files
+
+def confirmation(path,digest,catalog):
+ value=json.loads(read(path,digest));fields={'schema','activation_id','action','source_catalog_sha256','source_manifest_sha256','recipe_sha256','confirmed_by','confirmed_at','phase_execution_authorized'}
+ need(set(value)==fields and value['schema']=='e5-host-activation-copy-confirmation-v1','confirmation fields')
+ need(value['action']=='CREATE_STABLE_FOUR_PACKAGE_HOST_COPY_ONLY' and value['phase_execution_authorized'] is False,'copy only, never phase execution authorization')
+ need(value['source_catalog_sha256']==CATALOG_SHA and value['source_manifest_sha256']==catalog['source_manifest_sha256'] and value['recipe_sha256']==catalog['recipe_sha256'],'confirmation sources')
+ need(isinstance(value['confirmed_by'],str) and value['confirmed_by'].strip(),'explicit named confirmation')
+ at=datetime.fromisoformat(value['confirmed_at']);need(at.tzinfo is not None and at<=datetime.now(timezone.utc),'confirmation time')
+ need(re.fullmatch('[a-f0-9]{16}',value['activation_id']) is not None,'activation id16');return value
+
+def make_copy(path,digest):
+ catalog,files=load_sources();confirm=confirmation(path,digest,catalog);ident=confirm['activation_id'];dest={g:ROOT/'tools'/(DEST_STEMS[g]+ident) for g in GROUPS};control=ROOT/'tools'/('e5_activation_bundle_'+ident)
+ for p in [control,*dest.values()]:need(not p.exists() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'all sibling outputs must be fresh')
+ b=reseal(files,dest,json.loads(files['core/ACTIVATION_RECIPE.json']))
+ # Source changes during precomputation are rejected before any output exists.
+ _,again=load_sources();need(files==again,'source drift before copy')
+ try:
+  mkdir(control)
+  write_new(control/'CONFIRMATION.json',read(path,digest));write_new(control/'SOURCE_CATALOG.json',read(HERE/'SOURCE_CATALOG.json',CATALOG_SHA))
+  for p in dest.values():mkdir(p)
+  for key,raw in sorted(b.files.items()):
+   p=Path(b.path(key));missing=[];parent=p.parent
+   while parent not in dest.values() and not parent.exists():missing.append(parent);parent=parent.parent
+   for q in reversed(missing):mkdir(q)
+   write_new(p,raw)
+  _,last=load_sources();need(files==last,'source drift during copy')
+  for k,raw in b.files.items():read(b.path(k),sha(raw),len(raw))
+  diffs=[]
+  for k in sorted(b.files):
+   if files[k]!=b.files[k]:
+    need(not k.endswith(('.ENABLED','.DISABLED')),'binary modification forbidden')
+    diffs.extend(difflib.unified_diff(files[k].decode().splitlines(True),b.files[k].decode().splitlines(True),fromfile='preparation/'+k,tofile='copy/'+k))
+  write_new(control/'CHANGES.patch',''.join(diffs).encode());write_new(control/'EDITS.json',encode(b.edits))
+  result={'schema':'e5-host-activation-copy-result-v1','activation_id':ident,'source_catalog_sha256':CATALOG_SHA,'confirmation':{'path':str(Path(path)),'sha256':digest},'directories':{k:str(v) for k,v in dest.items()},'files':{k:b.binding(k,True) for k in sorted(b.files)},'diff':{'path':str(control/'CHANGES.patch'),'sha256':sha(read(control/'CHANGES.patch'))},'device_io_performed':False,'copies_imported_or_executed':False,'phase_execution_authorized':False,'independent_enabled_copy_review_required':True,'status':'HOST_COPIES_RESEALED_NOT_EXECUTED'}
+  write_new(control/'RESULT.json',encode(result));write_new(control/'COMPLETE.json',encode({'schema':'e5-host-activation-copy-complete-v1','result_sha256':sha(encode(result)),'device_execution_authorized':False}));return result
+ except BaseException as exc:
+  try:write_new(control/'STOP.json',encode({'schema':'e5-host-activation-copy-stop-v1','error':type(exc).__name__+': '+str(exc),'all_partial_copies_invalid':True,'no_cleanup_or_automatic_retry':True,'device_io_performed':False}))
+  except BaseException:pass
+  raise
+
+def main():
+ p=argparse.ArgumentParser(description=__doc__);s=p.add_subparsers(dest='command');s.add_parser('plan');s.add_parser('verify-sources');q=s.add_parser('copy');q.add_argument('confirmation');q.add_argument('sha256');a=p.parse_args()
+ if a.command in (None,'plan'):out={'status':'PLAN_ONLY','source_catalog_sha256':CATALOG_SHA,'creates_on_explicit_copy_only':True,'stable_four_packages':True,'executes_copies':False,'device_io':False}
+ elif a.command=='verify-sources':c,f=load_sources();out={'source_files_verified':len(f),'copy_created':False,'device_io':False}
+ else:out=make_copy(Path(a.confirmation).absolute(),a.sha256)
+ print(json.dumps(out,ensure_ascii=False,sort_keys=True))
+if __name__=='__main__':main()

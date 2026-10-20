@@ -1,0 +1,60 @@
+'use strict';
+let started=0, checked=0, error=null, mutations=[];
+// Fixed production contract: setters read status before validating/dispatching.
+let state={ok:true, role:'device', policy:'auto', role_auto:false,
+ net_available:true, net_supported:['ncm','ecm','rndis'], net_current:'ncm',
+ net_mode:'ncm', net_scope:'permanent', net_auto:true, lan_auto:true};
+let mutation_error=null;
+const ctx = {
+ run: cmd => 0,
+ read_trim: path => null,
+ read_num: path => null,
+ sh: cmd => '',
+ sh_json: cmd => {
+  if (cmd == '/usr/libexec/unisoc-modem/device-usb get') return state;
+  if (cmd == '/usr/libexec/unisoc-modem/cpu-control get') return null;
+  assert(match(cmd, /^\/usr\/libexec\/unisoc-modem\/device-usb set-(role|lan-auto|net) /),'unexpected mocked command: '+cmd);
+  push(mutations, cmd);
+  return mutation_error ? {ok:false,error:mutation_error} : {ok:true};
+ },
+ uci: () => ({get: () => null, foreach: () => null}),
+ usb_status: () => ({state:'configured',ip:'192.0.2.1',reset:{busy:false,state:'done',stage:'complete',message:'done'}}),
+ usb_reset_start: () => {started++;return error;},
+ network_check_status:()=>({checks:['usb_not_enumerated','dhcp_not_running'],report:'/etc/e5-infoscreen/diagnostics/network.json'}),
+ network_check:()=>{checked++;return null;}
+};
+let categories=loadfile('/usr/share/e5-infoscreen/settings.uc',{raw_mode:true})()(ctx);
+let usb=filter(categories,c=>c.id=='usb')[0];assert(usb,'USB category missing');
+let items=usb.items();assert(filter(items,i=>i.id=='reset'&&i.confirm&&i.reload)[0],'recovery action missing');
+assert(filter(items,i=>i.id=='check')[0],'read-only check action missing');
+assert(filter(items,i=>i.id=='diagnosis')[0].value.zh=='电脑尚未识别 USB；DHCP 服务未运行','diagnosis not shown');
+assert(started==0 && length(mutations)==0,'reading settings changed hardware');
+assert(usb.set('reset')==null&&started==1,'button did not queue recovery');
+error='USB controller unavailable';assert(usb.set('reset')==error,'error was hidden');
+assert(usb.set('check')==null && checked==1,'read-only check did not use callback');
+let before=length(mutations);
+assert(usb.set('unknown')=='Invalid USB setting' && length(mutations)==before,'unknown action dispatched');
+for (let item in [
+ ['usb_role','device','set-role device 0'],
+ ['usb_host_boot',true,'set-role host 1'],
+ ['usb_lan_auto',false,'set-lan-auto 0'],
+ ['usb_net_mode','ecm','set-net ecm permanent 1'],
+ ['usb_net_scope','once','set-net ncm once 1'],
+ ['usb_net_auto',false,'set-net ncm permanent 0']
+]) {
+ assert(usb.set(item[0],item[1])==null,'valid USB setting rejected');
+ assert(mutations[length(mutations)-1]=='/usr/libexec/unisoc-modem/device-usb '+item[2],'wrong USB command');
+}
+before=length(mutations);
+for (let item in [
+ ['usb_role','invalid'],['usb_host_boot','1'],['usb_lan_auto',1],
+ ['usb_net_mode','invalid'],['usb_net_scope','invalid'],['usb_net_auto','1']
+]) assert(usb.set(item[0],item[1])=='Invalid USB setting','invalid setting accepted');
+assert(length(mutations)==before,'invalid setting dispatched');
+mutation_error='mock transport error';
+assert(usb.set('usb_role','device')==mutation_error,'USB mutation error hidden');
+state=null; before=length(mutations);
+assert(usb.set('usb_role','device')=='USB status unavailable','missing status not rejected');
+assert(usb.set('unknown')=='USB status unavailable','unavailable-state contract changed');
+assert(length(mutations)==before,'unavailable status dispatched');
+print('USB settings checks passed\n');

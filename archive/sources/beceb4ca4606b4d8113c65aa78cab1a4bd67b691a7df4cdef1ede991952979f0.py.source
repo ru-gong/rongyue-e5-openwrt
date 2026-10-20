@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""Host-only source/byte tests, all external process/network execution denied."""
+# Installed before loading collector: no actual device/VM/process/network calls.
+import sys
+def offline(event,args):
+    if event.startswith(("subprocess.","socket.")) or event in ("os.system","os.exec","os.posix_spawn","os.posix_spawnp"):
+        raise AssertionError("OFFLINE ONLY: "+event)
+sys.addaudithook(offline)
+import ast
+import contextlib
+import importlib.util
+import io
+import json
+from pathlib import Path
+import struct
+import sys
+import unittest
+from unittest import mock
+import zlib
+
+HERE=Path(__file__).resolve().parent;WORK=HERE.parents[1]
+spec=importlib.util.spec_from_file_location("collect",HERE/"collect.py")
+c=importlib.util.module_from_spec(spec);spec.loader.exec_module(c)
+
+
+class Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.misc=(WORK/"evidence/preflight-20261013/recovery-backup-04/misc.full.raw.bin").read_bytes()
+    def test_contract_exact_and_physical_map(self):
+        self.assertEqual(c.CONTRACT,json.loads((HERE/"contract.json").read_text()))
+        self.assertEqual(len(c.CONTRACT["protected_hashes"]),13)
+        self.assertEqual(len(c.CONTRACT["nv_partitions"]),9)
+        self.assertEqual(c.CONTRACT["partitions"]["boot_a"]["partition_number"],36)
+        self.assertEqual(c.CONTRACT["partitions"]["boot_b"]["partition_number"],37)
+    def test_misc_original_matches(self):
+        self.assertTrue(c.analyze_misc(self.misc)["outside32_matches_original"])
+    def test_misc_runtime_bc_change_allowed(self):
+        x=bytearray(self.misc);x[2048+12]=0x9f
+        struct.pack_into("<I",x,2048+28,zlib.crc32(x[2048:2048+28]))
+        self.assertTrue(c.analyze_misc(x)["bc_crc_valid"])
+    def test_misc_outside_change_retains_actual_evidence(self):
+        x=bytearray(self.misc);x[2080]^=1
+        with self.assertRaises(c.EvidenceFailure) as cm:c.analyze_misc(x)
+        self.assertIn("prefix_sha256",cm.exception.data)
+        self.assertEqual(cm.exception.data["sha256"],c.sha(x))
+    def test_misc_bad_crc_and_short_reject(self):
+        x=bytearray(self.misc);x[2079]^=1
+        with self.assertRaises(c.EvidenceFailure):c.analyze_misc(x)
+        with self.assertRaises(c.EvidenceFailure):c.analyze_misc(self.misc[:-1])
+    def test_boot_actual_final_local_file(self):
+        p=WORK/"materials/openwrt-no-auto-fsck-20261015/files/boot.img"
+        self.assertTrue(c.boot_observation(p)["outside_diagnostic_matches_final_boot"])
+    def test_boot_diagnostic_only_allowed(self):
+        with mock.patch.object(c,"blob_sha",side_effect=[c.CONTRACT["boot_prefix_56m_sha256"],"a"*64,c.CONTRACT["boot_suffix_from60m_sha256"]]) as h:
+            self.assertTrue(c.boot_observation("fake")["outside_diagnostic_matches_final_boot"])
+        self.assertEqual(h.call_args_list,[mock.call("fake",0,56<<20),mock.call("fake",56<<20,4<<20),mock.call("fake",60<<20,4<<20)])
+    def test_boot_outside_change_retained(self):
+        with mock.patch.object(c,"blob_sha",side_effect=["a"*64,"b"*64,c.CONTRACT["boot_suffix_from60m_sha256"]]):
+            with self.assertRaises(c.EvidenceFailure) as cm:c.boot_observation("fake")
+        self.assertEqual(cm.exception.data["prefix_0_to_56m"],"a"*64)
+    def test_prepare_and_reboot_commands_rejected(self):
+        with mock.patch.object(c.subprocess,"run") as proc:
+            for command in (["reboot"],["/opt/e5/t551m-nv-prepare"],["/bin/bash","/opt/e5/e5-next-boot","linux"],["/bin/busybox","dmesg","-c"]):
+                with self.assertRaises(c.EvidenceFailure):c.run_command(command)
+        proc.assert_not_called()
+    def test_command_nonzero_output_retained_and_python_no_cache(self):
+        completed=type("Result",(),{"returncode":1,"stdout":b"checks partially passed","stderr":b"NV failure"})()
+        with mock.patch.object(c.subprocess,"run",return_value=completed) as proc:
+            got=c.run_command(["/usr/bin/python3","-B","/opt/e5/t551m-nv-verify"])
+        self.assertEqual(got["exit_code"],1);self.assertEqual(got["stderr"],"NV failure")
+        self.assertEqual(proc.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"],"1")
+    def test_mac_platform_guard_no_collection(self):
+        with mock.patch.object(c,"DEVICE_IO_DISABLED",False),mock.patch.object(c.sys,"platform","darwin"),mock.patch.object(c,"blob_sha") as read,contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(c.main(),2)
+        read.assert_not_called();self.assertFalse(json.loads(out.getvalue())["ok"])
+    def test_no_file_write_network_or_rw_ioctl_source(self):
+        tree=ast.parse((HERE/"collect.py").read_text())
+        forbidden={"write_bytes","write_text","unlink","remove","rename","replace","mkdir","rmdir","chmod","chown","symlink_to","connect","socket","mount"}
+        for node in ast.walk(tree):
+            if not isinstance(node,ast.Call) or not isinstance(node.func,ast.Attribute):continue
+            self.assertNotIn(node.func.attr,forbidden)
+            if node.func.attr=="open":self.assertEqual(ast.literal_eval(node.args[0]),"rb")
+            if node.func.attr=="ioctl":self.assertIn(ast.literal_eval(node.args[1]),(0x80081272,0x125e))
+    def test_runtime_script_hashes_match_actual_extracted_files(self):
+        root=HERE/"runtime-selected"
+        for p,h in c.CONTRACT["runtime_scripts"].items():self.assertEqual(c.sha((root/p.lstrip('/')).read_bytes()),h)
+    def test_shell_wrapper_exact_python_payload(self):
+        sh=(HERE/"collect.sh").read_text()
+        payload=sh.split("<<'E5_READONLY_PYTHON_20261015'\n",1)[1].rsplit("\nE5_READONLY_PYTHON_20261015\n",1)[0]
+        self.assertEqual(payload,(HERE/"collect.py").read_text())
+
+    def test_disabled_before_device_identity_or_io(self):
+        with mock.patch.object(c,"blob_sha",side_effect=AssertionError("no read")),mock.patch.object(c.os,"uname",side_effect=AssertionError("no device identity")),contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(c.main(),70)
+        self.assertEqual(json.loads(out.getvalue())["id"],"disabled")
+    def test_current_profile_and_candidate_exact(self):
+        profile=json.loads((WORK/"tools/e5_android_install_live_20261013/device-profile.json").read_text())
+        self.assertEqual(c.CONTRACT["protected_hashes"],profile["protected_hashes"])
+        self.assertEqual(c.CONTRACT["gpt_prefix_sha256"],profile["gpt_prefix_sha256"])
+        for name,item in profile["partitions"].items():
+            self.assertEqual(c.CONTRACT["partitions"][name],{"partition_number":int(item["node"].split("mmcblk0p")[1]),"start_sector":item["start_lba"],"bytes":item["bytes"]})
+        candidate=Path(c.CONTRACT["candidate"]["path"])
+        self.assertEqual(c.sha(candidate.read_bytes()),c.CONTRACT["candidate"]["sha256"])
+        self.assertEqual(json.loads(candidate.read_text())["artifacts"]["boot"]["sha256"],c.CONTRACT["boot_sha256"])
+    def test_old_candidate_boot_rejected(self):
+        with self.assertRaises(c.EvidenceFailure):c.boot_observation(WORK/"evidence/stage2-execution-20261013/final-install-bundle/boot.img")
+    def test_new_fresh_nv_origin(self):
+        v={n["partition"]:"a"*64 for n in c.CONTRACT["nv_partitions"]};self.assertTrue(c.analyze_nv_origin(v,v)["origin_matches_this_boot_source"])
+    def test_retained_origin_explicit_not_fresh(self):
+        v={n["partition"]:"a"*64 for n in c.CONTRACT["nv_partitions"]};src=dict(v);src["calinv"]="b"*64
+        self.assertTrue(c.analyze_nv_origin(v,src)["source_changed_retaining_is_not_fresh_origin"])
+        self.assertFalse(c.analyze_nv_origin(v,src)["origin_matches_this_boot_source"])
+    def test_nv_origin_unknown_missing_invalid_refused(self):
+        v={n["partition"]:"a"*64 for n in c.CONTRACT["nv_partitions"]}
+        for bad in ({},dict(v,unknown="b"*64),dict(v,calinv="wrong")):
+            with self.assertRaises(c.EvidenceFailure):c.analyze_nv_origin(bad,v)
+            with self.assertRaises(c.EvidenceFailure):c.analyze_nv_origin(v,bad)
+    def test_at_and_nv_refresh_never_allowed(self):
+        with mock.patch.object(c.subprocess,"run") as proc:
+            for cmd in (["mmcli","-m","0","--command=AT"],["/opt/e5/t551m-nv-prepare","--refresh"],["/bin/bash","/opt/e5/e5-next-boot","android"]):
+                with self.assertRaises(c.EvidenceFailure):c.run_command(cmd)
+        proc.assert_not_called()
+
+if __name__=="__main__":
+    def deny(event,args):
+        if event.startswith(("subprocess.","os.system","os.exec","os.posix_spawn","pty.spawn","socket.connect")):
+            raise AssertionError("OFFLINE ONLY: "+event)
+    sys.addaudithook(deny)
+    unittest.main(verbosity=2)

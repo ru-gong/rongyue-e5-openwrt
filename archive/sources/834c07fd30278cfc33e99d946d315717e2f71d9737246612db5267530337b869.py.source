@@ -1,0 +1,274 @@
+"""Host bounded transport + durable uncertainty barrier. No CLI/device policy.
+
+The Android adapter owns a literal disabled gate and fixed argv. This module
+also serves real host-pipe tests; it never retries or clears uncertain state.
+"""
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import threading
+import time
+import uuid
+
+MAX_INPUT = 4 << 20
+MAX_OUTPUT = (16 << 20) + 65536
+MAX_STDERR = 16384
+MAX_SECONDS = 8.0
+STEP = 65536
+
+class TransportError(RuntimeError): pass
+class Uncertain(TransportError): pass
+class Cancelled(TransportError): pass
+
+def require(ok, why):
+    if not ok: raise TransportError(why)
+
+def digest(data): return hashlib.sha256(data).hexdigest()
+def canonical(value): return json.dumps(value, sort_keys=True, separators=(',', ':')).encode()
+def fsync_dir(path):
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+def save(path,data):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f: f.write(data); f.flush(); os.fsync(f.fileno())
+    fsync_dir(path.parent)
+def save_json(path,value): save(path,canonical(value)+b'\n')
+def safe_directory(path,create=False):
+    p=Path(path)
+    require(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe host directory')
+    if create: p.mkdir(mode=0o700,exist_ok=False); fsync_dir(p.parent)
+    require(p.is_dir(),'host directory missing')
+    return p
+
+@contextlib.contextmanager
+def cancellation_signals():
+    old={}
+    def stop(signum,frame): raise Cancelled('operator signal '+str(signum))
+    if threading.current_thread() is threading.main_thread():
+        for sig in (signal.SIGINT,signal.SIGTERM):old[sig]=signal.getsignal(sig);signal.signal(sig,stop)
+    try:yield
+    finally:
+        for sig,handler in old.items():signal.signal(sig,handler)
+
+class BoundedTransport:
+    def __init__(self,evidence_dir,state_dir,serial,boot_id,txid,*,cancel_event=None,
+                 recovery_context=None,reconciliation_only=False,recovery_source_sha=None):
+        require(re.fullmatch(r'[A-Z0-9]+',serial) is not None,'serial')
+        require(re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',boot_id) is not None,'boot')
+        require(re.fullmatch(r'[0-9a-f]{16}',txid) is not None,'txid')
+        self.serial,self.boot_id,self.txid=serial,boot_id,txid
+        require(type(reconciliation_only) is bool,'reconciliation mode')
+        require(not (reconciliation_only and recovery_context is not None),'mutually exclusive recovery modes')
+        if recovery_context is not None:
+            require(isinstance(recovery_context,dict) and set(recovery_context)=={'request_sha256','txid','boot_id'} and
+                    re.fullmatch('[0-9a-f]{64}',recovery_context['request_sha256']) is not None and
+                    recovery_context['txid']==txid and recovery_context['boot_id']==boot_id,'recovery context binding')
+        self.recovery_context=dict(recovery_context) if recovery_context is not None else None
+        self.reconciliation_only=reconciliation_only;self.recovery_source_sha=recovery_source_sha
+        if reconciliation_only or recovery_context is not None:self._recovery_source()
+        self.state=safe_directory(state_dir)
+        self.evidence=safe_directory(evidence_dir,True)
+        self.cancel_event=cancel_event;self.poisoned=False;self.index=0
+        # Shared state path is fixed by the production caller per physical serial.
+        # All instances at that path observe unacknowledged/crashed requests.
+        self.global_active=self.state/'ACTIVE.json';self.global_uncertain=self.state/'UNCERTAIN.json'
+        self.recovery_only=self.state/'RECOVERY_ONLY.json';self.recovery_pending=self.state/'RECOVERY_PENDING.json'
+        binding=self.state/'STATE_BINDING.json'
+        if binding.exists():
+            st=binding.lstat();require(stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_size<1024,'unsafe state binding')
+            require(json.loads(binding.read_text())=={'schema':'e5-transport-state-v1','serial':serial},'state serial binding differs')
+        else:
+            require(not binding.is_symlink(),'dangling state binding')
+            require(not reconciliation_only,'reconciliation requires existing shared state identity')
+            save_json(binding,{'schema':'e5-transport-state-v1','serial':serial})
+        self.operation_state=self.evidence if reconciliation_only else self.state
+        self.active=self.operation_state/'ACTIVE.json';self.uncertain=self.operation_state/'UNCERTAIN.json'
+        self.completed=self.operation_state/'completed'
+        if not self.completed.exists():self.completed.mkdir(mode=0o700);fsync_dir(self.operation_state)
+        safe_directory(self.completed)
+        save_json(self.evidence/'binding.json',dict(serial=serial,boot_id=boot_id,txid=txid,state_dir=str(self.state),
+            reconciliation_only=reconciliation_only,recovery_context=self.recovery_context,recovery_source_sha256=recovery_source_sha))
+
+    def _recovery_source(self):
+        path=Path(__file__).resolve().with_name('uncertainty_recovery.py')
+        require(isinstance(self.recovery_source_sha,str) and re.fullmatch('[0-9a-f]{64}',self.recovery_source_sha),'pinned recovery source required')
+        require(not path.is_symlink() and all(not x.is_symlink() for x in path.parents),'unsafe recovery source')
+        st=path.lstat();require(stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_size<=262144,'recovery source type/size')
+        raw=path.read_bytes();require(digest(raw)==self.recovery_source_sha,'recovery source pin changed')
+        return path,raw
+
+    def _validate_recovery_context(self):
+        # Execute only the exact local bytes checked above; no arbitrary module path.
+        path,raw=self._recovery_source()
+        spec=importlib.util.spec_from_file_location('_e5_pinned_uncertainty_recovery',path)
+        module=importlib.util.module_from_spec(spec)
+        exec(compile(raw,str(path),'exec'),module.__dict__)
+        return module.validate_context(self.state,self.serial,self.recovery_context)
+
+    def _mode_gate(self,label=None,mutating=False,followup=None,payload=b''):
+        require(not self.recovery_pending.exists() and not self.recovery_pending.is_symlink(),'unfinished recovery transition')
+        if self.reconciliation_only:
+            self._recovery_source()
+            require(not mutating and followup is None and not payload,'reconciliation permits payload-free reads only; no followup')
+        elif self.recovery_context is not None:
+            self._validate_recovery_context()
+            require(not mutating or label in ('write-boot_b','write-misc32'),'recovery permits only fixed original B/misc32 mutations')
+        else:
+            require(not self.recovery_only.exists() and not self.recovery_only.is_symlink(),'recovery-only barrier; ordinary operations forbidden')
+
+    def mark_uncertain(self,reason):
+        """Poison after a host-side validation failure outside a request."""
+        self.poisoned=True
+        if not self.uncertain.exists():
+            save_json(self.uncertain,dict(schema='e5-bounded-transport-v1',status='UNCERTAIN',serial=self.serial,
+                boot_id=self.boot_id,txid=self.txid,reason=str(reason),remote_completion_proven=False,
+                evidence_directory=str(self.evidence),automatic_retry=False))
+
+    def _cancel(self,transaction_deadline=None):
+        if self.cancel_event is not None and self.cancel_event.is_set():raise Cancelled('cancel event')
+        if transaction_deadline is not None and time.monotonic()>=transaction_deadline:raise Cancelled('transaction deadline')
+
+    @contextlib.contextmanager
+    def _lock(self):
+        fd=os.open(self.state/'LOCK',os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600)
+        try:
+            s=os.fstat(fd);require(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and s.st_uid==os.getuid(),'unsafe lock inode')
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            self._mode_gate()
+            require(not self.poisoned and not self.active.exists() and not self.active.is_symlink() and
+                    not self.uncertain.exists() and not self.uncertain.is_symlink(),'persistent uncertainty; separate manual review required')
+            yield
+        finally:os.close(fd)
+
+    def _collect(self,argv,payload,limit,deadline_s,transaction_deadline):
+        start=time.monotonic();end=start+deadline_s
+        if transaction_deadline is not None:end=min(end,transaction_deadline)
+        proc=None;sel=selectors.DefaultSelector();out=bytearray();err=bytearray();sent=0;failure=None
+        try:
+            self._cancel(transaction_deadline)
+            proc=subprocess.Popen(argv,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE,bufsize=0,start_new_session=True)
+            for stream,label in ((proc.stdout,'out'),(proc.stderr,'err')):
+                os.set_blocking(stream.fileno(),False);sel.register(stream,selectors.EVENT_READ,label)
+            if payload:os.set_blocking(proc.stdin.fileno(),False);sel.register(proc.stdin,selectors.EVENT_WRITE,'in')
+            else:proc.stdin.close()
+            while sel.get_map():
+                self._cancel(transaction_deadline)
+                remain=end-time.monotonic()
+                if remain<=0:raise Cancelled('request deadline')
+                for key,_ in sel.select(min(remain,.05)):
+                    if key.data=='in':
+                        n=os.write(key.fileobj.fileno(),memoryview(payload)[sent:sent+STEP])
+                        if n<=0:raise TransportError('zero stdin progress')
+                        sent+=n
+                        if sent==len(payload):sel.unregister(key.fileobj);key.fileobj.close()
+                    else:
+                        data=os.read(key.fileobj.fileno(),STEP)
+                        if not data:sel.unregister(key.fileobj);continue
+                        target,cap=(out,limit) if key.data=='out' else (err,MAX_STDERR)
+                        room=cap-len(target);target.extend(data[:max(0,room)])
+                        if len(data)>room:raise TransportError(key.data+' output limit')
+            self._cancel(transaction_deadline)
+            proc.wait(timeout=max(.001,end-time.monotonic()))
+            if time.monotonic()>end:raise Cancelled('request deadline')
+            require(sent==len(payload),'incomplete stdin transfer')
+        except BaseException as exc:
+            failure=type(exc).__name__+': '+str(exc)
+        finally:
+            if proc is not None and proc.poll() is None:
+                # Only the host process group; this does not prove remote quiescence.
+                try:os.killpg(proc.pid,signal.SIGKILL)
+                except ProcessLookupError:pass
+                try:proc.wait(timeout=1)
+                except BaseException:pass
+            sel.close()
+            if proc is not None:
+                for stream in (proc.stdin,proc.stdout,proc.stderr):
+                    try:stream.close()
+                    except Exception:pass
+        return dict(stdout=bytes(out),stderr=bytes(err),returncode=proc.returncode if proc else None,
+                    failure=failure,stdin_bytes_sent=sent,elapsed_seconds=time.monotonic()-start,
+                    host_child_reaped=proc is None or proc.poll() is not None,remote_completion_proven=False)
+
+    def request(self,label,argv,*,payload=b'',output_limit,validator,mutating=False,deadline_s=8.0,
+                op_id=None,transaction_deadline=None,metadata=None,followup=None):
+        require(isinstance(label,str) and re.fullmatch(r'[a-z0-9_-]+',label),'operation label')
+        require(isinstance(argv,list) and argv and all(isinstance(x,str) and '\0' not in x for x in argv),'argv')
+        require(isinstance(payload,bytes) and len(payload)<=MAX_INPUT,'bounded input required')
+        require(type(output_limit) is int and 0<output_limit<=MAX_OUTPUT,'output cap')
+        require(0<float(deadline_s)<=MAX_SECONDS,'short request deadline required')
+        require(callable(validator),'exact result validator required')
+        require(not mutating or callable(followup),'mutating request requires readback followup before COMPLETE')
+        op_id=op_id or uuid.uuid4().hex
+        require(re.fullmatch(r'[0-9a-f]{32}',op_id) is not None,'op ID')
+        with self._lock(),cancellation_signals():
+            self._mode_gate(label,mutating,followup,payload)
+            self._cancel(transaction_deadline)
+            require(not (self.completed/(op_id+'.json')).exists(),'operation ID already completed')
+            self.index+=1;folder=self.evidence/(f'{self.index:06d}-'+label+'-'+op_id)
+            folder.mkdir(mode=0o700);fsync_dir(self.evidence)
+            begin=dict(schema='e5-bounded-transport-v1',status='IN_FLIGHT',serial=self.serial,boot_id=self.boot_id,
+                       txid=self.txid,op_id=op_id,label=label,mutating=bool(mutating),argv=argv,argv_sha256=digest(canonical(argv)),
+                       payload_bytes=len(payload),payload_sha256=digest(payload),output_limit=output_limit,stderr_limit=MAX_STDERR,
+                       deadline_seconds=deadline_s,transaction_monotonic_deadline=transaction_deadline,metadata=metadata or {},
+                       evidence_directory=str(folder),automatic_retry=False)
+            begin.update(reconciliation_only=self.reconciliation_only,recovery_context=self.recovery_context)
+            save_json(folder/'IN_FLIGHT.json',begin);save_json(self.active,begin)
+            result=None
+            try:
+                result=self._collect(argv,payload,output_limit,deadline_s,transaction_deadline)
+                save(folder/'stdout.bin',result['stdout']);save(folder/'stderr.bin',result['stderr'])
+                summary={k:v for k,v in result.items() if k not in ('stdout','stderr')}
+                summary.update(stdout_bytes=len(result['stdout']),stdout_sha256=digest(result['stdout']),stderr_bytes=len(result['stderr']))
+                save_json(folder/'transport-result.json',summary)
+                require(result['failure'] is None and result['returncode']==0 and not result['stderr'],'transport failed/uncertain')
+                parsed=validator(result['stdout'])
+                part_index=0
+                def request_part(label,argv,*,payload=b'',output_limit,validator,deadline_s=8.0,metadata=None):
+                    nonlocal part_index
+                    require(re.fullmatch(r'[a-z0-9_-]+',label) is not None,'part label')
+                    require(isinstance(argv,list) and argv and all(isinstance(x,str) and '\0' not in x for x in argv),'part argv')
+                    require(isinstance(payload,bytes) and len(payload)<=MAX_INPUT,'part payload')
+                    require(type(output_limit) is int and 0<output_limit<=MAX_OUTPUT and 0<float(deadline_s)<=MAX_SECONDS,'part bounds')
+                    require(callable(validator),'part validator')
+                    self._mode_gate(label,False,None,payload)
+                    self._cancel(transaction_deadline);part_index+=1
+                    sub=folder/(f'part-{part_index:03d}-'+label);sub.mkdir(mode=0o700);fsync_dir(folder)
+                    save_json(sub/'IN_FLIGHT.json',dict(begin,label=label,part_index=part_index,argv=argv,
+                        argv_sha256=digest(canonical(argv)),payload_bytes=len(payload),payload_sha256=digest(payload),
+                        output_limit=output_limit,deadline_seconds=deadline_s,metadata=metadata or {}))
+                    r=self._collect(argv,payload,output_limit,deadline_s,transaction_deadline)
+                    save(sub/'stdout.bin',r['stdout']);save(sub/'stderr.bin',r['stderr'])
+                    save_json(sub/'transport-result.json',{**{k:v for k,v in r.items() if k not in ('stdout','stderr')},
+                        'stdout_bytes':len(r['stdout']),'stdout_sha256':digest(r['stdout']),'stderr_bytes':len(r['stderr'])})
+                    require(r['failure'] is None and r['returncode']==0 and not r['stderr'],'followup transport failed/uncertain')
+                    verified=validator(r['stdout']);self._cancel(transaction_deadline)
+                    save_json(sub/'PART_VERIFIED.json',dict(op_id=op_id,part_index=part_index,validated=True))
+                    return verified
+                if followup is not None:parsed=followup(parsed,request_part)
+                self._cancel(transaction_deadline)
+                complete=dict(begin,status='COMPLETE',stdout_sha256=digest(result['stdout']),validated=True)
+                save_json(folder/'COMPLETE.json',complete)
+                # A crash before unlink leaves ACTIVE -> manual review, never replay.
+                # Original begin evidence remains in the operation directory.
+                save_json(self.completed/(op_id+'.json'),complete)
+                self.active.unlink();fsync_dir(self.operation_state)
+                return parsed
+            except BaseException as exc:
+                self.poisoned=True
+                failure=dict(begin,status='UNCERTAIN',reason=type(exc).__name__+': '+str(exc),
+                             remote_completion_proven=False,automatic_retry=False)
+                try:save_json(folder/'UNCERTAIN.json',failure)
+                except BaseException:pass
+                try:save_json(self.uncertain,failure)
+                except BaseException:pass
+                raise Uncertain('operation uncertain; no retry or later operation: '+str(exc)) from exc

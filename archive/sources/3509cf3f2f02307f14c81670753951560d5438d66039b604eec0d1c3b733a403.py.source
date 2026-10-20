@@ -1,0 +1,443 @@
+"""Prepared ordinary-directory session using AndroidDirectoryAdapter's real API.
+
+Both this session and the transport are hard disabled. No CLI/env activation,
+block-write, reboot, retry or automatic rollback exists. Fake tests exercise
+the same algorithm; they are not Android/F2FS validation or execution consent.
+"""
+from datetime import datetime, timezone, timedelta
+import contextlib
+import fcntl
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+
+import android_directory_adapter as adapter_api
+
+DEVICE_SESSION_DISABLED = True
+ROOT = Path(__file__).resolve().parents[2]
+CANDIDATE_PATH = ROOT / "research/author-clean-reinstall-20261014/candidate.json"
+CANDIDATE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+COLD_SOURCE = ROOT / "tools/e5_resume_prepare_20261013/plan.py"
+COLD_SOURCE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+PROFILE_PATH = ROOT / "tools/e5_android_install_live_20261013/device-profile.json"
+PROFILE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+B_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+M_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+SERIAL = "DEVICE_SERIAL_REDACTED"
+ROLES = ("active", "stage", "archive", "failed")
+GLOBAL_DEVICE_LOCK = ROOT / "evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock"
+PENDING_NAMES = {"boot-os-next", "stay", "openwrt.ext4.new", "openwrt.ext4.old"}
+EVENTS = {"SESSION_BOUND", "ARCHIVE_BEGIN", "ARCHIVE_DONE", "ACTIVATE_BEGIN", "ACTIVATE_DONE", "ACTIVATED",
+          "PRESERVE_FAILED_BEGIN", "PRESERVE_FAILED_DONE", "RESTORE_BEGIN", "RESTORE_MOVE_BEGIN",
+          "RESTORE_MOVE_DONE", "ROLLED_BACK"}
+
+
+class Refusal(RuntimeError):
+    pass
+
+
+def require(value, message):
+    if not value: raise Refusal(message)
+
+
+def canonical(obj):
+    return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _gate():
+    require(not DEVICE_SESSION_DISABLED, "DEVICE_SESSION_DISABLED: preparation only")
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def _time(value):
+    parsed = datetime.fromisoformat(value)
+    require(parsed.tzinfo is not None, "timestamp must have timezone")
+    return parsed
+
+
+def _local(path):
+    path = Path(path)
+    require(path.is_absolute() and not path.is_symlink() and
+            all(not q.is_symlink() for q in path.parents), "unsafe host path")
+    st = path.stat()
+    require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1, "host input must be ordinary unlinked file")
+    return path
+
+
+def _json(binding, limit=4 << 20):
+    require(set(binding) == {"path", "sha256"} and adapter_api.valid_sha(binding["sha256"]), "invalid host binding")
+    path = _local(binding["path"])
+    require(path.stat().st_size <= limit, "oversized JSON")
+    raw = path.read_bytes()
+    require(len(raw) <= limit and digest(raw) == binding["sha256"], "host evidence hash changed")
+    return json.loads(raw)
+
+
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+
+def _new_json(path, value):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(canonical(value) + b"\n"); f.flush(); os.fsync(f.fileno())
+    _fsync_dir(path.parent)
+
+
+@contextlib.contextmanager
+def _device_lock():
+    """One host lock across evidence folders/transactions; never unlink it."""
+    path = GLOBAL_DEVICE_LOCK
+    require(path.is_absolute() and path.parent.is_dir() and not path.is_symlink() and
+            all(not p.is_symlink() for p in path.parents), "unsafe global lock path")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        st = os.fstat(fd)
+        require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.getuid() and
+                stat.S_IMODE(st.st_mode) == 0o600, "unsafe global lock inode")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _cold_validate(binding, boot_id, now):
+    require(set(binding) == {"evidence_directory", "evidence_sha256", "review_sha256", "plan_path", "plan_sha256"},
+            "cold binding missing exact fields")
+    require(digest(_local(COLD_SOURCE).read_bytes()) == COLD_SOURCE_SHA, "cold validator changed")
+    spec = importlib.util.spec_from_file_location("_e5_bound_cold_resume", COLD_SOURCE)
+    module = importlib.util.module_from_spec(spec); spec.loader.exec_module(module)
+    recorded = _json({"path": binding["plan_path"], "sha256": binding["plan_sha256"]})
+    actual = module.validate_future(binding["evidence_directory"], binding["evidence_sha256"],
+                                    binding["review_sha256"], now=now)
+    require(actual == recorded, "cold plan is not reproducible from the bound evidence")
+    require(recorded.get("schema") == "e5-offline-resume-plan-v1" and recorded.get("status") == "NO_WRITE_NEEDED"
+            and recorded.get("boot_id") == boot_id and recorded.get("serial") == SERIAL
+            and recorded.get("current_boot_b_sha256") == B_SHA and recorded.get("current_misc_sha256") == M_SHA,
+            "cold gate requires original B/misc already restored on this boot")
+    require(recorded.get("device_execution_allowed") is False and recorded.get("approved_to_flash") is False,
+            "cold evidence must not masquerade as execution authorization")
+    require(now < _time(recorded["expires_at"]), "cold evidence expired")
+    return recorded
+
+
+def _inventory(binding, txid, role=None, boot_id=None):
+    item = _json(binding)
+    require(item.get("schema") == "e5-device-directory-inventory-v1" and item.get("txid") == txid
+            and item.get("role") in ROLES, "inventory transaction/schema")
+    if role is not None: require(item["role"] == role, "inventory role mismatch")
+    if boot_id is not None: require(item["boot_id"] == boot_id, "inventory is from another boot")
+    rows = item.get("rows")
+    require(isinstance(rows, list) and rows and rows[0]["path"] == "." and rows[0]["type"] == "d",
+            "inventory root missing")
+    require(item.get("tree_sha256") == adapter_api.tree_digest(rows), "inventory digest mismatch")
+    require(len({r["path"] for r in rows}) == len(rows) and len({r["dev"] for r in rows}) == 1,
+            "duplicate inventory paths/cross filesystem")
+    for row in rows:
+        require(set(row) == {"path", "type", "sha256", "dev", "inode", "bytes", "mode", "uid", "gid"}, "inventory fields")
+        require(row["path"] == "." or (re.fullmatch(r"\./[A-Za-z0-9_./-]+", row["path"]) and
+                ".." not in row["path"].split("/")), "unsafe inventory path")
+        require(row["type"] in ("d", "f") and (row["sha256"] == "-" if row["type"] == "d" else
+                adapter_api.valid_sha(row["sha256"])), "invalid inventory node")
+        require(all(type(row[x]) is int and row[x] >= 0 for x in ("dev", "inode", "bytes", "uid", "gid")) and
+                re.fullmatch(r"[0-7]{3,4}", row["mode"]), "invalid inventory stat")
+    return item
+
+
+def _backup(binding, snapshot):
+    require(set(binding) == {"path", "bytes", "sha256", "receipt_path", "receipt_sha256"}, "backup fields")
+    path = adapter_api.Artifact(Path(binding["path"]), binding["bytes"], binding["sha256"]).verify()
+    receipt = _json({"path": binding["receipt_path"], "sha256": binding["receipt_sha256"]})
+    measured = adapter_api.verify_backup_tar(path, snapshot)
+    require(receipt.get("schema") == "e5-full-directory-backup-v1" and receipt.get("complete") is True and
+            receipt.get("txid") == snapshot["txid"] and receipt.get("boot_id") == snapshot["boot_id"] and
+            receipt.get("role") == snapshot["role"] and receipt.get("path") == str(path), "backup receipt identity")
+    require(all(receipt.get(k) == v for k, v in measured.items()), "backup tar/receipt mismatch")
+    return receipt
+
+
+def _stage_matches(snapshot, candidate):
+    files = {r["path"][2:]: r for r in snapshot["rows"] if r["type"] == "f"}
+    require(set(files) == set(candidate["outer_file_set"]) and len(snapshot["rows"]) == len(files) + 1,
+            "candidate outer file set differs")
+    for name, expected in candidate["outer_file_set"].items():
+        require(files[name]["sha256"] == expected["sha256"] and files[name]["bytes"] == expected["bytes"],
+                "stage not equal to fixed clean candidate: " + name)
+        require(files[name]["uid"] == files[name]["gid"] == 0 and
+                int(files[name]["mode"], 8) == (0o700 if name == "fscrypt-probe" else 0o600), "stage file ownership/mode")
+    require(snapshot["rows"][0]["uid"] == snapshot["rows"][0]["gid"] == 0 and
+            int(snapshot["rows"][0]["mode"], 8) == 0o700, "stage directory ownership/mode")
+
+
+def review_binding(request):
+    """Exact hashes a human review must bind; hashes provide integrity, not identity."""
+    keys = ("candidate", "original_inventory", "stage_inventory", "original_backup", "cold_resume")
+    result = {"mode": request["mode"], "txid": request["txid"], "boot_id": request["boot_id"]}
+    result.update({key: digest(canonical(request[key])) for key in keys})
+    for key in ("origin_session", "failed_inventory", "failed_backup"):
+        if key in request: result[key] = digest(canonical(request[key]))
+    return result
+
+
+def validate_request(path, sha256, now=None):
+    """Offline only: replay existing cold-resume validator, never touch adapter."""
+    now = now or _now()
+    request = _json({"path": str(path), "sha256": sha256})
+    common = {"schema", "mode", "serial", "txid", "boot_id", "candidate", "cold_resume",
+              "original_inventory", "stage_inventory", "original_backup", "technical_review"}
+    mode = request.get("mode")
+    extra = {"origin_session", "failed_inventory", "failed_backup"} if mode == "rollback" else set()
+    require(set(request) == common | extra and mode in ("activate", "rollback") and
+            request["schema"] == "e5-clean-directory-session-request-v1" and request["serial"] == SERIAL,
+            "unknown request schema/fields/mode")
+    require(re.fullmatch(r"[0-9a-f]{16}", request["txid"]) and re.fullmatch(
+        r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", request["boot_id"]), "invalid transaction/boot")
+    require(request["candidate"] == {"path": str(CANDIDATE_PATH), "sha256": CANDIDATE_SHA}, "unapproved candidate")
+    candidate = _json(request["candidate"])
+    require(candidate.get("schema") == "e5-clean-author-candidate-v1" and
+            candidate.get("approved_for_device_execution") is False, "candidate schema/approval boundary")
+    for name in ("inner_default_android", "no_private_nv", "no_previous_origin", "no_pending_update"):
+        require(candidate["attestation"].get(name) is True, "candidate offline attestation missing")
+    cold = _cold_validate(request["cold_resume"], request["boot_id"], now)
+    original = _inventory(request["original_inventory"], request["txid"], "active")
+    require(not ({row["path"][2:] for row in original["rows"]} & PENDING_NAMES),
+            "original directory has pending boot/update markers; stop for review")
+    stage = _inventory(request["stage_inventory"], request["txid"], "stage")
+    _stage_matches(stage, candidate)
+    require(original["rows"][0]["dev"] == stage["rows"][0]["dev"] and
+            original["rows"][0]["inode"] != stage["rows"][0]["inode"], "source/stage identity collision")
+    _backup(request["original_backup"], original)
+    failed = None
+    if mode == "activate":
+        require(original["boot_id"] == stage["boot_id"] == request["boot_id"], "stale activation inventories")
+    else:
+        origin = _json(request["origin_session"])
+        require(origin.get("schema") == "e5-clean-directory-session-plan-v1" and origin["request"]["mode"] == "activate"
+                and origin["request"]["txid"] == request["txid"], "rollback origin not an activation session")
+        for key in ("candidate", "original_inventory", "stage_inventory", "original_backup"):
+            require(origin["request"][key] == request[key], "rollback changes origin binding")
+        if request["failed_inventory"] is not None or request["failed_backup"] is not None:
+            require(request["failed_inventory"] is not None and request["failed_backup"] is not None,
+                    "changed candidate needs both inventory and complete backup")
+            failed = _inventory(request["failed_inventory"], request["txid"], "active", request["boot_id"])
+            require(failed["rows"][0]["dev"] == stage["rows"][0]["dev"] and
+                    failed["rows"][0]["inode"] == stage["rows"][0]["inode"], "failed candidate root identity changed")
+            _backup(request["failed_backup"], failed)
+    review = _json(request["technical_review"])
+    require(review.get("schema") == "e5-clean-directory-session-review-v1" and
+            review.get("bindings") == review_binding(request) and
+            isinstance(review.get("reviewer"), str) and review["reviewer"].strip() and
+            review.get("conclusion") == "exact_directory_transaction_reviewed" and
+            now - timedelta(minutes=15) <= _time(review["reviewed_at"]) <= now,
+            "review missing/stale/not bound to exact request")
+    profile = _json({"path": str(PROFILE_PATH), "sha256": PROFILE_SHA})
+    return {"request": request, "request_sha256": sha256, "candidate": candidate, "cold": cold,
+            "original": original, "stage": stage, "failed": failed, "profile": profile}
+
+
+def _fresh(adapter, validated, now):
+    request = validated["request"]
+    require(now < _time(validated["cold"]["expires_at"]), "cold evidence expired before move")
+    binding = {"request_sha256": validated["request_sha256"], "txid": request["txid"], "boot_id": request["boot_id"],
+               "expires_at": validated["cold"]["expires_at"]}
+    reply = adapter.fresh_gate(binding)
+    checked_at = _now()
+    require(all(reply.get(k) == v for k, v in binding.items()) and reply.get("serial") == SERIAL,
+            "fresh gate identity differs")
+    require(checked_at - timedelta(seconds=30) <= _time(reply["captured_at"]) <= checked_at + timedelta(seconds=5), "stale fresh gate")
+    require(checked_at < _time(validated["cold"]["expires_at"]), "cold evidence expired during fresh readback")
+    require(reply.get("original_B_misc_restored") is True and reply.get("profile_sha256") == PROFILE_SHA,
+            "fresh original B/misc or profile check absent")
+    expected_hashes = dict(validated["profile"]["protected_hashes"], boot_b=B_SHA, misc=M_SHA)
+    require(reply.get("hashes") == expected_hashes, "fresh protected/target hashes mismatch")
+    require(reply.get("gpt_prefix_sha256") == validated["profile"]["gpt_prefix_sha256"] and
+            reply.get("partitions") == validated["profile"]["partitions"] and
+            reply.get("data") == {"node": "/dev/block/mmcblk0p70", "fstype": "f2fs", "rw": True},
+            "fresh GPT/geometry/data receipt incomplete")
+    return reply
+
+
+def capture_backup(adapter, *, cold_resume, request_sha256, txid, boot_id, inventory_binding, output):
+    """Future explicit capture step. Produces evidence, never self-approves a request."""
+    _gate()
+    require(adapter.txid == txid and adapter.boot_id == boot_id and adapter_api.valid_sha(request_sha256), "capture identity")
+    snap = _inventory(inventory_binding, txid, boot_id=boot_id)
+    require(snap["role"] in ("active", "stage"), "capture only active/stage")
+    context = {"request": {"txid": txid, "boot_id": boot_id}, "request_sha256": request_sha256,
+               "cold": _cold_validate(cold_resume, boot_id, _now()),
+               "profile": _json({"path": str(PROFILE_PATH), "sha256": PROFILE_SHA})}
+    with _device_lock():
+        _fresh(adapter, context, _now())
+        adapter.seal(snap["role"], snap)
+        receipt = adapter.backup_to_mac(snap["role"], snap, output)
+        measured = adapter_api.verify_backup_tar(_local(output), snap)
+        require(all(receipt.get(k) == v for k, v in measured.items()), "capture verification mismatch")
+    return receipt
+
+
+class DirectorySession:
+    @classmethod
+    def open(cls, adapter, request_path, request_sha256, evidence_directory, *, resume=False):
+        _gate()  # before validation, host mutation or any adapter call
+        validated = validate_request(request_path, request_sha256)
+        request = validated["request"]
+        require(adapter.txid == request["txid"] and adapter.boot_id == request["boot_id"], "adapter/request mismatch")
+        folder = Path(evidence_directory)
+        require(folder.is_absolute() and not folder.is_symlink() and all(not x.is_symlink() for x in folder.parents), "unsafe session evidence path")
+        obj = cls.__new__(cls)
+        obj.adapter, obj.validated, obj.folder = adapter, validated, folder
+        obj.request_path, obj.request_sha256 = str(request_path), request_sha256
+        plan = {"schema": "e5-clean-directory-session-plan-v1", "request_sha256": request_sha256,
+                "request": request, "device_execution_authorized_by_this_document": False}
+        obj.plan_hash = digest(canonical(plan))
+        if resume:
+            require(folder.is_dir() and json.loads(_local(folder / "plan.json").read_bytes()) == plan, "session cannot be reused with another request")
+            obj._records()
+        else:
+            folder.mkdir(mode=0o700, parents=False, exist_ok=False); _fsync_dir(folder.parent)
+            _new_json(folder / "plan.json", plan)
+            _new_json(folder / "session.lock", {"request_sha256": request_sha256})
+            fd = os.open(folder / "journal.jsonl", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            os.fsync(fd); os.close(fd); _fsync_dir(folder)
+            obj._event("SESSION_BOUND")
+        return obj
+
+    def _records(self):
+        require(digest(canonical(json.loads(_local(self.folder / "plan.json").read_bytes()))) == self.plan_hash,
+                "session plan replaced")
+        raw = _local(self.folder / "journal.jsonl").read_bytes()
+        require(not raw or raw.endswith(b"\n"), "torn journal; no automatic repair")
+        rows, previous = [], "0" * 64
+        for line in raw.splitlines():
+            row = json.loads(line); sha = row.pop("record_hash")
+            require(row["seq"] == len(rows) + 1 and row["previous"] == previous and
+                    row["plan_hash"] == self.plan_hash and row["event"] in EVENTS and
+                    digest(canonical(row)) == sha, "journal identity/chain")
+            row["record_hash"] = sha; rows.append(row); previous = sha
+        return rows
+
+    @contextlib.contextmanager
+    def _locked(self):
+        lock = _local(self.folder / "session.lock")
+        require(json.loads(lock.read_bytes()) == {"request_sha256": self.request_sha256}, "session lock identity")
+        with _device_lock():
+            fd = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                yield
+            finally: os.close(fd)
+
+    def _event(self, event, **fields):
+        rows = self._records()
+        record = {"seq": len(rows) + 1, "previous": rows[-1]["record_hash"] if rows else "0" * 64,
+                  "plan_hash": self.plan_hash, "event": event, **fields}
+        record["record_hash"] = digest(canonical(record))
+        fd = os.open(self.folder / "journal.jsonl", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        with os.fdopen(fd, "ab") as f:
+            f.write(canonical(record) + b"\n"); f.flush(); os.fsync(f.fileno())
+
+    def _inspect(self):
+        trees = {role: self.adapter.inventory_optional(role) for role in ROLES}
+        for role, snap in trees.items():
+            if snap is not None:
+                require(snap.get("schema") == "e5-device-directory-inventory-v1" and
+                        snap.get("role") == role and snap.get("txid") == self.adapter.txid and
+                        snap.get("boot_id") == self.adapter.boot_id and
+                        snap.get("tree_sha256") == adapter_api.tree_digest(snap["rows"]), "live inventory mismatch")
+        old, stage = self.validated["original"]["rows"], self.validated["stage"]["rows"]
+        failed = (self.validated["failed"] or self.validated["stage"])["rows"]
+        a, s, o, f = (trees[x]["rows"] if trees[x] is not None else None for x in ROLES)
+        events = [r["event"] for r in self._records()]
+        if a == old and s == stage and o is None and f is None:
+            state = "ROLLED_BACK_WITH_STAGE" if "RESTORE_BEGIN" in events else "PREPARED"
+        elif a is None and s == stage and o == old and f is None: state = "ARCHIVED"
+        elif a == failed and s is None and o == old and f is None: state = "ACTIVE"
+        elif a is None and s is None and o == old and f == failed: state = "ROLLBACK_GAP"
+        elif a == old and s is None and o is None and f == failed: state = "ROLLED_BACK"
+        else: raise Refusal("unknown tree/preimage; bind new complete inventory + Mac backup before any rollback")
+        require(not (any(e in events for e in ("ACTIVATE_DONE", "ACTIVATED")) and
+                     state in ("PREPARED", "ARCHIVED")), "disk contradicts activation journal")
+        require(not ("ROLLED_BACK" in events and state not in ("ROLLED_BACK", "ROLLED_BACK_WITH_STAGE")), "disk contradicts rollback journal")
+        return state, trees
+
+    def inspect(self):
+        _gate()
+        with self._locked():
+            _fresh(self.adapter, self.validated, _now())
+            state, trees = self._inspect()
+        return {"state": state, "trees": {k: v["tree_sha256"] if v else None for k, v in trees.items()},
+                "request_sha256": self.request_sha256, "automatic_reboot_retry_restore": False}
+
+    def _move(self, action, source, before, event):
+        # Replay all cold evidence + host backup hashes before EACH rename.
+        self.validated = validate_request(self.request_path, self.request_sha256)
+        receipt = _fresh(self.adapter, self.validated, _now())
+        self._event(event + "_BEGIN", fresh_gate=receipt, source_tree=before["tree_sha256"])
+        require(self.adapter.inspect(source) == before, "source drifted before move")
+        after, raw = self.adapter.move(action, before)
+        require(_now() < _time(self.validated["cold"]["expires_at"]),
+                "move returned after evidence expiry; preserve uncertain journal and re-review")
+        require(after["rows"] == before["rows"], "move not fully read back")
+        self._event(event + "_DONE", destination=after, helper_reply=raw.decode() if isinstance(raw, bytes) else raw)
+
+    def activate(self):
+        _gate(); require(self.validated["request"]["mode"] == "activate", "request is not activation")
+        with self._locked():
+            return self._activate()
+
+    def _activate(self):
+        _fresh(self.adapter, self.validated, _now())
+        state, trees = self._inspect()
+        require(not any(r["event"].startswith("RESTORE") or r["event"].startswith("PRESERVE") for r in self._records()),
+                "rollback already begun")
+        require(state in ("PREPARED", "ARCHIVED", "ACTIVE"), "cannot activate this state")
+        if state == "PREPARED":
+            self.adapter.seal("stage", trees["stage"])
+            self._move("move-active-to-archive", "active", trees["active"], "ARCHIVE")
+            state, trees = self._inspect()
+        if state == "ARCHIVED":
+            self._move("move-stage-to-active", "stage", trees["stage"], "ACTIVATE")
+        state, trees = self._inspect(); require(state == "ACTIVE", "activation incomplete")
+        self.adapter.seal("active", trees["active"])
+        self._event("ACTIVATED")
+        return {"state": "ACTIVE", "next": "separate reviewed boot/misc transaction; this session does not write them"}
+
+    def rollback(self):
+        _gate(); require(self.validated["request"]["mode"] == "rollback", "separate explicit rollback request required")
+        with self._locked():
+            return self._rollback()
+
+    def _rollback(self):
+        _fresh(self.adapter, self.validated, _now())
+        state, trees = self._inspect()
+        if state == "PREPARED": return {"state": "NO_SWITCH_OCCURRED", "candidate_retained": "stage"}
+        if state == "ACTIVE":
+            require(self.validated["failed"] is not None, "active candidate must have explicitly bound complete failed backup")
+            self._move("move-active-to-failed", "active", trees["active"], "PRESERVE_FAILED")
+            state, trees = self._inspect()
+        if state in ("ARCHIVED", "ROLLBACK_GAP"):
+            # No stage->failed action exists: preserve an unactivated stage in place.
+            self._event("RESTORE_BEGIN")
+            self._move("move-archive-to-active", "archive", trees["archive"], "RESTORE_MOVE")
+        state, trees = self._inspect()
+        require(state in ("ROLLED_BACK", "ROLLED_BACK_WITH_STAGE"), "rollback incomplete")
+        self.adapter.seal("active", trees["active"])
+        self._event("ROLLED_BACK")
+        return {"state": state, "failed_candidate_retained": "stage" if state.endswith("WITH_STAGE") else "failed"}
+
+
+if __name__ == "__main__":
+    raise SystemExit("Prepared library only: no CLI or device execution entry point.")

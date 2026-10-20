@@ -1,0 +1,96 @@
+#!/usr/bin/env python3
+"""Host-only, fixed-source, init-only rescue image preparation. No device API."""
+from pathlib import Path
+import hashlib
+import importlib.util
+import json
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[2]
+HERE = Path(__file__).resolve().parent
+OUT = ROOT / 'materials/userdata-readonly-rescue-20261020'
+BASE = ROOT / 'materials/openwrt-no-auto-fsck-20261015/files/boot.img'
+BASE_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+REPACKER = ROOT / 'tools/e5_candidate_no_fsck_prepare_20261015/prepare.py'
+REPACKER_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+
+
+def sha(b): return hashlib.sha256(b).hexdigest()
+
+
+def fixed(path, digest):
+    assert not path.is_symlink() and all(not p.is_symlink() for p in path.parents)
+    b = path.read_bytes()
+    assert sha(b) == digest, str(path)
+    return b
+
+
+def build():
+    fixed(REPACKER, REPACKER_SHA)
+    s = importlib.util.spec_from_file_location('_fixed_repacker', REPACKER)
+    p = importlib.util.module_from_spec(s); s.loader.exec_module(p)
+    old = fixed(BASE, BASE_SHA)
+    info = p.parse_boot(old)
+    cpio = p.decompress_legacy(info['ramdisk'])
+    before, _ = p.parse_cpio(cpio)
+    init = (HERE / 'init').read_bytes()
+    assert init.startswith(b'#!/bin/busybox sh\n')
+    subprocess.run(['/bin/sh', '-n'], input=init, check=True)
+    new_cpio = p.replace_cpio_init(cpio, init)
+    new = p.repack(old, new_cpio)
+    ni = p.parse_boot(new)
+    after, _ = p.parse_cpio(p.decompress_legacy(ni['ramdisk']))
+    changed = [a['name'] for a, b in zip(before, after) if a['raw'] != b['raw']]
+    assert len(before) == len(after) == 76 and changed == ['init']
+    assert [a['name'] for a in before] == [a['name'] for a in after]
+    assert info['kernel'] == ni['kernel'] and info['vbmeta'] == ni['vbmeta']
+    ah, bh = bytearray(info['header']), bytearray(ni['header']); ah[12:16] = bh[12:16]
+    af, bf = bytearray(info['footer']), bytearray(ni['footer']); af[12:28] = bf[12:28]
+    assert ah == bh and af == bf
+    assert new[56 << 20:60 << 20] == b'\0' * (4 << 20)
+    # AVB footer payload/vbmeta offsets move with the compressed ramdisk;
+    # its permitted fields were compared above. The surrounding tail is exact.
+    assert old[60 << 20:-64] == new[60 << 20:-64]
+    names = {r['name'] for r in after}
+    for name in ('repair/sbin/fsck.f2fs', 'repair/lib/ld-musl-aarch64.so.1',
+                 'linux-modules/sprd_battery_info.ko', 'linux-modules/sprd-charger-manager.ko',
+                 'linux-modules/ump96xx_fuel_gauge.ko', 'linux-modules/aw32257_charger.ko'):
+        assert name in names, name
+    # The only fsck invocation is in a quoted, manual helper heredoc, and dry-run.
+    text = init.decode()
+    assert text.count('/repair/sbin/fsck.f2fs ') == 1
+    assert '/repair/sbin/fsck.f2fs -f --dry-run "$dev"' in text
+    for forbidden in ('--setrw', 'of=/dev/', 'write_misc_bc', 'persist()', 'switch_root',
+                      'mount -t f2fs', 'mount -t ext4', 'modem_loader.ko', 'wcn_bsp.ko',
+                      'reboot -f', 'mkfs.', 'telnetd '):
+        assert forbidden not in text, forbidden
+    assert not OUT.exists() and not OUT.is_symlink()
+    OUT.mkdir(mode=0o700)
+    for name, value in [('boot.img', new), ('init', init)]:
+        with (OUT / name).open('xb') as f: f.write(value)
+    report = {
+        'schema': 'e5-host-only-readonly-rescue-candidate-v1',
+        'source': {'path': str(BASE), 'sha256': BASE_SHA},
+        'repacker': {'path': str(REPACKER), 'sha256': REPACKER_SHA},
+        'builder_sha256': sha(Path(__file__).read_bytes()),
+        'boot': {'path': str(OUT / 'boot.img'), 'bytes': len(new), 'sha256': sha(new)},
+        'init_sha256': sha(init), 'changed_cpio_members': changed,
+        'other_75_cpio_records_unchanged': True,
+        'kernel_sha256': sha(ni['kernel']), 'kernel_unchanged': True,
+        'commandline_unchanged': True, 'vbmeta_blob_unchanged': True,
+        'avb_resigned': False, 'payload_end_before_56mib': True,
+        'ramdisk_bytes': ni['ramdisk_size'], 'userdata_mounted_by_init': False,
+        'automatic_filesystem_repair': False, 'automatic_reboot': False,
+        'automatic_persistent_log_or_misc_write': False,
+        'fsck_tools_unchanged': True, 'device_execution_authorized': False,
+        'hardware_boot_validated': False, 'serial_network_validated': False,
+        'fsck_execution_validated': False,
+        'limits': 'Host syntax and byte-layout tests only; no deployment or device IO. Readonly rescue alone does not repair userdata.',
+        'members': {r['name']: {'bytes': len(r['data']), 'sha256': sha(r['data'])} for r in after},
+    }
+    with (OUT / 'CANDIDATE.json').open('x') as f:
+        json.dump(report, f, indent=2); f.write('\n')
+    print(json.dumps({k: v for k, v in report.items() if k != 'members'}, indent=2))
+
+
+if __name__ == '__main__': build()

@@ -1,0 +1,48 @@
+"""Fixed nine-NV read-only snapshot. Default disabled, no generic block scope."""
+from pathlib import Path
+from datetime import datetime,timezone
+import hashlib,json,os,re,uuid
+NV_IO_DISABLED = True
+HERE=Path(__file__).resolve().parent
+GEOMETRY_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CHUNK=4<<20
+class Refusal(RuntimeError):pass
+def need(ok,why):
+ if not ok:raise Refusal(why)
+def sha(b):return hashlib.sha256(b).hexdigest()
+def now():return datetime.now(timezone.utc).isoformat()
+def geometry():
+ p=HERE/'nv_geometry.json';need(not p.is_symlink() and p.stat().st_nlink==1,'geometry type');raw=p.read_bytes();need(sha(raw)==GEOMETRY_SHA,'geometry hash');rows=json.loads(raw)['rows'];need(len(rows)==9 and {r['number'] for r in rows}=={13,14,15,16,17,18,22,23,69},'exact nine');return rows
+def guard(r):
+ node=r['node'];leaf='mmcblk0p'+str(r['number']);ma,mi=map(int,r['dev'].split(':'));need(node=='/dev/block/'+leaf and re.fullmatch('[a-z0-9_]+',r['name']),'fixed path')
+ return (f'test ! -L {node}; test -b {node}; test "$(readlink -f {node})" = {node}\n'+f'test "$(readlink -f /dev/block/by-name/{r["name"]})" = {node}\n'+f'test "$(cat /sys/class/block/{leaf}/dev)" = {r["dev"]}\n'+f'test "$(cat /sys/class/block/{leaf}/start)" = {r["start_lba"]}\n'+f'test "$(cat /sys/class/block/{leaf}/size)" = {r["bytes"]//512}\n'+f'test "$(stat -c %t:%T {node})" = {ma:x}:{mi:x}\n'+f'test "$(blockdev --getsize64 {node})" = {r["bytes"]}\n')
+def chunk(a,r,off,size,hash_only=False):
+ need(not NV_IO_DISABLED,'NV_IO_DISABLED');need(r in geometry() and type(off) is int and off>=0 and off%4096==0 and type(size) is int and 0<size<=CHUNK and size%4096==0 and off+size<=r['bytes'],'NV range')
+ op=uuid.uuid4().hex;node=r['node'];head=f'NV\t{op}\t{a.boot_id}\t{node}\t{off}\t{size}\t'.encode();check=guard(r);pipe=' | /data/adb/magisk/busybox sha256sum' if hash_only else ''
+ script=check+f"printf 'NV\\t{op}\\t{a.boot_id}\\t{node}\\t{off}\\t{size}\\t'; stat -c '%i %d' {node}\n"+f'/data/adb/magisk/busybox dd if={node} bs=4096 skip={off//4096} count={size} iflag=count_bytes status=none{pipe}\n'+check+f"printf '\\nNV\\t{op}\\t%s\\t{node}\\t{off}\\t{size}\\t' \"$(cat /proc/sys/kernel/random/boot_id)\"; stat -c '%i %d' {node}\n"
+ n=68 if hash_only else size
+ def parse(raw):
+  first,sep,body=raw.partition(b'\n');need(sep and first.startswith(head),'NV header');identity=first[len(head):].split();need(len(identity)==2 and all(x.isdigit() and int(x)>0 for x in identity),'NV inode')
+  need(len(body)==n+len(first)+2 and body[n:]==b'\n'+first+b'\n','NV frame/identity');value=body[:n]
+  if hash_only:need(re.fullmatch(rb'[a-f0-9]{64}  -\n',value),'NV hash')
+  return value,tuple(map(int,identity))
+ return a._request('nv-hash-chunk' if hash_only else 'nv-read-chunk',script,limit=n+4096,validator=parse,op_id=op)
+def capture(a,folder):
+ need(not NV_IO_DISABLED,'NV_IO_DISABLED');folder=Path(folder);need(folder.is_absolute() and not folder.exists() and not folder.is_symlink() and all(not p.is_symlink() for p in folder.parents),'new evidence directory');folder.mkdir(mode=0o700);started=now();items=[]
+ for r in geometry():
+  p=folder/(r['name']+'.bin');h=hashlib.sha256();identity=None;parts=[]
+  with os.fdopen(os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600),'wb') as f:
+   for off in range(0,r['bytes'],CHUNK):
+    size=min(CHUNK,r['bytes']-off);raw,meta=chunk(a,r,off,size);need(identity is None or meta==identity,'NV inode drift');identity=meta;need(len(raw)==size,'NV short read');h.update(raw);f.write(raw);parts.append((off,size,sha(raw)))
+   f.flush();os.fsync(f.fileno())
+  for off,size,digest in parts:
+   value,meta=chunk(a,r,off,size,True);need(meta==identity and value[:64].decode()==digest,'NV changed during two full passes')
+  items.append({**r,'artifact':{'path':str(p),'bytes':r['bytes'],'sha256':h.hexdigest()},'inode':identity[0],'host_dev':identity[1],'two_complete_passes_match':True})
+ result={'schema':'e5-nine-nv-baseline-v1','serial':'DEVICE_SERIAL_REDACTED','boot_id':a.boot_id,'txid':a.txid,'started_at':started,'completed_at':now(),'geometry_sha256':GEOMETRY_SHA,'source_sha256':sha(Path(__file__).read_bytes()),'items':items,'read_only':True,'device_mutations':0,'approved_to_flash':False}
+ raw=(json.dumps(result,sort_keys=True,separators=(',',':'))+'\n').encode();p=folder/'COMPLETE.json'
+ with os.fdopen(os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600),'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+ fd=os.open(folder,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:os.fsync(fd)
+ finally:os.close(fd)
+ return {'path':str(p),'sha256':sha(raw)}
+if __name__=='__main__':raise SystemExit('Disabled read-only library; no device command.')

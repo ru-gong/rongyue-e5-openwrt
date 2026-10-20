@@ -1,0 +1,69 @@
+# 固定主机合同
+
+所有 binding 都是精确 `{ "path": "绝对普通单链接文件路径", "sha256": "64位小写SHA256" }`，拒绝 symlink 祖先。文件必须存在且原始字节符合哈希。以下是字段说明，不是实际请求或审批。
+
+## ARTIFACT_MANIFEST.json
+
+- `schema`: `e5-next-scanner-artifact-manifest-v1`
+- `production_binaries_executed`: `false`
+- `host_source_sha256`、`runner_source_sha256`
+- `core`: 仅 `android_directory_adapter.py` 和 `bounded_transport.py` 两份 binding，指向新 core 固定目录。
+- `cold_contract`: `evidence_contract.py` binding。
+- `cold_dependencies`: 仅 `common.py` 和 `observe.py` binding。validator 自身还核验它使用的冻结纯解析器、profile、工具 runtime pins 和实际原始请求证据。
+- `artifacts`: 仅 `archiver`、`scanner`、`io_helper`、`helper`。每项精确 `{path,bytes,sha256}`；每件最多 4 MiB。IO/helper 仍要求原固定 SHA。
+- 可以附构建来源、测试、独审字段；运行请求对 manifest **整文件 SHA** 绑定，不能默默改附录。
+
+## 实际请求
+
+精确字段：
+
+```text
+schema = e5-next-scanner-deployment-v1
+serial = DEVICE_SERIAL_REDACTED
+txid = 新16位小写hex（不是旧失败tx、也不在已用ledger中）
+boot_id = 恢复之后新冷启动UUID
+created_at / expires_at = aware UTC ISO8601（租约<=900秒）
+total_seconds = 整数30..600，且总预算+5秒小于剩余租约
+manifest = ARTIFACT_MANIFEST binding
+postcold = e5-next-directory-evidence-v1 envelope binding
+restoration = 前一恢复阶段实际 e5-bounded-boot-result-v3 的 result.json binding
+```
+
+恢复 result 的同目录 request.json 必须 SHA 匹配、mode=restore-original；两份真实 `boot_b.readback.bin`（64 MiB）和 `misc.readback.bin`（1 MiB）必须为本机原件。新 cold validator 同时检查当前实际原件和正常共享状态，所以历史恢复结果不能代替当前分区预像。
+
+## 独立审阅
+
+精确字段：
+
+```text
+schema = e5-next-scanner-deployment-review-v1
+reviewer = 非空审阅者标识（名称不构成认证）
+decision = FIXED_OLD_LOCK_ARCHIVE_NEW_HELPERS_SCANNER_ONLY
+request = 精确请求 binding
+manifest = 同请求 manifest binding
+cold_gate_sha256 = SHA256(canonical真实validator返回对象，只删除动态checked_at键))
+restoration = 同请求恢复结果 binding
+scope_no_partition_or_rootfs_write = true
+```
+
+canonical 为 Python `json.dumps(sort_keys=True,separators=(',',':')).encode()`。除 `checked_at` 外全部返回字段保留，包括证据链 SHA、state binding、boot、expires_at；不是把 cold 结果伪装成固定 pass。审阅凭据只能由实际材料审查后生成，本包不生成。
+
+## 成功输出
+
+runner新 evidence 根：
+
+- `SOURCE_BINDING.json`：入口、request/manifest/review、boot/tx、cold gate digest。
+- `transport/`：冻结 BoundedTransport 原始 argv、payload 摘要、stdout/stderr、IN_FLIGHT、COMPLETE；与 serial-wide 共享状态绑定。
+- `result/INPUT.json`：输入 binding。
+- `result/old-owner.bin`、`OLD_LOCK_BEFORE.json`：旧锁预像。
+- `result/OLD_LOCK_ARCHIVED.json`：native 成功回执＋before/after身份；在改名请求同一 ACTIVE 内持久化。
+- `result/RESULT.json`：`e5-next-scanner-deployment-result-v1`，含 serial/boot/tx/request/manifest/review/archive/ uploads/lock/scanner/baseline/operations。
+- `result/COMPLETE.json`：`e5-stage2-complete-v1`，精确 RESULT binding 与 `all_requests_completed=true`。
+
+RESULT.lock 的 data/local/tmp/old_lock/old_owner/new_lock/new_owner 是完整 stat 元数据：mode_bits、dev、inode、bytes、mode、uid、gid、nlink、mtime、ctime、mtime_text、ctime_text、rdev_major、rdev_minor、type；old_owner_hex 为已实际读取并核对的17字节。old_lock 对应 archive 路径；new_lock 对应重新独占创建的原名。
+
+RESULT.uploads 各项 `{remote_path,artifact:{path,bytes,sha256},remote_metadata}`。RESULT.operations 记录 4次upload、1次archive、1次new-lock的 label/opid；真正成功性仍须复核 transport 原始回执及 followup，不能只信此列表。scanner 为实际 native RESULT，含process/fd/namespace等计数。
+
+固定结论键：`no_partition_or_rootfs_write=true`、`no_reboot=true`、`automatic_cleanup_retry_or_resume=false`、`noreplace_probe_passed=false`、`approved_to_activate=false`。完整扫描仅在真实运行成功后才能写 `scanner_real_full_scan_passed=true`。
+
+失败留 STOP 和 transport UNKNOWN；没有“重试执行”或“自动撤销”入口。改名成功后丢回执属于未知，绝不能假定原名还在或自动反向改名。

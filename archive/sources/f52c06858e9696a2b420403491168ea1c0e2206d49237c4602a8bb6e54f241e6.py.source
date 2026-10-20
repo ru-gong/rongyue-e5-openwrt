@@ -1,0 +1,69 @@
+import os,stat,tempfile,unittest,hashlib
+from pathlib import Path
+from unittest.mock import patch
+import host_inputs as h
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.t=tempfile.TemporaryDirectory(prefix='e5-input-test-');self.addCleanup(self.t.cleanup);self.p=Path(self.t.name).resolve()/'input';self.data=b'openwrt\n';self.p.write_bytes(self.data);self.sha=hashlib.sha256(self.data).hexdigest()
+ def reader(self):return h.PinnedInput(self.p,len(self.data),self.sha)
+ def test_read_and_finish(self):
+  with self.reader() as r:self.assertEqual(r.read(8),self.data);r.finish()
+ def test_read_atime_only_not_drift(self):
+  st=self.p.stat();os.utime(self.p,ns=(1_000_000_000,st.st_mtime_ns));before=self.p.stat()
+  with self.reader() as r:self.assertEqual(r.read(8),self.data);r.finish()
+  after=self.p.stat();self.assertEqual(h.identity(before),h.identity(after));self.assertNotEqual(before,after)
+ def test_access_timestamp_excluded_but_ns_mtime_ctime_included(self):
+  self.assertNotIn('st_atime_ns',h.FIELDS);self.assertIn('st_mtime_ns',h.FIELDS);self.assertIn('st_ctime_ns',h.FIELDS)
+ def test_same_size_content_changed_rejected(self):
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:self.p.write_bytes(b'changed\n');r.read(8);r.finish()
+ def test_same_bytes_rewrite_rejected_metadata(self):
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:r.read(8);self.p.write_bytes(self.data);r.finish()
+ def test_mtime_restoration_cannot_hide_ctime(self):
+  st=self.p.stat()
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:r.read(8);self.p.write_bytes(self.data);os.utime(self.p,ns=(st.st_atime_ns,st.st_mtime_ns));r.finish()
+ def test_path_replaced_same_bytes_rejected(self):
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:r.read(8);self.p.rename(self.p.with_name('old'));self.p.write_bytes(self.data);r.finish()
+ def test_path_removed_rejected(self):
+  with self.assertRaises((h.InputChanged,FileNotFoundError)):
+   with self.reader() as r:r.read(8);self.p.unlink();r.finish()
+ def test_truncate_rejected(self):
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:self.p.write_bytes(b'x');r.read(8);r.finish()
+ def test_append_rejected(self):
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:r.read(8);self.p.open('ab').write(b'x');r.finish()
+ def test_mode_changed_rejected(self):
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:r.read(8);self.p.chmod(0o400);r.finish()
+ def test_leaf_symlink_refused(self):
+  q=self.p.with_name('alias');q.symlink_to(self.p)
+  with self.assertRaises(h.InputChanged):h.PinnedInput(q,8,self.sha).__enter__()
+ def test_parent_symlink_refused(self):
+  q=self.p.parent/'alias-dir';q.symlink_to(self.p.parent,target_is_directory=True)
+  with self.assertRaises(h.InputChanged):h.PinnedInput(q/'input',8,self.sha).__enter__()
+ def test_hardlink_refused(self):
+  os.link(self.p,self.p.with_name('link'))
+  with self.assertRaises(h.InputChanged):self.reader().__enter__()
+ def test_relative_refused(self):
+  with self.assertRaises(h.InputChanged):h.PinnedInput('relative',8,self.sha).__enter__()
+ def test_unfinished_refused_and_fd_closed(self):
+  r=self.reader()
+  with self.assertRaises(h.InputChanged):
+   with r:r.read(1)
+  self.assertIsNone(r.fd)
+ def test_short_read_refused(self):
+  with self.assertRaises(h.InputChanged):
+   with self.reader() as r:r.read(4);r.finish()
+ def test_wrong_hash_refused(self):
+  with self.assertRaises(h.InputChanged):
+   with h.PinnedInput(self.p,8,'0'*64) as r:r.read(8);r.finish()
+ def test_wrong_size_refused(self):
+  with self.assertRaises(h.InputChanged):h.PinnedInput(self.p,9,self.sha).__enter__()
+ def test_empty_file_allowed_with_exact_hash(self):
+  self.p.write_bytes(b'')
+  with h.PinnedInput(self.p,0,hashlib.sha256(b'').hexdigest()) as r:r.finish()
+if __name__=='__main__':unittest.main(verbosity=2)

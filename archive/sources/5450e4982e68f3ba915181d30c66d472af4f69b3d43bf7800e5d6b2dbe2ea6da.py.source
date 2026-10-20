@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Read-only material/import verification. Never calls any runtime I/O method."""
+import ast,hashlib,importlib.util,json,os,sys
+from pathlib import Path
+from datetime import datetime,timezone
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parents[1]
+OUTPUT=HERE/'HOST_VALIDATION_FINAL.json'
+assert not OUTPUT.exists()
+def sentinel(event,args):
+    if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event in ('os.system','os.mkdir','os.remove','os.rmdir','os.rename','os.symlink','os.link'):
+        raise RuntimeError('host validation forbids external effects: '+event)
+    if event=='open':
+        path,mode,flags=args
+        writable=(isinstance(mode,str) and any(x in mode for x in 'wax+')) or (isinstance(flags,int) and flags&(os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC|os.O_APPEND))
+        if writable and (not isinstance(path,(str,bytes)) or Path(os.fsdecode(path)).absolute()!=OUTPUT):
+            raise RuntimeError('host validation forbids write: '+str(path))
+sys.addaudithook(sentinel)
+sha=lambda b:hashlib.sha256(b).hexdigest()
+def load(name,path):
+    p=Path(path);spec=importlib.util.spec_from_file_location(name,p);m=importlib.util.module_from_spec(spec);sys.modules[name]=m;spec.loader.exec_module(m);return m
+def literal(raw,name):
+    matches=[n for n in ast.parse(raw).body if isinstance(n,ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0],ast.Name) and n.targets[0].id==name]
+    assert len(matches)==1
+    return ast.literal_eval(matches[0].value)
+result=json.loads((HERE/'RESULT.json').read_bytes())
+assert json.loads((HERE/'COMPLETE.json').read_bytes())['result_sha256']==sha((HERE/'RESULT.json').read_bytes())
+assert not (HERE/'STOP.json').exists()
+for key,item in result['files'].items():
+    raw=Path(item['path']).read_bytes();assert len(raw)==item['bytes'] and sha(raw)==item['sha256']
+dirs={g:Path(p) for g,p in result['directories'].items()}
+# Match Python's ordinary workflow.py CLI import context; this verifier itself
+# lives in the separate host bundle directory, not beside the runtime sources.
+sys.path.insert(0,str(dirs['core']))
+workflow=load('_e5_integrated_workflow_host_validation',dirs['core']/'workflow.py')
+manifest=workflow.verify_materials()
+mods=workflow.load_modules(manifest)
+contract=mods['cold_bridge']._module()
+recovery_manifest=manifest['recovery_manifest']
+contract.c.verify_manifest(recovery_manifest['sha256'])
+runtime=contract.c.load_runtime()
+assert all(runtime[n].__file__==str(dirs['core']/(n+'.py')) for n in runtime)
+runner=load('_e5_integrated_scanner_runner_host_validation',dirs['scanner']/'runner.py')
+scanner=runner.material_manifest(manifest['deployment_manifest'])
+assert scanner['cold_contract']['sha256']==sha(Path(contract.__file__).read_bytes())
+ffec=ROOT/'tools/e5_boot_lineage_recovery_live_ffec9bc637b44850'
+observer=dirs['recovery']/'observe.py'
+assert observer.read_bytes()==(ffec/'observe.py').read_bytes()
+assert sha(observer.read_bytes())=='0000000000000000000000000000000000000000000000000000000000000000'
+assert contract.c.PINS==literal((ffec/'common.py').read_text(),'PINS')
+assert contract.observer.PINS==literal((ffec/'observe.py').read_text(),'PINS')
+base=ROOT/'tools/e5_nextphase_core_live_b7b4ea5324174ae2'
+for name in contract.c.PINS:assert (dirs['core']/(name+'.py')).read_bytes()==(base/(name+'.py')).read_bytes()
+for key,item in result['files'].items():
+    raw=Path(item['path']).read_bytes();assert len(raw)==item['bytes'] and sha(raw)==item['sha256']
+value={'schema':'e5-integrated-host-material-verification-v1','at':datetime.now(timezone.utc).isoformat(),
+    'result_sha256':sha((HERE/'RESULT.json').read_bytes()),'output_files_verified':len(result['files']),
+    'workflow_verify_materials_passed':True,'core_module_imports_passed':sorted(mods),
+    'actual_cold_bridge_module_and_three_pins_loaded':True,'recovery_runtime_source_paths_verified':True,
+    'scanner_runner_material_manifest_passed':True,'observer_byte_identical_to_running_ffec':True,
+    'runtime_and_observer_source_pins_equal_ffec':True,'four_primitive_sources_byte_identical_to_b7':True,
+    'full_new_cold_record_validated':False,'field_evidence_or_reviews_generated':False,
+    'runtime_io_methods_called':False,'subprocess_socket_and_unrelated_writes_denied':True,
+    'harness_note':'Host-only verifier initially omitted the core CLI sys.path context, then its audit hook refused fdopen of its own output fd. Both affected only the verifier; the empty HOST_VALIDATION.json is retained. Final verifier matches CLI import context and writes only this explicitly allowed fresh output. Runtime sources unchanged.',
+    'device_io_performed':False,'shared_state_or_ledger_modified':False,
+    'new_enabled_copy_independent_review_still_required':True}
+raw=(json.dumps(value,ensure_ascii=False,indent=2)+'\n').encode()
+fd=os.open(OUTPUT,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+try:
+    sent=0
+    while sent<len(raw):
+        n=os.write(fd,raw[sent:]);assert n>0;sent+=n
+    os.fsync(fd)
+finally:os.close(fd)
+fd=os.open(HERE,os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+print(json.dumps({'path':str(OUTPUT),'sha256':sha(raw)}))

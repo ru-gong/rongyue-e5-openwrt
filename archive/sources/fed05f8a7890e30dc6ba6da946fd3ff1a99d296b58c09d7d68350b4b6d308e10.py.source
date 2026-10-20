@@ -1,0 +1,25 @@
+"""Only fixed historical boot replay; never a new request or current approval."""
+from pathlib import Path
+import sys,importlib.util,json,hashlib,datetime
+R=Path('/REDACTED_HOST_PATH');H=Path(__file__).resolve().parent
+S=R/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED';L=R/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+def pin(p):return {'path':str(p),'sha256':hashlib.sha256(p.read_bytes()).hexdigest(),'bytes':p.stat().st_size}
+def hook(e,a):
+ if e.startswith(('subprocess.','socket.')) or e in ('os.system','os.posix_spawn','os.fork','os.rename','os.remove','os.rmdir'):raise RuntimeError(e)
+ if e=='open' and isinstance(a[0],str) and (a[0].startswith(str(S)) or a[0]==str(L)):
+  flags=a[2] if len(a)>2 and isinstance(a[2],int) else 0
+  if flags&3:raise RuntimeError('state write prohibited')
+sys.addaudithook(hook)
+paths=[S/n for n in ('ACTIVE.json','UNCERTAIN.json','RECOVERY_PENDING.json')]+[L];before=[pin(p) for p in paths]
+bundle=R/'tools/e5_fdfix_bundle_prepare_20261016/prepared/RESULT.json'
+assert pin(bundle)['sha256']=='0000000000000000000000000000000000000000000000000000000000000000'
+b=json.loads(bundle.read_bytes())
+for v in b['files'].values():assert pin(Path(v['path']))==v
+p=Path(b['directories']['recovery'])/'common.py';sp=importlib.util.spec_from_file_location('_e5_next_common',p);c=importlib.util.module_from_spec(sp);sys.modules[sp.name]=c;sp.loader.exec_module(c)
+cold=R/'evidence/next-recovery-observations-20261015/cold-diagnostic-20261016T050045Z-b78d1294/COMPLETE.json'
+binding={'path':str(cold),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'}
+result=c.validate_boot_observation(binding)
+assert result['historical_only'] and result['freshness_or_execution_granted'] is False and result['boot_id']=='00000000-0000-4000-8000-000000000001'
+after=[pin(p) for p in paths];assert before==after
+out={'schema':'e5-partial-closure-historical-cold-replay-v1','status':'PASS_HISTORICAL_ONLY','at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'bundle':pin(bundle),'common':pin(p),'binding':binding,'result':result,'actual_partial_close_required_for_historical_replay':False,'actual_partial_close_performed':False,'state_before':before,'state_after':after,'device_io_performed':False,'shared_state_mutated':False,'fresh_state_still_requires_completed_partial_closure':True}
+q=H/'HISTORICAL_COLD_REPLAY.json';q.write_text(json.dumps(out,ensure_ascii=False,indent=2)+'\n');print(json.dumps({'report':pin(q),'result':result},ensure_ascii=False))

@@ -1,0 +1,45 @@
+# 有界生命周期扫描器准备包
+
+本包解决旧扫描器要求所有 TID 从首次枚举到末次复核始终不变的问题。生产源默认 `DEVICE_EXECUTION_ENABLED=0`；`build/` 同时封存 gate0/gate1 Android AArch64 静态 ELF 材料，gate1 仅供后续独审和固定整合，未执行或上传。未接触 E5、ADB/USB、手机 SSH、真实 marker 或 ledger。
+
+## 身份与退出
+
+每个已捕获 TID 同时持有 proc 目录 FD 和 stat FD；对既有身份使用 openat/readlinkat 和已打开 stat 的重新读取。数字 PID 复用不会把旧引用重定向到新任务。仅已打开 stat 的读取明确返回 ESRCH，或成功解析同一身份为 Z/X，才计入 `retired_tasks`。权限、I/O、解析、deadline/cancel、身份漂移仍停止。子项 ENOENT 本身不代表退出。
+
+初枚举后尚未取得句柄的任务消失，只记录枚举缺口；有限后续完整枚举才可证明 closing-set coverage，不冒称独立证实该任务退出。持续缺口、不可枚举线程组或未知身份均停止。leader 退出不使同组线程被跳过：VM 中仍可枚举的幸存线程已实际覆盖；Android 若无法枚举则仍停止。
+
+最多三轮**同一次扫描内**补齐新增身份。共享 FD 表只在 KCMP_FILES==0 时合并；TGID 仅限定比较候选。代表退出时从已验证存活成员重新比较并完整扫表。存活代表的已完成双快照可在本次后续任务轮复用；末轮再核身份、namespace 和 KCMP。它是每个最终可见存活身份至少一次完整有界观察，不是全局原子快照或所有 FD 的最终同时稳定证明。
+
+每张表最多三次完整枚举，要求两次完整一致（FD 号、链接、dev/ino/type）才完成。有限关闭/复用可重扫；持续变化不收敛则停止。任何已发现的受保护路径或 inode 立即 EBUSY，不因随后消失抹除。双快照仍不能证明瞬时开关或 ABA 从未发生。
+
+只排除 scanner 自己**已逐项检查并证明身份的当前 opendir 遍历 FD**参与稳定比较；自身其他 FD、继承 FD、cwd/root 一律扫描。每新增 proc/stat 句柄使自身表失效并重新扫描。
+
+## 未放宽的限制
+
+累计 MAX_PIDS=4096、MAX_FDS=131072、MAX_KCMP=131072、读取 32 MiB、namespace 256、loop 128 不随轮次重置。新增三轮上限和每个 FD snapshot 16 MiB 链接存储上限。为保持两个可信句柄/身份，仅把扫描器自身 soft RLIMIT_NOFILE 必要时提高到 2×4096+64=8256；不提高 existing hard、不改系统配置，hard 不足立即停止。保留句柄直到进程结束。
+
+native 接受的最长 deadline 仍 7000ms；既有设备调用的远端 6s、主机 8s 未修改。真实动态套件以 5000ms absolute deadline 运行；未知或超限不重发扫描事务，不自动重试设备命令。
+
+## 已运行验证
+
+- Mac：116 项，112 通过，4 个实际 Linux syscall 测试跳过。
+- Linux 6.8.0-117-generic aarch64 VM：116 项全通过，含 4 个真实 KCMP 子进程/取消清理测试。
+- 私有 PID/mount namespace：25 个真实动态场景全部满足**各自固定预期**，成功场景必须 rc0，持续不收敛/占用/资源不足必须 rc70；没有“0 或 70 都算兼容成功”用例。
+- 实际 CLONE_FILES/unshare、退出/新增任务、代表退出后重扫、FD 有限 close/reuse、同号换受保护文件、持续不收敛、leader 退出后幸存非 leader 占用、cwd/root、scanner 自身继承 FD、只读 loop 都已检查。loop 仅绑定 VM 私有临时文件，随后精确 detach；最终 VM loop 列表为空。
+- 压测 441 workload 表、1532 workload 任务，另加 harness/scanner；每 workload 表 128 FD。静态、退出、新增三种规模均成功；精确时间/累计量见 TEST_RESULTS.json。新增场景达到 1536 身份、127862 累计 FD，仍在 32 MiB 和 5s 内。
+- 数字 PID 复用使用保留旧句柄的**合成 proc 代换**测试，未调整 VM pid_max，不冒称真实 kernel PID reuse 已发生。
+- 新 722b 固定归档器 Linux 34 个临时文件系统回归 + 6 个生产元数据谓词测试通过；其独立源码来自已审 closure 包，旧 owner 字面量已更新，tmp 2000:2000/0771 不变。
+
+真实动态 workload 只存在本机 Colima VM；Android 5.15 的权限、调度、系统域 KCMP 与实际负载仍须未来受控现场验证。VM 测试速度不是 Android 运行时间保证。工具不会承诺冻结系统、无瞬时占用或掉电原子性。
+
+## 可复现检查
+
+Mac 在本目录执行：
+
+```sh
+python3 -B -m unittest -v test_native_occupancy_scanner test_kcmp test_final_identity_diagnostics test_lifecycle
+```
+
+Linux 动态 harness 仅允许 VM root，并自行为每个场景创建私有 PID/mount namespace；不得在 Android 执行。`build/BUILD_COMMANDS.sh` 是固定 VM 工作副本中使用的构建命令。生产 ELF 只做静态 ELF/program/dynamic 表解析；完整来源、命令、结果、四产物 hash 在 build/BUILD.json。
+
+WIP 日志保留早期夹具错误及预期修正：旧 leader-exit 预期 STOP 被实际可枚举线程覆盖否定；旧 self 测试先命中父进程，最终夹具关闭父 FD 并强制 result.pid==self_pid；初始 loop 仅挂 sys/block 时相对链接无法解析，最终隔离挂完整 sysfs 后实际 EBUSY。最终日志不会把这些旧失败算作通过。生产行为源最终为 0000000000000000000000000000000000000000000000000000000000000000。

@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Offline own-device BT/audio conversion + deterministic device-files.tar.
+No ADB, USB, mounts, devices, network, firmware execution or NV extraction.
+The only child processes are two bundled, hash-pinned Python data converters.
+"""
+import argparse
+import hashlib
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import xml.etree.ElementTree as ET
+import e5_install as e
+
+CONVERTERS=e.CONVERTERS
+RAW_REQUIRED={"wcnmodem.bin","bt_configure_pskey.xpe.ini","bt_configure_rf.xpe.ini","btmac.txt",
+              "l_agdsp_a.img","audio_structure.xml","dsp_vbc.xml","cvs.xml","codec.xml"}
+RAW_OPTIONAL={"gnssmodem.bin","aw87xxx_acf.bin","tsx_data"}
+
+def unpack_data(path, dest, vendor):
+    """Manually extract regular files/directories under fixed allowed prefixes."""
+    rows=[];seen=set();total=0
+    with tarfile.open(path,"r:") as t:
+        for m in t:
+            p=PurePosixPath(m.name)
+            if str(p)==".":
+                e.require(m.isdir(),"invalid root archive member");continue
+            e.require(not p.is_absolute() and ".." not in p.parts and str(p) not in seen,"tar traversal/duplicate")
+            seen.add(str(p));e.require(m.isfile() or m.isdir(),"tar link/device forbidden")
+            if vendor:
+                e.require(str(p) in ("opt","opt/e5","opt/e5/android") or str(p).startswith("opt/e5/android/"),"vendor archive tree mismatch")
+                e.require(not any(x in p.parts for x in ("nv","block","calinv")),"NV/block content forbidden")
+            else:
+                e.require(len(p.parts)==1 and (p.name in RAW_REQUIRED|RAW_OPTIONAL or
+                          re.fullmatch(r"wifi_board_config[\w.-]*\.ini",p.name)),"unexpected raw firmware name")
+                e.require(m.isfile(),"raw input must be flat regular files")
+            e.require(0<=m.size<=64<<20,"archive member too large");total+=m.size
+            e.require(total<=384<<20,"archive total too large")
+            target=dest/str(p);target.parent.mkdir(parents=True,exist_ok=True)
+            if m.isdir():target.mkdir(exist_ok=True);continue
+            with t.extractfile(m) as src,target.open("xb") as out:shutil.copyfileobj(src,out,1<<20)
+            e.require(target.stat().st_size==m.size,"short tar member")
+            target.chmod(0o755 if m.mode&0o111 else 0o644)
+            rows.append({"name":str(p),"bytes":m.size,"sha256":e.file_hash(target)})
+    return rows
+
+def check_inputs(raw):
+    for name in RAW_REQUIRED:e.require((raw/name).is_file() and (raw/name).stat().st_size>0,"missing raw "+name)
+    e.require(list(raw.glob("wifi_board_config*.ini")),"no Wi-Fi board config")
+    p=raw/"l_agdsp_a.img"
+    with p.open("rb") as f:head=f.read(11)
+    e.require(p.stat().st_size==6291456 and head.startswith(b"SharkL5_AUD"),"audio DSP wrong format")
+    mac=(raw/"btmac.txt").read_text().strip()
+    e.require(re.fullmatch(r"(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}",mac),"BT address invalid")
+    for name,tag in (("dsp_vbc.xml","dsp_vbc"),("audio_structure.xml","audio_structure"),("cvs.xml","cvs")):
+        data=(raw/name).read_bytes();e.require(len(data)<=16<<20 and b"<!DOCTYPE" not in data and b"<!ENTITY" not in data,"XML DTD/entity/size forbidden")
+        root=ET.fromstring(data);e.require(root.tag==tag,"unexpected audio output name")
+        modes=int(root.get("num_mode"),0);size=int(root.get("struct_size"),0)
+        e.require(0<modes<=1024 and 0<size<=1<<20 and modes*size<=32<<20,"audio output size invalid")
+        for el in root.iter():
+            for key in ("id","offset","bits","mode"):
+                if key in el.attrib:e.require(0<=int(el.get(key),0)<=1<<32,"audio field out of bounds")
+            if "val" in el.attrib:e.require(int(el.get("val"),0).bit_length()<=size*8,"audio value too wide")
+            if "t" in el.attrib:
+                width=el.get("t").lstrip("ut")
+                e.require(width.isdigit() and 0<int(width)<=size*8,"audio word width invalid")
+    for name in ("bt_configure_pskey.xpe.ini","bt_configure_rf.xpe.ini"):
+        text=(raw/name).read_text();e.require(len(text)<=1<<20,"BT ini too large")
+        lengths=re.findall(r"#\[\d+\.\d+\]_*/L=(\d+)",text)
+        e.require(lengths and len(lengths)<1024 and all(0<int(x)<=252 for x in lengths),"BT block widths invalid")
+
+def run_converter(name, args):
+    script=e.ROOT/"converters"/name
+    e.require(e.file_hash(script)==CONVERTERS[name],"converter source hash mismatch")
+    # Isolated Python and hash verification avoid PYTHONPATH/local imports.
+    result=subprocess.run([sys.executable,"-I",str(script),*map(str,args)],stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE,timeout=120,env={"PATH":os.defpath,"LC_ALL":"C"})
+    e.require(result.returncode==0 and not result.stderr,"data conversion failed/warned; retained for review")
+
+def deterministic_tar(tree, target):
+    rows=[]
+    with tarfile.open(target,"x",format=tarfile.PAX_FORMAT) as t:
+        for p in sorted(tree.rglob("*")):
+            e.require(not p.is_symlink(),"symlink in package tree")
+            name=p.relative_to(tree).as_posix();info=tarfile.TarInfo(name)
+            info.uid=info.gid=0;info.uname=info.gname="root";info.mtime=0
+            if p.is_dir():info.type=tarfile.DIRTYPE;info.mode=0o755;t.addfile(info)
+            else:
+                info.mode=0o755 if p.stat().st_mode&0o111 else 0o644;info.size=p.stat().st_size
+                with p.open("rb") as f:t.addfile(info,f)
+                rows.append({"name":name,"bytes":info.size,"sha256":e.file_hash(p)})
+    return rows
+
+def prepare(collection_path, collection_sha, output, fixture=False):
+    collection_path=e.regular(collection_path);c=e.pinned_json(collection_path,collection_sha)
+    e.require(c["serial"]==e.SERIAL and c["source_build"]=="TS305_V03_20241128_2301" and c["nv_included"] is False,"collection identity")
+    e.require(c["script_sha256"]==e.file_hash(e.ROOT/"collect-own-device.sh"),"collector source not frozen")
+    e.require(bool(c.get("synthetic_fixture",False))==fixture,"fixture/live provenance mismatch")
+    records={x["name"]:x for x in c["files"]}
+    e.require(set(records)=={"android-subset.tar","firmware-raw.tar"} and len(c["files"])==2,"collection input set")
+    files={}
+    for name,r in records.items():
+        p=e.regular(collection_path.parent/name)
+        e.require(p.stat().st_size==r["bytes"] and e.file_hash(p)==r["sha256"],"collection input changed")
+        files[name]=p
+    output=Path(output);e.require(not output.exists(),"output already exists")
+    output.mkdir(mode=0o700)
+    try:
+        with tempfile.TemporaryDirectory(dir=output,prefix="work-") as td:
+            work=Path(td);raw=work/"raw";tree=work/"tree";raw.mkdir();tree.mkdir()
+            inputs=unpack_data(files["android-subset.tar"],tree,True)
+            inputs+=unpack_data(files["firmware-raw.tar"],raw,False);check_inputs(raw)
+            fw=tree/"lib/firmware";(fw/"sprd").mkdir(parents=True)
+            for p in raw.iterdir():
+                if p.name in {"wcnmodem.bin","gnssmodem.bin","aw87xxx_acf.bin","tsx_data","l_agdsp_a.img","codec.xml"} or p.name.startswith("wifi_board_config"):
+                    shutil.copyfile(p,fw/p.name)
+            run_converter("sprd-bt-config.py",[raw/"bt_configure_pskey.xpe.ini",raw/"bt_configure_rf.xpe.ini",raw/"btmac.txt",fw/"sprd"])
+            run_converter("vbc-profile.py",[raw/"dsp_vbc.xml",raw/"audio_structure.xml",raw/"cvs.xml","-o",fw])
+            for n,size in (("marlin3lite_pskey.bin",176),("marlin3lite_rf.bin",252)):
+                e.require((fw/"sprd"/n).stat().st_size==size,"BT converted payload length")
+            for name in ("audio_structure","dsp_vbc","cvs"):
+                data=(fw/name).read_bytes();e.require(data.startswith(b"audio_profile\0\0\0"),"audio converted header")
+            target=output/"device-files.tar";rows=deterministic_tar(tree,target);e.safe_tar(target)
+        result={"schema":1,"serial":e.SERIAL,"source_build":c["source_build"],"source_commit":e.COMMIT,
+                "synthetic_fixture":fixture,"reviewed":False,"collection_manifest_sha256":collection_sha,
+                "converter_hashes":CONVERTERS,"collector_sha256":c["script_sha256"],
+                "inputs":inputs,"outputs":rows,"nv_included":False,
+                "device_files_tar":{"path":"device-files.tar","bytes":target.stat().st_size,"sha256":e.file_hash(target)}}
+        (output/"device-files.provenance.json").write_text(json.dumps(result,indent=2)+"\n")
+        return result
+    except BaseException:
+        (output/"FAILED_NOT_INSTALLABLE").write_text("Preparation failed; do not bind artifacts to an install manifest.\n")
+        raise
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--collection",type=Path,required=True);p.add_argument("--collection-sha256",required=True)
+    p.add_argument("--output",type=Path,required=True)
+    a=p.parse_args();r=prepare(a.collection,a.collection_sha256,a.output)
+    print(json.dumps({"output":str(a.output),"device_files_tar":r["device_files_tar"],"reviewed":False}))
+
+if __name__=="__main__":main()

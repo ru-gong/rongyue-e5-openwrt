@@ -1,0 +1,297 @@
+"""Fake-only host tests. Audit hook forbids every subprocess/socket before import."""
+import sys
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('external operation forbidden')
+sys.addaudithook(audit)
+import re,copy,datetime as dt,importlib.util,json,shlex,tempfile,unittest,uuid
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+spec=importlib.util.spec_from_file_location('_e5_next_common',Path(__file__).with_name('common.py'));c=importlib.util.module_from_spec(spec);sys.modules[spec.name]=c;spec.loader.exec_module(c)
+e=c.sibling('evidence_contract');o=e.observer;r=c.sibling('recovery');arm=c.sibling('rearm')
+OLD='00000000-0000-4000-8000-000000000001';NEW='00000000-0000-4000-8000-000000000001';TX='1234567890abcdef'
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve();(self.root/'evidence').mkdir();self.clock=dt.datetime.now(dt.timezone.utc);self.purpose='directory'
+  self.state={'schema':'e5-next-state-v1','serial':c.SERIAL,'state_path':str(c.STATE),'markers':{k:'ABSENT' for k in c.MARKERS},'ledger_head':'0'*64,'ledger_sha256':'ABSENT','ledger_last_event':None,'previous_boots':[OLD],'used_txids':[]}
+  self.statebind=self.write('state.json',self.state);self.simconfirm=self.write('sim-confirmation.json',{'schema':'e5-sim-placement-confirmation-v1','serial':c.SERIAL,'slot1':'China Mobile','slot2':'China Unicom','sim_state':'READY,READY','user_confirmed':True})
+  for p in (patch.object(c,'ROOT',self.root),patch.object(c,'now',return_value=self.clock),patch.object(c,'state_snapshot',side_effect=lambda:copy.deepcopy(self.state))):p.start();self.addCleanup(p.stop)
+ def write(self,name,value):
+  p=self.root/name;p.write_bytes(value if isinstance(value,bytes) else c.canonical(value)+b'\n');return c.binding(p)
+ def cold_fixture(self):
+  folder=self.root/'evidence/cold';folder.mkdir()
+  observer=e.observer;capture,triage=observer.load_sources();purpose=self.purpose
+  def put(name,value):
+   p=folder/name;p.write_bytes(value if isinstance(value,bytes) else e.canonical(value)+b'\n');return e.binding(p)
+  request=self.write('request.json',{'schema':'e5-next-cold-request-v1','serial':e.SERIAL,'previous_boot_id':OLD,'state_snapshot':self.statebind,'purpose':purpose,'sim_confirmation':self.simconfirm if purpose=='rearm-with-sim' else None})
+  put('SOURCE_BINDING.json',{'script_sha256':e.sha(e.read(e.COLD_SOURCE)),'source_pins':observer.PINS,'adb_sha256':e.ADB_SHA,'old_boot_id':OLD,'serial':e.SERIAL,'no_device_writes':True,'purpose':purpose,'state_snapshot':self.statebind,'request':request})
+  counter=[0]
+  def cmd(label,raw,script,at,limit=16384):
+   counter[0]+=1;stem=f'{counter[0]:05d}-{label}';started=at.isoformat();args=[str(e.ADB),'-s',e.SERIAL,'shell','-T',capture.SU+' -c '+shlex.quote(capture.BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(script))]
+   put(stem+'.stdout',raw);put(stem+'.stderr',b'');put(stem+'.sh.txt',script.encode())
+   put(stem+'.request.json',{'argv':args,'started_at':started,'host_deadline_seconds':8,'expected_returncode':0,'output_limit':limit,'script_sha256':e.sha(script.encode())})
+   put(stem+'.result.json',{'started_at':started,'finished_at':(at+dt.timedelta(seconds=.01)).isoformat(),'returncode':0,'failure':None,'elapsed_seconds':.1,'stdout_sha256':e.sha(raw),'stdout_bytes':len(raw),'stderr_sha256':e.sha(b''),'stderr_bytes':0})
+   return {'started_at':started}
+  body=triage.HEALTH_SCRIPT.replace('emit boot_id_end','emit data_device_resolved "$(/system/bin/readlink -f /dev/block/by-name/userdata)"\nemit data_rdev "$(/system/bin/stat -c %t:%T /dev/block/mmcblk0p70)"\nemit data_sysdev "$(/system/bin/cat /sys/class/block/mmcblk0p70/dev)"\nemit boot_id_end')
+  script=observer.root_guard(capture,NEW,purpose)+body;first=self.clock-dt.timedelta(seconds=700)
+  for i in range(21):
+   f={k:'' for k in triage.KEYS};f.update(boot_id_start=NEW,boot_id_end=NEW,root_uid='0',uptime=f'{30+i*30.1:.2f} 40.00',serial=e.SERIAL,model='E5',platform='ums9621',build='TS305_V03_20241128_2301',kernel='5.4.0',slot='_a',boot_completed='1',verifiedbootstate='orange',flash_locked='0',sim_states=observer.sim_state(purpose),ro_boot_reason='power_key',sys_boot_reason='cold',zygote='running',zygote_secondary='running',surfaceflinger='running',adbd='running',data_mount='/dev/block/by-name/userdata|f2fs|rw,nosuid',monitor='hang_detect_enabled: 1,hang_detect_timeout = 120 s  hang_detect_counter: 25',data_device_resolved='/dev/block/mmcblk0p70',data_rdev='103:3f',data_sysdev='259:63')
+   raw=('\n'.join(k+'\t'+v for k,v in f.items())+'\n').encode();at=first+dt.timedelta(seconds=i*30.1);cmd(f'health-{i:02d}',raw,script,at)
+   put(f'health-{i:02d}.parsed.json',{'captured_at':at.isoformat(),'snapshot':observer.parse_health(raw,triage,NEW,purpose)})
+  for phase in ('initial','final'):
+   phase_at=first+dt.timedelta(seconds=(0 if phase=='initial' else 602)+.1);phase_index=0
+   guard=observer.root_guard(capture,NEW,purpose)
+   for label,path,cap in (('pstore-console','/sys/fs/pstore/console-ramoops-0',262144),('pstore-dmesg','/sys/fs/pstore/dmesg-ramoops-0',1048576)):
+    body=f"if test -e {path}; then\n test -r {path}\n printf 'PRESENT\\n'\n {capture.BB} head -c {cap+1} {path}\nelse\n test ! -L {path}\n printf 'MISSING\\n'\nfi\n"
+    cmd(phase+'-'+label,b'MISSING\n',guard+body,phase_at+dt.timedelta(seconds=phase_index*.1));phase_index+=1
+    put(phase+'-'+label+'.presence.json',{'path':path,'present':False,'contents_bytes':0,'not_automatically_classified_as_new_panic':True})
+   cmd(phase+'-crash',b'',guard+triage.FIXED_REQUESTS[3]['script'],phase_at+dt.timedelta(seconds=.2))
+   fields=['S']+['0']*19;fields[6]='4194560';rawstat=('1 (init) '+' '.join(fields)+'\n').encode();values={};parsed={}
+   for label,raw,parser in [('stat-before',rawstat,observer.parse_pid1_stat),('stat-after',rawstat,observer.parse_pid1_stat),('namespace-before',b'mnt:[1]\n',observer.parse_namespace),('namespace-after',b'mnt:[1]\n',observer.parse_namespace),('mountinfo',b'1 2 0:1 / / rw - tmpfs tmpfs rw\n',observer.parse_mountinfo)]:
+    path='/proc/1/ns/mnt' if label.startswith('namespace') else '/proc/1/mountinfo' if label=='mountinfo' else '/proc/1/stat';cap=80 if '/ns/' in path else 1048576 if label=='mountinfo' else 8192
+    body=(f'readlink {path}\n' if '/ns/' in path else f'{capture.BB} head -c {cap+1} {path}\n')+f'test "$(cat /proc/sys/kernel/random/boot_id)" = {NEW}\n'
+    order={'stat-before':3,'namespace-before':4,'mountinfo':5,'namespace-after':6,'stat-after':7};meta=cmd(phase+'-pid1-'+label,raw,guard+body,phase_at+dt.timedelta(seconds=order[label]*.1));parsed[label]=parser(raw);values[label]={'sha256':e.sha(raw),'bytes':len(raw),'started_at':meta['started_at']}
+   put(phase+'-pid1-diagnostic.json',{'schema':'e5-pid1-diagnostic-v1','boot_id':NEW,'device_writes':False,'raw':values,'parsed':parsed})
+  complete={'schema':'e5-next-cold-observation-v1','serial':e.SERIAL,'old_boot_id':OLD,'boot_id':NEW,'samples':21,'span_seconds':602.,'health_window_completed':True,'diagnostics_completed':True,'device_writes':False,'block_reads':False,'uncertainty_cleared':False,'approved_to_flash':False,'purpose':purpose,'state_snapshot':self.statebind,'request':request}
+  cold=put('COMPLETE.json',complete);_,evidence_sha,_=e.cold_evidence(cold,self.clock)
+  review=self.write('cold-review.json',{'schema':'e5-next-cold-independent-review-v1','serial':e.SERIAL,'boot_id':NEW,'cold_complete':cold,'cold_evidence_sha256':evidence_sha,'state_snapshot':self.statebind,'purpose':purpose,'decision':'READY_FOR_READONLY_ONLY','physical_cold_and_current_ui_confirmed':True,'all_21_raw_and_initial_final_logs_reviewed':True,'new_panic_or_unassessed_abnormality':False,'device_writes_allowed':False,'collector':'collector','reviewer':'independent','captured_at':self.clock.isoformat(),'expires_at':(self.clock+dt.timedelta(seconds=890)).isoformat()})
+  env={'schema':'e5-next-directory-evidence-v1','serial':e.SERIAL,'boot_id':NEW,'cold_request':request,'cold_complete':cold,'cold_review':review,'cold_refresh':None,'readonly_result':None,'original_review':None}
+  return self.write('envelope.json',env),folder
+ def test_real_cold_evidence_positive(self):
+  env,_=self.cold_fixture();v=e.validate_cold(env,self.clock);self.assertEqual(v['purpose'],'directory');self.assertFalse(v['approved_to_flash'])
+ def test_sim_cold_ready_exact_and_confirmation(self):
+  self.purpose='rearm-with-sim';env,_=self.cold_fixture();self.assertEqual(e.validate_cold(env,self.clock)['purpose'],self.purpose)
+ def test_sim_state_not_ready_not_allowed(self):
+  self.purpose='rearm-with-sim';env,folder=self.cold_fixture();raw=next(folder.glob('*-health-00.stdout')).read_bytes();capture,triage=o.load_sources()
+  for state in (b'NOT_READY,READY',b'ABSENT,ABSENT',b'LOADED,LOADED',b'READY,NOT_READY'):
+   with self.assertRaisesRegex(RuntimeError,'profile'):o.parse_health(raw.replace(b'READY,READY',state),triage,NEW,self.purpose)
+ def test_directory_does_not_accept_sim_cold(self):
+  self.purpose='rearm-with-sim';env,_=self.cold_fixture()
+  with self.assertRaisesRegex(RuntimeError,'SIM trial'):e.validate_original(env,self.clock)
+ def test_missing_sim_confirmation_fails(self):
+  r={'purpose':'rearm-with-sim','sim_confirmation':None}
+  with self.assertRaises(RuntimeError):o.validate_policy(r)
+ def test_shared_state_drift_stops(self):
+  env,_=self.cold_fixture();self.state['markers']['UNCERTAIN.json']={'path':'changed','sha256':'0'*64}
+  with self.assertRaisesRegex(RuntimeError,'changed'):e.validate_cold(env,self.clock)
+ def test_old_boot_rejected(self):
+  env,_=self.cold_fixture();self.state['previous_boots']=[OLD,NEW];self.write('state.json',self.state)
+  with self.assertRaises(RuntimeError):e.validate_cold(env,self.clock)
+ def test_cold_missing_raw_and_stop(self):
+  env,folder=self.cold_fixture();(folder/'STOP.json').write_text('{}')
+  with self.assertRaisesRegex(RuntimeError,'stopped'):e.validate_cold(env,self.clock)
+ def test_cold_raw_and_parsed_tamper(self):
+  env,folder=self.cold_fixture();next(folder.glob('*-health-00.stdout')).write_bytes(b'wrong')
+  with self.assertRaisesRegex(RuntimeError,'raw/result'):e.validate_cold(env,self.clock)
+ def test_pid1_cross_boot_changed_refused(self):
+  env,folder=self.cold_fixture();p=folder/'final-pid1-diagnostic.json';value=json.loads(p.read_text());value['parsed']['stat-before']['starttime']=1;p.write_text(json.dumps(value))
+  with self.assertRaisesRegex(RuntimeError,'PID1 evidence'):e.validate_cold(env,self.clock)
+ def test_review_named_independence(self):
+  for v in ({'collector':'','reviewer':'a'},{'collector':' x ','reviewer':'x'},{'reviewer':'x'}):
+   with self.assertRaises(RuntimeError):e.review_people(v)
+ def test_review_expired_future_unzoned(self):
+  for start,end in ((-20,-1),(1,50),(0,901)):
+   with self.assertRaises(RuntimeError):e.lease({'captured_at':(self.clock+dt.timedelta(seconds=start)).isoformat(),'expires_at':(self.clock+dt.timedelta(seconds=end)).isoformat()},self.clock)
+ def test_default_all_device_gates(self):
+  with patch.object(c,'load_runtime',side_effect=AssertionError('must not import runtime')):
+   for call in (lambda:r.reconcile({},TX,TX,'/unused'),lambda:r.execute({}, {},'/unused'),lambda:arm.capture({},TX,'/unused'),lambda:arm.run({}, {},'/unused'),lambda:arm.backend({},NEW,TX,None,None)):
+    with self.assertRaisesRegex(RuntimeError,'IO_DISABLED'):call()
+  with self.assertRaisesRegex(RuntimeError,'IO_DISABLED'):o.main(['observe','--request','/not-read','--sha256','x'])
+ def test_no_clear_reboot_or_scanner(self):
+  for module in (r,arm):
+   source=Path(module.__file__).read_text();self.assertNotIn('unlink(',source);self.assertNotIn('rmtree(',source);self.assertNotIn('occupancy(',source);self.assertNotIn('subprocess',source)
+ def test_sim_base_exact_owner_and_ready(self):
+  value=e.base(NEW,'rearm-with-sim',TX);self.assertIn('= READY,READY',value);self.assertIn('= '+TX,value);self.assertNotIn('ABSENT',value)
+  self.assertIn('= ABSENT,ABSENT',e.base(NEW,'recovery'))
+ def test_budget_snapshot_future_stale(self):
+  for age in (-1,900,901):
+   with self.assertRaises(RuntimeError):c.remaining({'captured_at':(self.clock-dt.timedelta(seconds=age)).isoformat()},self.clock)
+ def test_source_variants_and_namespace(self):
+  self.assertEqual(len(e.source_variants(Path(r.__file__),b'RECOVERY_IO_DISABLED=True')),2)
+  self.assertNotIn('bounded_boot_control',sys.modules)
+ def test_symlink_and_host_overwrite_rejected(self):
+  target=self.write('x.json',{});p=self.root/'link';p.symlink_to(target['path'])
+  with self.assertRaises(RuntimeError):c.read(p)
+  with self.assertRaises(RuntimeError):c.output(self.root/'evidence')
+ def raw_fixture(self):
+  env,_=self.cold_fixture();envelope=c.obj(env);p=e.profile();out=self.root/'evidence/raw-capture';out.mkdir();(out/'raw').mkdir();(out/'transport').mkdir();artifacts={};payloads={}
+  for i,key in enumerate(sorted(e.PROTECTED|{'boot_b','misc','gpt'})):
+   size=(1<<20) if key=='misc' else 32768 if key=='gpt' else 4096
+   raw=(bytes([i+1])*size);payloads[key]=raw
+   if key!='gpt':p['partitions'][key]['bytes']=size
+   digest=c.sha(raw)
+   if key in e.PROTECTED:p['protected_hashes'][key]=digest
+   elif key=='gpt':p['gpt_prefix_sha256']=digest
+   elif key=='boot_b':p['original_boot_b_sha256']=digest
+   else:p['original_misc_sha256']=digest
+   file=out/'raw'/(key+'.observed.bin');file.write_bytes(raw);artifacts[key]={'path':str(file),'sha256':digest,'bytes':size}
+  orig=self.write('original-misc.bin',payloads['misc']);patches=[patch.object(e,'profile',return_value=p),patch.object(c,'ORIGINAL_MISC',Path(orig['path']))]
+  for v in patches:v.start();self.addCleanup(v.stop)
+  rec={'schema':'e5-boot-reconciliation-v3','serial':c.SERIAL,'boot_id':NEW,'ledger_head':self.state['ledger_head'],'captured_at':self.clock.isoformat(),'complete':True,'protected_match':True,'hashes':{k:c.sha(payloads[k]) for k in ('boot_b','misc')},'artifacts':artifacts,'misc_outside_original_match':True,'does_not_clear_poison':True}
+  rp=out/'raw/reconciliation.json';rp.write_bytes(c.canonical(rec)+b'\n')
+  tb={'serial':c.SERIAL,'boot_id':NEW,'txid':TX,'reconciliation_only':True,'recovery_context':None,'state_dir':str(c.STATE),'recovery_source_sha256':c.PINS['uncertainty_recovery']};tp=out/'transport/binding.json';tp.write_bytes(c.canonical(tb)+b'\n')
+  count=0
+  for turn in range(2):
+   for part in sorted(e.PROTECTED|{'boot_b','misc'}):
+    count+=1;self.receipt(out,count,'geometry-'+part,e.guard(part,p)+"printf 'GEOMETRY_OK\\n'\n",b'GEOMETRY_OK\n',4096)
+   for part in sorted(payloads):
+    raw=payloads[part];op=uuid.uuid4().hex;data=f'E5READ3 {op} {part} 0 {len(raw)} 12 34\n'.encode()+raw+f'\nE5END3 {op} 12 34\n'.encode();count+=1
+    self.receipt(out,count,'read-'+part,e.read_script(part,0,len(raw),op,NEW,p),data,len(raw)+1024)
+  result={'schema':'e5-next-readonly-v1','serial':c.SERIAL,'boot_id':NEW,'txid':TX,'purpose':self.purpose,'reconciliation':c.binding(rp),'cold_envelope':e.binding_without_originals(envelope),'state_snapshot':self.statebind,'helper_owner_tx':TX,'producer_source_sha256':c.sha(c.read(Path(r.__file__))),'source_pins':c.PINS,'transport_binding':c.binding(tp),'device_writes':False,'native_helpers_executed':False,'approved_to_restore':False};resultpath=out/'READONLY_RESULT.json';resultpath.write_bytes(c.canonical(result)+b'\n');rb=c.binding(resultpath)
+  _,_,_,digest=e.validate_readonly(rb,self.clock,self.purpose)
+  review=self.write('original-review.json',{'schema':'e5-next-originals-independent-review-v1','serial':c.SERIAL,'boot_id':NEW,'readonly_result':rb,'reconciliation':c.binding(rp),'raw_transport_evidence_sha256':digest,'decision':'ORIGINALS_VERIFIED_READONLY','device_writes_allowed':False,'collector':'a','reviewer':'b','captured_at':self.clock.isoformat(),'expires_at':(self.clock+dt.timedelta(seconds=890)).isoformat()})
+  envelope.update(readonly_result=rb,original_review=review);env=self.write('envelope.json',envelope);return env,rb,out
+ def receipt(self,out,index,label,script,raw,limit):
+  op=uuid.uuid4().hex;folder=out/'transport'/f'{index:06d}-{label}-{op}';folder.mkdir();argv=e.argv(e.base(NEW,self.purpose,TX)+script)
+  complete={'schema':'e5-bounded-transport-v1','serial':c.SERIAL,'boot_id':NEW,'txid':TX,'op_id':op,'status':'COMPLETE','validated':True,'mutating':False,'reconciliation_only':True,'recovery_context':None,'payload_bytes':0,'payload_sha256':c.sha(b''),'deadline_seconds':8,'automatic_retry':False,'evidence_directory':str(folder),'stdout_sha256':c.sha(raw),'argv':argv,'argv_sha256':c.sha(c.canonical(argv)),'label':label,'output_limit':limit}
+  flight={k:v for k,v in complete.items() if k not in ('validated','stdout_sha256')};flight['status']='IN_FLIGHT'
+  meta={'failure':None,'returncode':0,'elapsed_seconds':.1,'host_child_reaped':True,'stdin_bytes_sent':0,'stdout_bytes':len(raw),'stdout_sha256':c.sha(raw),'stderr_bytes':0}
+  for name,value in [('stdout.bin',raw),('stderr.bin',b''),('COMPLETE.json',complete),('IN_FLIGHT.json',flight),('transport-result.json',meta)]:
+   (folder/name).write_bytes(value if isinstance(value,bytes) else c.canonical(value)+b'\n')
+ def test_real_raw16_double_read_and_directory_contract(self):
+  env,rb,_=self.raw_fixture();gate=e.validate_directory_ready(env,NEW,self.clock);self.assertEqual(gate['status'],'ORIGINALS_VERIFIED');self.assertFalse(gate['device_execution_allowed'])
+ def test_raw_missing_second_read_rejected(self):
+  env,rb,out=self.raw_fixture();folder=sorted((out/'transport').glob('*-read-boot_b-*'))[-1];(folder/'COMPLETE.json').unlink()
+  with self.assertRaises(FileNotFoundError):e.validate_readonly(rb,self.clock)
+ def test_raw_wrong_tx_and_source_rejected(self):
+  _,rb,out=self.raw_fixture();original=c.obj(rb)
+  for key,value in [('txid','0000000000000000'),('producer_source_sha256','0'*64),('device_writes',True)]:
+   (out/'READONLY_RESULT.json').write_bytes(c.canonical({**original,key:value})+b'\n')
+   with self.assertRaises(RuntimeError):e.validate_readonly(c.binding(out/'READONLY_RESULT.json'),self.clock)
+ def test_read_body_corruption_rejected(self):
+  _,rb,out=self.raw_fixture();p=next((out/'transport').glob('*-read-boot_b-*/stdout.bin'));p.write_bytes(p.read_bytes().replace(b'E5READ3',b'E5READ4'))
+  with self.assertRaises(RuntimeError):e.validate_readonly(rb,self.clock)
+ def test_cold_original_review_not_self_assertion(self):
+  env,_,_=self.raw_fixture();value=c.obj(env);rv=c.obj(value['original_review']);rv['collector']=rv['reviewer'];value['original_review']=self.write('original-review.json',rv);env=self.write('envelope.json',value)
+  with self.assertRaisesRegex(RuntimeError,'independent'):e.validate_directory_ready(env,NEW,self.clock)
+ def test_read_transcript_exact_script_required(self):
+  _,rb,out=self.raw_fixture();folder=next((out/'transport').glob('*-read-boot_b-*'));receipt=json.loads((folder/'COMPLETE.json').read_text());receipt['argv'][-1]+=' ; echo changed';receipt['argv_sha256']=c.sha(c.canonical(receipt['argv']));flight=json.loads((folder/'IN_FLIGHT.json').read_text());flight.update(argv=receipt['argv'],argv_sha256=receipt['argv_sha256']);(folder/'COMPLETE.json').write_bytes(c.canonical(receipt)+b'\n');(folder/'IN_FLIGHT.json').write_bytes(c.canonical(flight)+b'\n')
+  with self.assertRaisesRegex(RuntimeError,'exact bounded read'):e.validate_readonly(rb,self.clock)
+ def test_raw_stop_or_recovery_context_rejected(self):
+  _,rb,out=self.raw_fixture();(out/'transport/UNCERTAIN.json').write_text('{}')
+  with self.assertRaisesRegex(RuntimeError,'incomplete'):e.validate_readonly(rb,self.clock)
+ def test_other_boot_directory_rejected(self):
+  env,_,_=self.raw_fixture()
+  with self.assertRaisesRegex(RuntimeError,'boot mismatch'):e.validate_directory_ready(env,OLD,self.clock)
+ def test_non_original_b_refused_even_if_consistent_snapshot(self):
+  env,_,_=self.raw_fixture();p=e.profile();p['original_boot_b_sha256']='1'*64
+  with self.assertRaisesRegex(RuntimeError,'not restored'):e.validate_original(env,self.clock)
+ def test_recovery_proposal_scope_and_new_failure_binding(self):
+  self.purpose='recovery';env,rb,out=self.raw_fixture();request=r.proposal(rb,100)
+  self.assertEqual(request['mode'],'restore-original');self.assertEqual(request['txid'],TX);self.assertEqual(request['image']['bytes'],64<<20);self.assertIsNone(request['install_ready']);self.assertEqual(request['expected_before'],c.obj(c.obj(rb)['reconciliation'])['hashes'])
+ def test_recovery_new_tx_and_boot_not_forgiven(self):
+  self.purpose='recovery';env,rb,_=self.raw_fixture();self.state['used_txids']=[TX]
+  with self.assertRaises(RuntimeError):r.proposal(rb,100)
+ def test_recovery_request_review_and_template(self):
+  self.purpose='recovery';env,rb,_=self.raw_fixture();proposal=r.proposal(rb,100);pb=self.write('proposal.json',proposal);rec=c.obj(c.obj(rb)['reconciliation']);expected={'schema':'e5-explicit-boot-recovery-review-v3','serial':c.SERIAL,'proposal_sha256':c.sha(c.canonical(proposal)),'reconciliation_sha256':c.obj(rb)['reconciliation']['sha256'],'ledger_head':rec['ledger_head'],'decision':r.DECISION}
+  bound=r.bind_request(rb,pb,self.write('first-review.json',expected),self.root/'evidence/bound');value=c.obj(bound);self.assertEqual(value['markers']['boot_ledger'],'ABSENT');self.assertEqual(value['context']['txid'],TX)
+  expected['decision']='TEMPLATE_NOT_VALID'
+  with self.assertRaisesRegex(RuntimeError,'independent first'):r.bind_request(rb,pb,self.write('wrong-review.json',expected),self.root/'evidence/nope')
+ def test_draft_does_not_change_markers(self):
+  self.purpose='recovery';env,rb,_=self.raw_fixture();before=copy.deepcopy(self.state);r.draft(rb,self.root/'evidence/draft',100);self.assertEqual(self.state,before);template=json.loads((self.root/'evidence/draft/BOOT_REVIEW.TEMPLATE.json').read_text());self.assertNotEqual(template['decision'],r.DECISION);self.assertEqual(template['ledger_head'],self.state['ledger_head'])
+ def engine_fixture(self,fail=None):
+  sp=importlib.util.spec_from_file_location('_e5_engine_fixture',c.LIVE/'bounded_boot_control.py');b=importlib.util.module_from_spec(sp);sp.loader.exec_module(b)
+  before=bytearray(64<<20);misc=bytearray(c.read(c.ORIGINAL_MISC));profile=b.profile();events=[];calls=[];poison=[];out=self.root/'evidence/engine';out.mkdir()
+  class FakeLedger:
+   rows=[];head='0'*64
+   def __enter__(self):return self
+   def __exit__(self,*a):pass
+   def poisoned(self):return False
+   def event(self,event,**fields):events.append((event,fields));self.rows.append({'event':event,**fields})
+  class Fake:
+   p=profile;boot_id=NEW;txid=TX
+   def preflight(self,budget):
+    calls.append(('protect',));c.require(fail!='protect','protection changed')
+   def read_chunk(self,part,off,n,budget):
+    calls.append(('read',part,off,n));raw=bytes(before if part=='boot_b' else misc)
+    if fail=='b-after' and events and any(ev=='VERIFIED' for ev,_ in events) and part=='boot_b':raw=b'X'+raw[1:]
+    return raw[off:off+n]
+   def write_chunk(self,part,off,data,op,budget):
+    calls.append(('write',part,off,len(data)));c.require(fail!='write','lost ack');misc[off:off+len(data)]=data
+    if fail=='outside':misc[0]^=1
+    return {'op_id':op,'part':part,'offset':off,'bytes':len(data),'fsync_completed':True}
+   def poison(self,reason):poison.append(reason)
+  request={'helper_owner_tx':TX,'request_id':'a'*32,'boot_id':NEW,'ledger_head':'0'*64,'total_seconds':100,'expected_before':{'boot_b':c.sha(bytes(before)),'misc':c.sha(bytes(misc))},'target_bc32_hex':b.trial_bc(bytes(misc)[2048:2080]).hex(),'expires_at':(self.clock+dt.timedelta(seconds=200)).isoformat()}
+  patches=[patch.object(b,'Ledger',FakeLedger),patch.object(b,'_protected',side_effect=lambda n,p,budget,ledger=None:n.preflight(budget)),patch.object(arm,'same_candidate',return_value=None)]
+  for p in patches:p.start();self.addCleanup(p.stop)
+  return Fake(),b,request,out,events,calls,poison
+ def test_rearm_engine_only32_no_B_write(self):
+  native,b,rq,out,events,calls,poison=self.engine_fixture();result=arm._engine(native,b,rq,'a'*64,out,None)
+  self.assertEqual([x for x in calls if x[0]=='write'],[('write','misc',2048,32)]);self.assertEqual(events[-1][0],'COMPLETE');self.assertFalse(result['boot_b_written']);self.assertFalse(poison)
+ def test_rearm_faults_stop_poison_and_no_retry(self):
+  for mode in ('protect','write','outside','b-after'):
+   with self.subTest(mode=mode):
+    # Independent temporary fixture/ledger for each failure, no device backend.
+    out=self.root/'evidence/engine'
+    if out.exists():
+     import shutil;shutil.rmtree(out)
+    native,b,rq,dest,events,calls,poison=self.engine_fixture(mode)
+    with self.assertRaises(RuntimeError):arm._engine(native,b,rq,'a'*64,dest,None)
+    self.assertEqual(events[-1][0],'UNKNOWN');self.assertTrue(poison);self.assertLessEqual(len([x for x in calls if x[0]=='write']),1)
+ def test_rearm_cancel_before_write(self):
+  import threading
+  native,b,rq,out,events,calls,poison=self.engine_fixture();cancel=threading.Event();cancel.set()
+  with self.assertRaises(RuntimeError):arm._engine(native,b,rq,'a'*64,out,cancel)
+  self.assertFalse([x for x in calls if x[0]=='write'])
+ def refresh_fixture(self):
+  env,folder=self.cold_fixture();prior=c.obj(env);later=self.clock+dt.timedelta(seconds=2000);self.clock=later
+  req=self.write('refresh-request.json',{'schema':'e5-next-refresh-request-v1','serial':c.SERIAL,'boot_id':NEW,'state_snapshot':self.statebind,'prior_envelope':env,'purpose':self.purpose,'sim_confirmation':None});dest=self.root/'evidence/refresh';dest.mkdir()
+  import shutil
+  for file in folder.iterdir():
+   if 'health-' in file.name:
+    match=re.search(r'health-(\d+)',file.name)
+    if match and int(match.group(1))>1:continue
+   shutil.copyfile(file,dest/file.name)
+  sb=json.loads((dest/'SOURCE_BINDING.json').read_text());sb.update(old_boot_id=NEW,request=req);(dest/'SOURCE_BINDING.json').write_bytes(c.canonical(sb)+b'\n')
+  for i in range(2):
+   at=later-dt.timedelta(seconds=10-i*2.1);rawfile=next(dest.glob(f'*-health-{i:02d}.stdout'));raw=rawfile.read_bytes();raw=raw.replace(f'{30+i*30.1:.2f} 40.00'.encode(),f'{2030+i*2.1:.2f} 40.00'.encode());rawfile.write_bytes(raw)
+   stem=rawfile.name[:-7]
+   for suffix in ('.request.json','.result.json'):
+    p=dest/(stem+suffix);v=json.loads(p.read_text());v['started_at']=at.isoformat()
+    if suffix=='.result.json':v['finished_at']=(at+dt.timedelta(seconds=.01)).isoformat();v['stdout_sha256']=c.sha(raw);v['stdout_bytes']=len(raw)
+    p.write_bytes(c.canonical(v)+b'\n')
+   capture,triage=o.load_sources();(dest/f'health-{i:02d}.parsed.json').write_bytes(c.canonical({'captured_at':at.isoformat(),'snapshot':o.parse_health(raw,triage,NEW,self.purpose)})+b'\n')
+  sequence=('pstore-console','pstore-dmesg','crash','pid1-stat-before','pid1-namespace-before','pid1-mountinfo','pid1-namespace-after','pid1-stat-after')
+  for phase,offset in (('initial',0),('final',2.1)):
+   for index,label in enumerate(sequence):
+    at=later-dt.timedelta(seconds=10-offset)+dt.timedelta(seconds=.1+index*.1)
+    for suffix in ('.request.json','.result.json'):
+     p=next(dest.glob('*-'+phase+'-'+label+suffix));v=json.loads(p.read_text());v['started_at']=at.isoformat()
+     if suffix=='.result.json':v['finished_at']=(at+dt.timedelta(seconds=.01)).isoformat()
+     p.write_bytes(c.canonical(v)+b'\n')
+    if label.startswith('pid1-'):
+     p=dest/(phase+'-pid1-diagnostic.json');v=json.loads(p.read_text());v['raw'][label[5:]]['started_at']=at.isoformat();p.write_bytes(c.canonical(v)+b'\n')
+  complete=json.loads((dest/'COMPLETE.json').read_text());complete.update(schema='e5-next-sameboot-refresh-v1',old_boot_id=NEW,samples=2,span_seconds=2.1,request=req,new_cold_observation=False,historical_cold_envelope=env);(dest/'COMPLETE.json').write_bytes(c.canonical(complete)+b'\n');cb=c.binding(dest/'COMPLETE.json')
+  with patch.object(c,'now',return_value=later):_,digest,_=e.cold_evidence(cb,later,refresh=True)
+  review=self.write('refresh-review.json',{'schema':'e5-next-refresh-independent-review-v1','serial':c.SERIAL,'boot_id':NEW,'complete':cb,'raw_evidence_sha256':digest,'state_snapshot':self.statebind,'purpose':self.purpose,'decision':'SAME_BOOT_READONLY_REFRESH','current_ui_confirmed':True,'initial_final_logs_and_health_reviewed':True,'new_panic_or_unassessed_abnormality':False,'device_writes_allowed':False,'collector':'a','reviewer':'b','captured_at':later.isoformat(),'expires_at':(later+dt.timedelta(seconds=800)).isoformat()})
+  pair=self.write('refresh-pair.json',{'schema':'e5-next-refresh-review-pair-v1','complete':cb,'review':review});new={**prior,'cold_refresh':pair};return self.write('refreshed-envelope.json',new),later
+ def test_sameboot_refresh_does_not_relabel_cold(self):
+  env,at=self.refresh_fixture()
+  with patch.object(c,'now',return_value=at):v=e.validate_cold(env,at)
+  self.assertFalse(v['new_cold_claimed']);self.assertGreater(c.timestamp(v['expires_at']),at);self.assertEqual(v['boot_id'],NEW)
+ def test_sameboot_refresh_unknown_cannot_renew(self):
+  env,at=self.refresh_fixture();self.state['markers']['UNCERTAIN.json']={'path':'unknown','sha256':'0'*64}
+  with patch.object(c,'now',return_value=at),self.assertRaises(RuntimeError):e.validate_cold(env,at)
+ def test_refresh_does_not_extend_raw900(self):
+  env,at=self.refresh_fixture()
+  with self.assertRaises(RuntimeError):c.remaining({'captured_at':(at-dt.timedelta(seconds=901)).isoformat()},at)
+ def test_refresh_without_review_refused(self):
+  env,at=self.refresh_fixture();value=c.obj(env);pair=c.obj(value['cold_refresh']);pair['review']=self.write('missing-review.json',{});value['cold_refresh']=self.write('changed-pair.json',pair);env=self.write('changed-envelope.json',value)
+  with patch.object(c,'now',return_value=at),self.assertRaises(RuntimeError):e.validate_cold(env,at)
+ def test_final_crash_cannot_be_first_window_capture(self):
+  env,folder=self.cold_fixture();first=json.loads(next(folder.glob('*-health-00.result.json')).read_text())['started_at']
+  for suffix in ('.request.json','.result.json'):
+   p=next(folder.glob('*-final-crash'+suffix));value=json.loads(p.read_text());value['started_at']=first
+   if suffix=='.result.json':value['finished_at']=(c.timestamp(first)+dt.timedelta(seconds=.01)).isoformat()
+   p.write_bytes(c.canonical(value)+b'\n')
+  with self.assertRaisesRegex(RuntimeError,'diagnostic sequence'):e.validate_cold(env,self.clock)
+ def test_read_request_overlap_or_stderr_not_passed(self):
+  env,rb,out=self.raw_fixture();p=next((out/'transport').glob('*-read-boot_b-*/stderr.bin'));p.write_bytes(b'error')
+  with self.assertRaisesRegex(RuntimeError,'failed raw'):e.validate_readonly(rb,self.clock)
+ def test_purpose_unknown_and_confirmation_wrong_slot(self):
+  with self.assertRaises(RuntimeError):o.sim_state('anything')
+  confirmation=c.obj(self.simconfirm);confirmation['slot1']='China Unicom';bad=self.write('bad-confirm.json',confirmation)
+  with self.assertRaises(RuntimeError):o.validate_policy({'purpose':'rearm-with-sim','sim_confirmation':bad})
+ def test_normal_completed_context_not_implicitly_unknown(self):
+  self.purpose='recovery';self.state.update(ledger_last_event='COMPLETE',ledger_head='9'*64,ledger_sha256='8'*64,used_txids=['0000000000000001']);self.statebind=self.write('state.json',self.state);env,rb,_=self.raw_fixture();request=r.proposal(rb,100)
+  self.assertEqual(request['txid'],TX);self.assertTrue(all(v=='ABSENT' for v in self.state['markers'].values()));self.assertEqual(c.obj(c.obj(rb)['reconciliation'])['ledger_head'],'9'*64)

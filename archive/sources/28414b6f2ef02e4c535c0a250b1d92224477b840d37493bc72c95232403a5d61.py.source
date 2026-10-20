@@ -1,0 +1,84 @@
+"""Compile/evaluate the exact production metadata predicate; no device I/O.
+
+HOST_TEST filesystem regressions intentionally bypass Android numeric uid checks.
+This separate pure predicate test covers that production-only guard directly.
+"""
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+CC = Path(shutil.which('cc')).resolve()
+ALLOWED = {CC}
+
+
+def guard(event, args):
+    if event.startswith('socket.') or event in ('os.system', 'os.exec', 'os.posix_spawn', 'os.posix_spawnp'):
+        raise AssertionError('network/indirect process forbidden')
+    if event == 'subprocess.Popen' and Path(args[0]).resolve() not in ALLOWED:
+        raise AssertionError('only local compiler and pure predicate fixture executable allowed')
+
+
+sys.addaudithook(guard)
+
+
+class NativeMetadataTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        source = (HERE / 'native/lock_archive.c').read_text()
+        found = re.findall(r'if\((ds\.st_uid!=[^\n]+)\)\{errno=EPERM;return fail\("ancestor-metadata"\);\}', source)
+        if len(found) != 1:
+            raise AssertionError('exact single production metadata predicate required')
+        cls.expression = found[0]
+        cls.tmp = tempfile.TemporaryDirectory(prefix='e5-tmp-predicate-')
+        root = Path(cls.tmp.name)
+        cls.binary = root / 'metadata-predicate'
+        cls.c = root / 'predicate.c'
+        cls.c.write_text('#include <sys/stat.h>\n#include <stdlib.h>\n'
+                         'int main(int argc,char **argv){if(argc!=4)return 2;'
+                         'struct stat ds={0},ls={0},ts={0},ks={0};'
+                         'ds.st_uid=1000;ds.st_gid=1000;ds.st_mode=0771;'
+                         'ls.st_uid=0;ls.st_gid=0;ls.st_mode=0751;ks.st_gid=0;'
+                         'ts.st_uid=(unsigned)strtoul(argv[1],0,10);'
+                         'ts.st_gid=(unsigned)strtoul(argv[2],0,10);'
+                         'ts.st_mode=(unsigned)strtoul(argv[3],0,8);'
+                         'return (' + cls.expression + ')?1:0;}\n')
+        subprocess.run([str(CC), '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', str(cls.c), '-o', str(cls.binary)], check=True, timeout=30)
+        ALLOWED.add(cls.binary.resolve())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def evaluate(self, uid, gid, mode):
+        return subprocess.run([str(self.binary), str(uid), str(gid), mode], capture_output=True, timeout=2).returncode
+
+    def test_actual_850_byte_fixture_numbers(self):
+        raw = (HERE / 'fixtures/stdout.bin').read_bytes()
+        line = next(x for x in raw.splitlines() if x.startswith(b'tmp\t'))
+        fields = line.split(b'\t', 1)[1].split(b'|')
+        self.assertEqual(self.evaluate(int(fields[5]), int(fields[6]), fields[4].decode()), 0)
+
+    def test_uid_zero_rejected(self):
+        self.assertEqual(self.evaluate(0, 2000, '771'), 1)
+
+    def test_other_uid_rejected(self):
+        self.assertEqual(self.evaluate(1000, 2000, '771'), 1)
+
+    def test_gid_zero_rejected(self):
+        self.assertEqual(self.evaluate(2000, 0, '771'), 1)
+
+    def test_wrong_mode_rejected(self):
+        self.assertEqual(self.evaluate(2000, 2000, '777'), 1)
+
+    def test_production_remains_disabled(self):
+        self.assertIn('static const int DEVICE_EXECUTION_ENABLED=0;', (HERE / 'native/lock_archive.c').read_text())
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

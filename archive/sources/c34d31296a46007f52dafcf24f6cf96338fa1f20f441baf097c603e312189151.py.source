@@ -1,0 +1,175 @@
+"""Only temporary host fixtures. No device processes or sockets are permitted."""
+import sys
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('external operation forbidden')
+sys.addaudithook(audit)
+import copy,datetime as dt,importlib.util,json,shlex,tempfile,unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+import recovery_entry as e
+REAL_LINEAGE=e.capture_lineage
+NEW='00000000-0000-4000-8000-000000000001';TX='1234567890abcdef'
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve();(self.root/'evidence').mkdir()
+  self.markers={'ACTIVE.json':'a'*64,'UNCERTAIN.json':'b'*64,'RECOVERY_ONLY.json':'ABSENT','boot_ledger':'ABSENT'}
+  self.clock=dt.datetime.now(dt.timezone.utc)
+  self.rec={'schema':'e5-boot-reconciliation-v3','serial':e.SERIAL,'boot_id':NEW,'captured_at':self.clock.isoformat(),'ledger_head':'0'*64,'complete':True,'hashes':{'boot_b':'1'*64,'misc':'2'*64}}
+  self.recbind=self.write('rec.json',self.rec)
+  self.profile={'original_boot_b_sha256':'3'*64,'original_misc_sha256':'4'*64}
+  self.boot=SimpleNamespace(BOOT_BYTES=64<<20,MISC_BYTES=1<<20)
+  self.recovery=SimpleNamespace(_snapshot=lambda *a:None,_validated_bundle=self.validated)
+  self.modules={'bounded_boot_control':self.boot,'uncertainty_recovery':self.recovery}
+  patches=[patch.object(e,'ROOT',self.root),patch.object(e,'now',return_value=self.clock),patch.object(e,'old_state',return_value=self.markers),
+   patch.object(e,'load_runtime',return_value=self.modules),patch.object(e,'material_check',return_value=self.profile),patch.object(e,'capture_lineage',return_value=None)]
+  for p in patches:p.start();self.addCleanup(p.stop)
+ def write(self,name,value):
+  p=self.root/name;p.write_bytes(e.canonical(value)+b'\n');return e.binding(p)
+ def validated(self,bundle,state):
+  proposal={k:v for k,v in bundle.items() if k!='review'}
+  want={'schema':'e5-uncertainty-recovery-review-v3','serial':e.SERIAL,'proposal_sha256':e.sha(e.canonical(proposal)),'decision':e.DECISION}
+  e.require(e.obj(bundle['review'])==want,'independent second review differs')
+  return bundle['context'],self.clock
+ def boot_review(self,p):
+  return self.write('boot-review.json',{'schema':'e5-explicit-boot-recovery-review-v3','serial':e.SERIAL,'proposal_sha256':e.sha(e.canonical(p)),
+   'reconciliation_sha256':self.recbind['sha256'],'ledger_head':'0'*64,'decision':e.DECISION})
+ def proposal(self):return e.request_proposal(self.recbind,TX)
+ def bound_request(self):
+  p=self.proposal();return e.bind_request(self.write('proposal.json',p),self.boot_review(p),self.root/'evidence/request')
+ def test_default_gate_reconcile_before_all_reads(self):
+  with patch.object(e,'cold_inputs',side_effect=AssertionError('must not inspect')),self.assertRaisesRegex(RuntimeError,'IO_DISABLED'):e.reconcile({}, {}, TX,'/unused')
+ def test_default_gate_execute_before_all_reads(self):
+  with patch.object(e,'obj',side_effect=AssertionError('must not read')),self.assertRaisesRegex(RuntimeError,'IO_DISABLED'):e.execute({},'/unused')
+ def test_new_boot_required(self):
+  with self.assertRaisesRegex(RuntimeError,'new boot'):e.identity(e.OLD_BOOT,TX)
+ def test_old_tx_rejected_despite_new_boot(self):
+  with self.assertRaisesRegex(RuntimeError,'new transaction'):e.identity(NEW,e.OLD_TX)
+ def test_invalid_uuid_and_tx(self):
+  for boot,tx in [('bad',TX),(NEW,'arbitrary/path')]:
+   with self.assertRaises((ValueError,RuntimeError)):e.identity(boot,tx)
+ def test_fixed_request_scope(self):
+  p=self.proposal();self.assertEqual(p['mode'],'restore-original');self.assertIsNone(p['install_ready']);self.assertEqual(p['image']['path'],str(e.ORIGINAL_B));self.assertEqual(p['original_misc']['path'],str(e.ORIGINAL_MISC));self.assertNotIn('review_path',p['recovery'])
+ def test_budget_limited_by_fresh_snapshot(self):
+  self.rec['captured_at']=(self.clock-dt.timedelta(seconds=301)).isoformat();self.recbind=self.write('rec.json',self.rec)
+  with self.assertRaisesRegex(RuntimeError,'remaining snapshot lease'):self.proposal()
+ def test_future_or_expired_snapshot(self):
+  for seconds in (-1,900):
+   rec={**self.rec,'captured_at':(self.clock-dt.timedelta(seconds=seconds)).isoformat()}
+   with self.assertRaisesRegex(RuntimeError,'fresh snapshot'):e.remaining(rec)
+ def test_unzoned_snapshot_refused(self):
+  with self.assertRaisesRegex(RuntimeError,'timezone'):e.remaining({**self.rec,'captured_at':self.clock.replace(tzinfo=None).isoformat()})
+ def test_draft_only_invalid_template(self):
+  b=e.draft(self.recbind,TX,self.root/'evidence/draft');self.assertEqual(e.obj(b),self.proposal())
+  template=json.loads((self.root/'evidence/draft/BOOT_REVIEW.TEMPLATE.json').read_text());self.assertNotEqual(template['decision'],e.DECISION)
+ def test_template_is_not_accepted_review(self):
+  p=self.proposal();r=self.boot_review(p);value=e.obj(r);value['decision']='TEMPLATE_NOT_VALID';r=self.write('boot-review.json',value)
+  with self.assertRaisesRegex(RuntimeError,'independent boot'):e.bind_request(self.write('proposal.json',p),r,self.root/'evidence/refused')
+  self.assertFalse((self.root/'evidence/refused').exists())
+ def test_install_request_not_accepted(self):
+  p=self.proposal();p['mode']='install-linux'
+  with self.assertRaisesRegex(RuntimeError,'scope changed'):e.bind_request(self.write('proposal.json',p),self.boot_review(p),self.root/'evidence/refused')
+ def test_other_original_not_accepted(self):
+  p=self.proposal();p['image']['path']='/tmp/another-original.bin'
+  with self.assertRaisesRegex(RuntimeError,'scope changed'):e.bind_request(self.write('proposal.json',p),self.boot_review(p),self.root/'evidence/refused')
+ def test_complete_two_review_flow_only_host(self):
+  bp=e.obj(self.bound_request());self.assertEqual(bp['markers'],self.markers);self.assertEqual(e.obj(bp['request'])['recovery']['review_path'],str(self.root/'boot-review.json'))
+  review=self.write('bundle-review.json',{'schema':'e5-uncertainty-recovery-review-v3','serial':e.SERIAL,'proposal_sha256':e.sha(e.canonical(bp)),'decision':e.DECISION})
+  bound=e.bind_bundle(self.write('bundle-proposal.json',bp),review,self.root/'evidence/bundle')
+  self.assertEqual(e.validate_bundle(e.obj(bound))[0]['txid'],TX)
+  self.assertFalse((self.root/'evidence/bundle/RECOVERY_ONLY.json').exists())
+ def test_second_review_mismatch_refused(self):
+  bp=e.obj(self.bound_request());review=self.write('wrong-review.json',{})
+  with self.assertRaisesRegex(RuntimeError,'second review'):e.bind_bundle(self.write('bundle-proposal.json',bp),review,self.root/'evidence/refused')
+ def test_stale_bundle_after_review_stops(self):
+  bp=e.obj(self.bound_request());review=self.write('bundle-review.json',{'schema':'e5-uncertainty-recovery-review-v3','serial':e.SERIAL,'proposal_sha256':e.sha(e.canonical(bp)),'decision':e.DECISION})
+  with patch.object(e,'now',return_value=self.clock+dt.timedelta(seconds=400)),self.assertRaisesRegex(RuntimeError,'lease'):e.bind_bundle(self.write('bundle-proposal.json',bp),review,self.root/'evidence/refused')
+ def test_host_output_not_overwritten(self):
+  out=self.root/'evidence/existing';out.mkdir()
+  with self.assertRaisesRegex(RuntimeError,'new host evidence'):e.output(out)
+ def test_symlink_input_refused(self):
+  p=self.root/'alias';p.symlink_to(self.root/'rec.json')
+  with self.assertRaisesRegex(RuntimeError,'unsafe path'):e.read(p)
+ def test_material_hash_change_refused(self):
+  b=self.recbind;(self.root/'rec.json').write_text('{}')
+  with self.assertRaisesRegex(RuntimeError,'hash/length'):e.obj(b)
+ def test_missing_diagnostic_pin_fails_closed(self):
+  with patch.object(e,'COLD_SOURCE_SHA',None),self.assertRaisesRegex(RuntimeError,'pin pending'):e.cold_inputs({}, {})
+ def test_no_cli_enable_or_generic_clear(self):
+  source=Path(e.__file__).read_text();self.assertNotIn('getenv',source);self.assertNotIn('unlink(',source);self.assertNotIn('rmtree(',source);self.assertNotIn('occupancy(',source)
+ def test_reconciliation_transport_always_isolated(self):
+  seen={};native=object()
+  def transport(*args,**kw):seen.update(kw);return object()
+  m={'bounded_transport':SimpleNamespace(BoundedTransport=transport),'bounded_boot_control':SimpleNamespace(NativeBackend=lambda *a,**k:native)}
+  self.assertIs(e.backend(m,NEW,TX,self.root/'transport',object(),readonly=True),native)
+  self.assertTrue(seen['reconciliation_only']);self.assertIsNone(seen['recovery_context']);self.assertEqual(seen['recovery_source_sha'],e.PINS['uncertainty_recovery'])
+ def cold_fixture(self):
+  folder=self.root/'evidence/cold';folder.mkdir()
+  spec=importlib.util.spec_from_file_location('_test_recovery_diagnostic',e.COLD_SOURCE);observer=importlib.util.module_from_spec(spec);spec.loader.exec_module(observer);capture,triage=observer.load_sources()
+  markers={k:v for k,v in self.markers.items() if k in ('ACTIVE.json','UNCERTAIN.json')}
+  def put(name,value):
+   p=folder/name;p.write_bytes(value if isinstance(value,bytes) else e.canonical(value)+b'\n');return e.binding(p)
+  put('SOURCE_BINDING.json',{'script_sha256':e.COLD_SOURCE_SHA,'source_pins':observer.PINS,'adb_sha256':e.ADB_SHA,'old_boot_id':e.OLD_BOOT,'serial':e.SERIAL,'no_device_writes':True,'marker_pins':markers})
+  counter=[0]
+  def cmd(label,raw,script,at,limit=16384):
+   counter[0]+=1;stem=f'{counter[0]:05d}-{label}';started=at.isoformat();args=[str(e.ADB),'-s',e.SERIAL,'shell','-T',capture.SU+' -c '+shlex.quote(capture.BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(script))]
+   put(stem+'.stdout',raw);put(stem+'.stderr',b'');put(stem+'.sh.txt',script.encode())
+   put(stem+'.request.json',{'argv':args,'started_at':started,'host_deadline_seconds':8,'expected_returncode':0,'output_limit':limit,'script_sha256':e.sha(script.encode())})
+   put(stem+'.result.json',{'started_at':started,'returncode':0,'failure':None,'elapsed_seconds':.1,'stdout_sha256':e.sha(raw),'stdout_bytes':len(raw),'stderr_sha256':e.sha(b''),'stderr_bytes':0})
+   return {'started_at':started}
+  body=triage.HEALTH_SCRIPT.replace('emit boot_id_end','emit data_device_resolved "$(/system/bin/readlink -f /dev/block/by-name/userdata)"\nemit data_rdev "$(/system/bin/stat -c %t:%T /dev/block/mmcblk0p70)"\nemit data_sysdev "$(/system/bin/cat /sys/class/block/mmcblk0p70/dev)"\nemit boot_id_end')
+  script=capture.guard().replace(capture.BOOT_ID,NEW)+body;first=self.clock-dt.timedelta(seconds=700)
+  for i in range(21):
+   f={k:'' for k in triage.KEYS};f.update(boot_id_start=NEW,boot_id_end=NEW,root_uid='0',uptime=f'{30+i*30.1:.2f} 40.00',serial=e.SERIAL,model='E5',platform='ums9621',build='TS305_V03_20241128_2301',kernel='5.4.0',slot='_a',boot_completed='1',verifiedbootstate='orange',flash_locked='0',sim_states='ABSENT,ABSENT',ro_boot_reason='power_key',sys_boot_reason='cold',zygote='running',zygote_secondary='running',surfaceflinger='running',adbd='running',data_mount='/dev/block/by-name/userdata|f2fs|rw,nosuid',monitor='hang_detect_enabled: 1,hang_detect_timeout = 120 s  hang_detect_counter: 25',data_device_resolved='/dev/block/mmcblk0p70',data_rdev='103:3f',data_sysdev='259:63')
+   raw=('\n'.join(k+'\t'+v for k,v in f.items())+'\n').encode();at=first+dt.timedelta(seconds=i*30.1);cmd(f'health-{i:02d}',raw,script,at)
+   put(f'health-{i:02d}.parsed.json',{'captured_at':at.isoformat(),'snapshot':observer.parse_health(raw,triage,NEW)})
+  for phase in ('initial','final'):
+   guard=capture.guard().replace(capture.BOOT_ID,NEW)
+   for label,path,cap in (('pstore-console','/sys/fs/pstore/console-ramoops-0',262144),('pstore-dmesg','/sys/fs/pstore/dmesg-ramoops-0',1048576)):
+    body=f"if test -e {path}; then\n test -r {path}\n printf 'PRESENT\\n'\n {capture.BB} head -c {cap+1} {path}\nelse\n test ! -L {path}\n printf 'MISSING\\n'\nfi\n"
+    cmd(phase+'-'+label,b'MISSING\n',guard+body,first)
+    put(phase+'-'+label+'.presence.json',{'path':path,'present':False,'contents_bytes':0,'not_automatically_classified_as_new_panic':True})
+   cmd(phase+'-crash',b'',guard+triage.FIXED_REQUESTS[3]['script'],first)
+   fields=['S']+['0']*19;fields[6]='4194560';rawstat=('1 (init) '+' '.join(fields)+'\n').encode();values={};parsed={}
+   for label,raw,parser in [('stat-before',rawstat,observer.parse_pid1_stat),('stat-after',rawstat,observer.parse_pid1_stat),('namespace-before',b'mnt:[1]\n',observer.parse_namespace),('namespace-after',b'mnt:[1]\n',observer.parse_namespace),('mountinfo',b'1 2 0:1 / / rw - tmpfs tmpfs rw\n',observer.parse_mountinfo)]:
+    path='/proc/1/ns/mnt' if label.startswith('namespace') else '/proc/1/mountinfo' if label=='mountinfo' else '/proc/1/stat';cap=80 if '/ns/' in path else 1048576 if label=='mountinfo' else 8192
+    body=(f'readlink {path}\n' if '/ns/' in path else f'{capture.BB} head -c {cap+1} {path}\n')+f'test "$(cat /proc/sys/kernel/random/boot_id)" = {NEW}\n'
+    meta=cmd(phase+'-pid1-'+label,raw,guard+body,first);parsed[label]=parser(raw);values[label]={'sha256':e.sha(raw),'bytes':len(raw),'started_at':meta['started_at']}
+   put(phase+'-pid1-diagnostic.json',{'schema':'e5-pid1-diagnostic-v1','boot_id':NEW,'device_writes':False,'raw':values,'parsed':parsed})
+  complete={'schema':'e5-cold-diagnostic-observation-v1','serial':e.SERIAL,'old_boot_id':e.OLD_BOOT,'boot_id':NEW,'samples':21,'span_seconds':602.,'health_window_completed':True,'diagnostics_completed':True,'device_writes':False,'block_reads':False,'uncertainty_cleared':False,'approved_to_flash':False,'marker_pins':markers}
+  cold=put('COMPLETE.json',complete);_,evidence_sha,_=e.cold_evidence(cold)
+  review=self.write('cold-review.json',{'schema':'e5-cold-review-for-recovery-reconciliation-v1','serial':e.SERIAL,'boot_id':NEW,'cold_complete':cold,'diagnostic_source_sha256':e.COLD_SOURCE_SHA,'cold_evidence_sha256':evidence_sha,'old_markers':self.markers,'decision':'READY_FOR_READONLY_RECONCILIATION_ONLY','cold_user_action_and_ui_confirmed':True,'same_boot_android_a_root_no_sim_stable_600s':True,'all_21_samples_and_initial_final_logs_reviewed':True,'block_writes_allowed':False})
+  return cold,review,folder
+ def lineage_fixture(self):
+  cold,review,folder=self.cold_fixture();out=self.root/'evidence/read';out.mkdir();(out/'raw').mkdir();(out/'transport').mkdir()
+  recpath=out/'raw/reconciliation.json';recpath.write_bytes(e.canonical(self.rec)+b'\n');recbind=e.binding(recpath)
+  tb={'serial':e.SERIAL,'boot_id':NEW,'txid':TX,'reconciliation_only':True,'recovery_context':None,'state_dir':str(e.STATE),'recovery_source_sha256':e.PINS['uncertainty_recovery']}
+  tpath=out/'transport/binding.json';tpath.write_bytes(e.canonical(tb)+b'\n')
+  result={'schema':'e5-recovery-entry-readonly-v1','serial':e.SERIAL,'boot_id':NEW,'txid':TX,'reconciliation':recbind,'old_markers':self.markers,'device_writes':False,'native_helpers_executed':False,'approved_to_restore':False,'producer_source_sha256':e.sha(Path(e.__file__).read_bytes()),'source_pins':e.PINS,'transport_binding':e.binding(tpath),'cold_complete':cold,'cold_review':review}
+  rpath=out/'READONLY_RESULT.json';rpath.write_bytes(e.canonical(result)+b'\n');return recbind,rpath,folder
+ def test_real_cold_and_lineage_files_positive(self):
+  rec,rpath,_=self.lineage_fixture();REAL_LINEAGE(rec,self.rec,TX)
+ def test_real_lineage_tx_source_modes_refused(self):
+  rec,rpath,_=self.lineage_fixture();original=json.loads(rpath.read_text())
+  for key,value in [('txid',e.OLD_TX),('producer_source_sha256','0'*64),('source_pins',{}),('device_writes',True)]:
+   result={**original,key:value};rpath.write_bytes(e.canonical(result)+b'\n')
+   with self.assertRaises(RuntimeError):REAL_LINEAGE(rec,self.rec,TX)
+ def test_real_cold_raw_tamper_refused(self):
+  cold,review,folder=self.cold_fixture();next(folder.glob('*-health-00.stdout')).write_bytes(b'changed')
+  with self.assertRaisesRegex(RuntimeError,'raw/result'):e.cold_inputs(cold,review)
+ def test_real_pid_parsed_tamper_refused(self):
+  cold,review,folder=self.cold_fixture();p=folder/'final-pid1-diagnostic.json';v=json.loads(p.read_text());v['parsed']['stat-before']['starttime']=5;p.write_bytes(e.canonical(v)+b'\n')
+  with self.assertRaisesRegex(RuntimeError,'PID1 evidence'):e.cold_inputs(cold,review)
+ def test_real_lineage_uncertain_transport_refused(self):
+  rec,rpath,_=self.lineage_fixture();(rpath.parent/'transport/UNCERTAIN.json').write_text('{}')
+  with self.assertRaisesRegex(RuntimeError,'incomplete/uncertain'):REAL_LINEAGE(rec,self.rec,TX)
+ def test_real_missing_lineage_refused(self):
+  rec,rpath,_=self.lineage_fixture();rpath.unlink()
+  with self.assertRaises(FileNotFoundError):REAL_LINEAGE(rec,self.rec,TX)
+ def test_real_cold_stop_refused(self):
+  cold,review,folder=self.cold_fixture();(folder/'STOP.json').write_text('{}')
+  with self.assertRaisesRegex(RuntimeError,'stopped'):e.cold_inputs(cold,review)
+ def test_real_readonly_binding_changed_refused(self):
+  rec,rpath,_=self.lineage_fixture();result=json.loads(rpath.read_text());p=Path(result['transport_binding']['path']);tb=json.loads(p.read_text());tb['reconciliation_only']=False;p.write_bytes(e.canonical(tb)+b'\n');result['transport_binding']=e.binding(p);rpath.write_bytes(e.canonical(result)+b'\n')
+  with self.assertRaisesRegex(RuntimeError,'isolated reconciliation'):REAL_LINEAGE(rec,self.rec,TX)
+if __name__=='__main__':unittest.main(verbosity=2)

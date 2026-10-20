@@ -1,0 +1,301 @@
+"""Native scanner tests: local compiler and isolated synthetic /proc only."""
+import json
+import os
+from pathlib import Path
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+HERE = Path(__file__).resolve().parent
+BOOT = '00000000-0000-4000-8000-000000000001'
+TX = '0123456789abcdef'
+OP = 'a' * 32
+CC = shutil.which('cc')
+ALLOWED_BINARIES = set()
+
+
+def sentinel(event, args):
+    if event.startswith('socket.') or event in ('os.system', 'os.posix_spawn', 'os.posix_spawnp', 'os.exec'):
+        raise AssertionError('network or indirect process forbidden')
+    if event == 'subprocess.Popen' and Path(args[0]).resolve() not in ALLOWED_BINARIES:
+        raise AssertionError('unapproved host process')
+
+
+sys.addaudithook(sentinel)
+
+
+class ScannerTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.build = tempfile.TemporaryDirectory(prefix='e5-native-test-build-', dir='/tmp')
+        cls.binary = Path(cls.build.name) / 'scanner'
+        cls.disabled = Path(cls.build.name) / 'scanner-disabled'
+        ALLOWED_BINARIES.add(Path(CC).resolve())
+        for path, flags in ((cls.binary, ['-DE5_SCANNER_HOST_TEST']), (cls.disabled, [])):
+            subprocess.run([CC, '-std=c11', '-Wall', '-Wextra', '-Werror', '-O2', *flags,
+                            str(HERE / 'native_occupancy_scanner.c'), '-o', str(path)], check=True)
+            ALLOWED_BINARIES.add(path.resolve())
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.build.cleanup()
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='e5-native-test-case-', dir='/tmp')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = (Path(self.tmp.name) / 'sandbox')
+        self.root.mkdir()
+        self.root = self.root.resolve()
+        self.write('proc/sys/kernel/random/boot_id', BOOT + '\n')
+        (self.root / 'sys/block').mkdir(parents=True)
+        (self.root / 'data/e5linux').mkdir(parents=True)
+        self.write('data/e5linux/boot-os', 'openwrt\n')
+        self.proc(100)
+
+    def write(self, path, contents):
+        p = self.root / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(contents)
+        return p
+
+    def link(self, path, contents):
+        p = self.root / path
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if p.is_symlink() or p.exists():
+            p.unlink()
+        p.symlink_to(contents)
+
+    def proc(self, pid, ns=1000, flags=0, state='S'):
+        values = {i: '0' for i in range(3, 53)}
+        values.update({3: state, 9: str(flags), 22: str(pid * 10)})
+        self.write(f'proc/{pid}/stat', f'{pid} (test process) ' + ' '.join(values[i] for i in range(3, 53)) + '\n')
+        self.write(f'proc/{pid}/mountinfo', '1 0 0:1 / / rw - rootfs rootfs rw\n')
+        (self.root / f'proc/{pid}/fd').mkdir(exist_ok=True)
+        (self.root / f'proc/{pid}/task/{pid}').mkdir(parents=True, exist_ok=True)
+        self.link(f'proc/{pid}/ns/mnt', f'mnt:[{ns}]')
+        self.link(f'proc/{pid}/cwd', '/')
+        self.link(f'proc/{pid}/root', '/')
+        self.link(f'proc/{pid}/fd/0', 'pipe:[1]')
+
+    def run_scan(self, *, fault=None, delta=6000, extra=(), root=None, disabled=False):
+        env = dict(os.environ)
+        if fault:
+            env['E5_SCANNER_TEST_FAULT'] = fault
+        deadline = int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000) + delta
+        argv = [str(self.disabled if disabled else self.binary)]
+        if not disabled:
+            argv += ['--test-root', str(self.root if root is None else root)]
+        argv += ['scan', TX, BOOT, OP, str(deadline), *extra]
+        p = subprocess.run(argv, capture_output=True, timeout=8, env=env)
+        rows = [json.loads(s) for s in p.stdout.splitlines()]
+        self.assertTrue(rows, p.stderr)
+        self.assertEqual(rows[-1]['event'], 'RESULT')
+        return p, rows[-1], rows
+
+    def good(self):
+        p, r, rows = self.run_scan()
+        self.assertEqual(p.returncode, 0, (r, p.stderr))
+        self.assertTrue(r['complete'])
+        self.assertEqual(r['unknown'], [])
+        self.assertFalse(r['atomic_snapshot'])
+        self.assertEqual(r['opid'], OP)
+        return r, rows
+
+    def bad(self, **kwargs):
+        p, r, rows = self.run_scan(**kwargs)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertFalse(r['complete'])
+        return r, rows
+
+    def test_clear(self):
+        r, rows = self.good()
+        self.assertEqual((r['processes'], r['fds'], r['namespaces']), (1, 1, 1))
+        self.assertEqual(rows[0]['event'], 'BEGIN')
+
+    def test_shared_namespace_once(self):
+        self.proc(101)
+        r, _ = self.good()
+        self.assertEqual((r['processes'], r['namespaces']), (2, 1))
+
+    def test_other_namespace_checked(self):
+        self.proc(101, ns=1001)
+        self.write('proc/101/mountinfo', '2 1 0:1 /e5linux /mnt/hidden rw - f2fs /dev/x rw\n')
+        self.bad()
+
+    def test_task_fd_checked(self):
+        self.proc(101)
+        (self.root / 'proc/100/task/101').mkdir()
+        self.link('proc/101/fd/0', '/data/e5linux/boot-os')
+        self.bad()
+
+    def test_protected_fd(self):
+        self.link('proc/100/fd/0', '/data/e5linux/boot-os')
+        self.bad()
+
+    def test_protected_deleted_fd(self):
+        self.link('proc/100/fd/0', '/data/e5linux/boot-os (deleted)')
+        self.bad()
+
+    def test_inode_alias_fd(self):
+        alias = self.root / 'data/alias'
+        alias.symlink_to(self.root / 'data/e5linux/boot-os')
+        self.link('proc/100/fd/0', str(alias))
+        self.bad()
+
+    def test_cwd_and_root(self):
+        for name in ('cwd', 'root'):
+            with self.subTest(name=name):
+                self.link(f'proc/100/{name}', '/data/e5linux')
+                self.bad()
+                self.link(f'proc/100/{name}', '/')
+
+    def test_stage_archive_failed_paths(self):
+        for role in ('stage', 'archive', 'failed'):
+            with self.subTest(role=role):
+                self.link('proc/100/fd/0', f'/data/e5linux.{role}.{TX}/x')
+                self.bad()
+
+    def test_mount_escaped_path(self):
+        self.write('proc/100/mountinfo', '2 1 0:1 /e5linux/a\\040b /mnt/z rw - f2fs /dev/x rw\n')
+        self.bad()
+
+    def test_invalid_mount_escape(self):
+        self.write('proc/100/mountinfo', '2 1 0:1 /x\\099y /mnt/z rw - f2fs /dev/x rw\n')
+        self.bad()
+
+    def test_benign_escaped_mount(self):
+        self.write('proc/100/mountinfo', '2 1 0:1 /a\\040b /mnt/z rw - f2fs /dev/x rw\n')
+        self.good()
+
+    def test_loop_protected(self):
+        self.write('sys/block/loop0/loop/backing_file', '/data/e5linux/openwrt.ext4\n')
+        self.bad()
+
+    def test_unconfigured_loop(self):
+        (self.root / 'sys/block/loop0').mkdir()
+        r, _ = self.good()
+        self.assertEqual(r['loops'], 1)
+
+    def test_missing_backing_attribute_unknown(self):
+        (self.root / 'sys/block/loop0/loop').mkdir(parents=True)
+        self.bad()
+
+    def test_loop_bound(self):
+        for i in range(129):
+            (self.root / f'sys/block/loop{i}').mkdir()
+        self.bad()
+
+    def test_kernel_without_fs(self):
+        self.proc(101, flags=0x200000)
+        for name in ('ns/mnt', 'cwd', 'root'):
+            (self.root / f'proc/101/{name}').unlink()
+        (self.root / 'proc/101/fd/0').unlink()
+        self.good()
+
+    def test_kernel_missing_fs_but_open_fd_unknown(self):
+        self.proc(101, flags=0x200000)
+        (self.root / 'proc/101/cwd').unlink()
+        self.bad()
+
+    def test_loop_inode_alias(self):
+        (self.root / 'data/alias').symlink_to(self.root / 'data/e5linux/boot-os')
+        self.write('sys/block/loop0/loop/backing_file', '/data/alias\n')
+        self.bad()
+
+    def test_unrelated_loop(self):
+        self.write('data/unrelated.ext4', 'not a protected inode')
+        self.write('sys/block/loop0/loop/backing_file', '/data/unrelated.ext4\n')
+        self.good()
+
+    def test_user_missing_fs_unknown(self):
+        (self.root / 'proc/100/cwd').unlink()
+        r, _ = self.bad()
+        self.assertEqual(r['gone_observed'], 1)
+
+    def test_zombie_unknown(self):
+        self.proc(100, state='Z')
+        self.bad()
+
+    def test_pid_identity_malformed(self):
+        self.write('proc/100/stat', '101 (different) S 0\n')
+        self.bad()
+
+    def test_incomplete_task_list(self):
+        (self.root / 'proc/100/task/100').rmdir()
+        self.bad()
+
+    def test_missing_task_stat(self):
+        (self.root / 'proc/100/task/999').mkdir()
+        r, _ = self.bad()
+        self.assertEqual(r['gone_observed'], 1)
+
+    def test_wrong_boot(self):
+        self.write('proc/sys/kernel/random/boot_id', '0' * 36)
+        self.bad()
+
+    def test_cancel_before_scan(self):
+        r, _ = self.bad(fault='cancel-before-scan')
+        self.assertEqual(r['cancel_signal'], signal.SIGTERM)
+
+    def test_expired_and_excessive_deadline(self):
+        for delta in (-1, 9000):
+            with self.subTest(delta=delta):
+                self.bad(delta=delta)
+        self.bad(fault='expire-before-scan')
+
+    def test_symlink_tree_refused(self):
+        (self.root / 'data/e5linux/boot-os').unlink()
+        (self.root / 'data/e5linux/boot-os').symlink_to('/etc/passwd')
+        self.bad()
+
+    def test_hardlink_tree_refused(self):
+        os.link(self.root / 'data/e5linux/boot-os', self.root / 'data/second')
+        self.bad()
+
+    def test_fixture_escape_refused(self):
+        p = self.root / 'proc/100/mountinfo'
+        p.unlink()
+        p.symlink_to('/etc/passwd')
+        self.bad()
+
+    def test_production_disabled(self):
+        r, _ = self.bad(disabled=True)
+        self.assertEqual(r['reason'], 'production-device-execution-disabled')
+
+    def test_real_data_and_extra_arg_refused(self):
+        self.bad(root='/data')
+        self.bad(extra=('unexpected',))
+
+    def test_real_cancel_signals(self):
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            with self.subTest(sig=sig):
+                deadline = int(time.clock_gettime(time.CLOCK_MONOTONIC) * 1000) + 2000
+                argv = [str(self.binary), '--test-root', str(self.root), 'scan', TX, BOOT, OP, str(deadline)]
+                p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                     env={**os.environ, 'E5_SCANNER_TEST_FAULT': 'pause-before-scan'})
+                rows = []
+                while True:
+                    line = p.stdout.readline()
+                    self.assertTrue(line)
+                    row = json.loads(line)
+                    rows.append(row)
+                    if row['phase'] == 'protected-tree':
+                        break
+                p.send_signal(sig)
+                out, err = p.communicate(timeout=3)
+                rows.extend(json.loads(s) for s in out.splitlines())
+                self.assertNotEqual(p.returncode, 0)
+                self.assertEqual(err, '')
+                self.assertEqual(rows[-1]['cancel_signal'], sig)
+                self.assertFalse(rows[-1]['complete'])
+
+    def test_actual_deadline_while_scanning(self):
+        self.bad(fault='pause-before-scan', delta=50)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)

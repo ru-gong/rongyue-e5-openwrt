@@ -1,0 +1,24 @@
+# D0 existing OpenWrt trial — local preparation, live disabled
+
+This dispatcher is fixed to DEVICE_SERIAL_REDACTED, the restored original B/misc, the existing seven-file runtime snapshot, and the already approved 64 MiB OpenWrt boot image. It does not contain a new rootfs, cellular fix, AT command, observer deployment, or hotspot configuration. Known RF assertion risk is not resolved by this tool.
+
+`python3 -B trial.py plan` verifies local fixed materials, including the 2,425,207,808-byte runtime backup tar, and reports the fixed transaction. `execute` unconditionally refuses while `LIVE_ENABLED=False`, before importing the backend or constructing transport. There are no CLI path, serial, image, evidence, partition, or scope overrides. Only an independently reviewed enabling copy may be used later by the root operator.
+
+The fixed evidence directory is `evidence/cellular-diagnosis-20261013/d0-trial-01`. It must not already exist. A failure consumes this evidence path; this dispatcher never retries or removes evidence.
+
+The transaction reuses the SHA-pinned frozen Android backend for the exact A/root/device/node/GPT prefix/13-partition/data preflight. It then requires the seven expected top-level entries to be regular files of their fixed lengths and hashes, with no extra entries or symlinks. It rejects an unknown/busy rootfs: any loop backing identity matching it, any process mountinfo mentioning e5linux, or any `fuser` user. Missing applets, inaccessible live process mountinfo, unresolvable loop backing paths, or parse uncertainty also reject. This conservative check has only fake test coverage here; an unexpected real Android response must stop rather than relax the guard during execution.
+
+Two complete seven-file SHA passes must match each other and the fixed snapshot. Each pass brackets every hash with inode/device/mode/size/mtime/ctime/owner checks. Extra inactivity and metadata checks follow the long prewrite reads, precede misc, and follow misc. The snapshot's pinned offline ext4 inspection proves the preserved image's internal default is Android; outer `boot-os` remains `openwrt` and `openwrt-default-boot` remains `android`. The tool does not mount, upload, rename, replace, chmod, or explicitly write any ordinary device file. Reads can affect access-time bookkeeping; these are content checks, not a snapshot guarantee against an adversarial concurrent writer.
+
+Before any device write, original B (64 MiB) and misc (1 MiB) must exactly match this device's fixed recovery hashes. Exclusive host backups and the journal use the frozen core's file and parent-directory fsync. The sequence is:
+
+1. Complete preflight, file checks and durable backup, then repeat preflight and file checks.
+2. Durable `BEGIN_BOOT_B`, exactly one B full write, complete B readback and SHA, 13 protected partition checks, unchanged misc, and another inactive/metadata check.
+3. Durable `BEGIN_MISC32`, exactly one 32-byte write at misc offset 2048. Complete misc readback must equal its preimage everywhere else and contain the computed CRC-valid B trial record. Recheck B, 13 protected partitions and inactivity/metadata.
+4. Durable result and `COMPLETE_NO_REBOOT`. Reboot is a separate root-operator decision.
+
+Any exception stops with no retry, reboot, automatic rollback, first-install staging, or upload. A write can have partially completed before an exception; the journal is evidence, not proof of non-mutation. Recovery uses the separately approved frozen original-B plus misc32 restore workflow after a new Android A preflight. This dispatcher provides no recovery command and cannot repair a device that cannot return to Android A. No FDL writes, A boot writes, super/data/metadata changes, NV writes, permanent default changes, or broader restore are included.
+
+Thirteen unit tests use an in-memory fake transport under an audit hook rejecting every process and socket operation. They exercise ordered success, B/disconnect/short-read failures, protected/file drift, misc outside-window drift, busy state, reused evidence, and simulated backup/journal persistence failures. Fake host captures verify transaction ordering; they do not simulate power loss, Android shell execution, or storage guarantees. Existing frozen backend implementation supplies real fsync and binary `shell -T` transport. This dispatcher has not performed device I/O.
+
+This is a finite trial preparation. Successful writes do not certify cellular registration, internet forwarding, CP stability, hotspot behavior after USB removal, or runtime return-to-Android behavior. Those remain separate observed acceptance steps.

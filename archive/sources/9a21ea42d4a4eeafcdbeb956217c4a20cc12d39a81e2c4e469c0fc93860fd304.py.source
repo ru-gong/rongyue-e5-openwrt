@@ -1,0 +1,109 @@
+"""Host-only core continuation copy; preserve legacy helper/recovery sources."""
+import ast,copy,hashlib,json,os,secrets,sys
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent
+OLD=ROOT/'tools/e5_nextphase_core_live_265962d3c1cdbde8';BASE=ROOT/'tools/e5_activation_bundle_265962d3c1cdbde8/RESULT.json';BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+GATES={'android_directory_adapter.py':'DEVICE_IO_DISABLED','bounded_boot_control.py':'DEVICE_IO_DISABLED','directory_session.py':'DEVICE_SESSION_DISABLED','nv_baseline.py':'NV_IO_DISABLED','workflow.py':'WORKFLOW_IO_DISABLED','bounded_stage.py':'STAGE_IO_DISABLED','probe_host.py':'PROBE_IO_DISABLED','uncertainty_recovery.py':'RECOVERY_TRANSITION_DISABLED'}
+sha=lambda x:hashlib.sha256(x).hexdigest()
+def need(x,s):
+ if not x:raise RuntimeError(s)
+def encoded(v):return (json.dumps(v,ensure_ascii=False,sort_keys=True,indent=2)+'\n').encode()
+def pin(p):return {'path':str(p),'sha256':sha(p.read_bytes()),'bytes':p.stat().st_size}
+def assign(raw,name,value):
+ lines=raw.decode().splitlines(True);nodes=[n for n in ast.parse(raw).body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets)];need(len(nodes)==1,'one literal assignment '+name);n=nodes[0]
+ if ast.literal_eval(n.value)==value:return raw
+ lines[n.lineno-1:n.end_lineno]=[name+' = '+repr(value)+'\n'];return ''.join(lines).encode()
+def originals():
+ need(sha(BASE.read_bytes())==BASE_SHA,'old family digest');base=json.loads(BASE.read_bytes());files={}
+ for k,v in base['files'].items():
+  p=Path(v['path']);raw=p.read_bytes();need(not p.is_symlink() and len(raw)==v['bytes'] and sha(raw)==v['sha256'],'old source drift '+k)
+  if k.startswith('core/'):files[k[5:]]=raw
+ return base,files
+
+def overlay(files):
+ f=copy.deepcopy(files);s=f['android_directory_adapter.py'].decode();start=s.index('    def occupancy(self):');end=s.index('    def _inventory(self,role):',start)
+ method='''    def _occupancy_response(self,raw,op,deadline):
+        # Protocol completion of a read-only negative response is distinct from
+        # a successful occupancy proof. No partial scan can admit a mutation.
+        body,separator,tail=raw.rpartition(b'\\nE5_SCAN_EXIT\\t')
+        require(separator and tail.endswith(b'\\n'),'complete scanner exit frame')
+        fields=tail[:-1].split(b'\\t')
+        require(len(fields)==3 and fields[0]==op.encode() and fields[1].isdigit() and fields[2]==self.boot_id.encode(),'scanner exit/boot binding')
+        code=int(fields[1]);rows=self._native_records(body,op,deadline,'e5-native-occupancy-v1');last=rows[-1]
+        ready=(code==0 and last.get('event')=='RESULT' and last.get('complete') is True and last.get('unknown')==[])
+        reacquire=(code==70 and last.get('event')=='RESULT' and last.get('complete') is False and
+            last.get('reason')=='fd-table-scan-unknown' and last.get('errno')==116 and last.get('cancel_signal')==0 and
+            last.get('unknown')==['scan-not-complete'] and
+            last.get('detail') in ('fd-table-not-converged','closed-fd-reappeared','fd-final-coverage-new-slot'))
+        require(ready or reacquire,'scanner occupied, unknown or unacknowledged failure')
+        if ready:
+            require(all(type(last.get(k)) is int and last[k]>=0 for k in ('processes','fds','namespaces','loops','tree_entries','read_bytes')) and last['processes']>0 and last['namespaces']>0,'scanner coverage counters')
+        return {'ready':ready,'scanner':last,'exit_code':code}
+    def occupancy(self):
+        self._enabled()
+        for attempt in range(3):
+            self.verify_file(self.remote_scanner,self.scanner.size,self.scanner.sha256)
+            op=uuid.uuid4().hex;deadline=self._deadline()
+            script=(f'scan_status=0\\n{self.remote_scanner} scan {self.txid} {self.boot_id} {op} {deadline} || scan_status=$?\\n'
+                    f'printf "E5_SCAN_EXIT\\\\t{op}\\\\t%s\\\\t%s\\\\n" "$scan_status" "$(cat /proc/sys/kernel/random/boot_id)"\\n')
+            reply=self._request('occupancy',script,limit=262144,validator=lambda raw:self._occupancy_response(raw,op,deadline),op_id=op)
+            if reply['ready']:return reply['scanner']
+        raise Refusal('three complete readonly scan attempts declined; no mutation admitted')
+'''
+ f['android_directory_adapter.py']=(s[:start]+method+s[end:]).encode()
+ s=f['phase_evidence.py'].decode();start=s.index('def validate_requirements(');mid=s.index('    deployed = deployment(',start);s=s[:mid]+s[mid:].replace("    deployed = deployment(requirements['deployment'], manifest, txid)","    historical, legacy = historical_prerequisites(manifest)\n    deployed = legacy.deployment(requirements['deployment'], historical, txid)",1)
+ s=s.replace("result['probe'] = probe(requirements['probe'], manifest, txid, deployed)","result['probe'] = legacy.probe(requirements['probe'], historical, txid, deployed)",1)
+ old_manifest={'path':str(OLD/'SOURCE_MANIFEST.json'),'sha256':sha(files['SOURCE_MANIFEST.json'])};old_parser={'path':str(OLD/'phase_evidence.py'),'sha256':sha(files['phase_evidence.py'])}
+ bridge='''def historical_prerequisites(manifest):
+    expected=HISTORICAL_PREREQUISITES
+    need(manifest.get('historical_prerequisites')==expected,'explicit unchanged-helper provenance required')
+    original=obj(expected['manifest'])
+    for key in ('artifacts','candidate','stage_inputs','closure','closure_case','deployment_manifest','recovery_manifest'):
+        need(manifest[key]==original[key],'historical helper/candidate/closure scope changed: '+key)
+    raw=read(expected['parser']['path'],expected['parser']['sha256'])
+    import types
+    key='_e5_exact_265_historical_phase_parser'
+    module=sys.modules.get(key)
+    if module is None:
+        module=types.ModuleType(key);module.__file__=expected['parser']['path'];sys.modules[key]=module
+        exec(compile(raw,module.__file__,'exec'),module.__dict__)
+    need(module.__file__==expected['parser']['path'],'historical parser identity')
+    original['_bound_manifest_sha256']=expected['manifest']['sha256']
+    return original,module
+
+
+'''
+ s=s.replace('def validate_requirements(', 'HISTORICAL_PREREQUISITES = '+repr({'manifest':old_manifest,'parser':old_parser})+'\n\n'+bridge+'def validate_requirements(',1);f['phase_evidence.py']=s.encode()
+ s=f['workflow.py'].decode();needle='    max_seconds = '
+ s=s.replace(needle,"    require(r['phase'] in ('activate','rollback','install'),'post-stage continuation phases only')\n"+needle,1);f['workflow.py']=s.encode()
+ return f
+
+def build(disabled,ident):
+ base,old=originals();files=overlay(old);dest=ROOT/'tools'/('e5_core_scan_reply_runtime_disabled_20261020' if disabled else 'e5_nextphase_core_live_'+ident);control=HERE/'prepared' if disabled else ROOT/'tools'/('e5_activation_bundle_'+ident)
+ need(not dest.exists() and not control.exists(),'exclusive new package')
+ for name,var in GATES.items():files[name]=assign(files[name],var,True if name in ('bounded_stage.py','probe_host.py','uncertainty_recovery.py') else disabled)
+ for name in ('bounded_stage.py','probe_host.py'):files[name]=assign(files[name],'ADAPTER_SHA',sha(files['android_directory_adapter.py']))
+ manifest=json.loads(old['SOURCE_MANIFEST.json']);manifest['modules']={k:sha(files[k+'.py']) for k in manifest['modules']};manifest['nv_geometry']={'path':str(dest/'nv_geometry.json'),'sha256':sha(files['nv_geometry.json'])};manifest['historical_prerequisites']={'manifest':{'path':str(OLD/'SOURCE_MANIFEST.json'),'sha256':sha(old['SOURCE_MANIFEST.json'])},'parser':{'path':str(OLD/'phase_evidence.py'),'sha256':sha(old['phase_evidence.py'])}}
+ files['SOURCE_MANIFEST.json']=encoded(manifest);files['workflow.py']=assign(files['workflow.py'],'MANIFEST_SHA',sha(files['SOURCE_MANIFEST.json']))
+ for name,raw in files.items():
+  if name.endswith('.py'):ast.parse(raw,filename=name)
+ for name in ('bounded_transport.py','cold_bridge.py','nv_geometry.json'):need(files[name]==old[name],'unchanged isolation/geometry source')
+ if not disabled:
+  for name in ('bounded_boot_control.py','directory_session.py','nv_baseline.py'):need(files[name]==old[name],'native-write/directory/NV behavior changed '+name)
+ dest.mkdir(mode=0o700);control.mkdir(mode=0o700)
+ for name,raw in files.items():
+  with (dest/name).open('xb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+ result=copy.deepcopy(base);result.update(activation_id=ident,device_io=False,core_only_read_protocol_continuation=True,native_binaries_unchanged=True,base_result={'path':str(BASE),'sha256':BASE_SHA},normal_phases=['activate','rollback','install'],host_writes_disabled=disabled)
+ result['directories']['core']=str(dest)
+ for name in files:result['files']['core/'+name]=pin(dest/name)
+ for filename,v in [('RESULT.json',result),('COMPLETE.json',{'host_copy_complete':True,'device_commands':False,'result_sha256':sha(encoded(result))})]:
+  with (control/filename).open('xb') as f:f.write(encoded(v));f.flush();os.fsync(f.fileno())
+ return {'result':{'path':str(control/'RESULT.json'),'sha256':sha(encoded(result))},'activation_id':ident,'directories':result['directories'],'device_io':False}
+if __name__=='__main__':
+ action=sys.argv[1] if len(sys.argv)>1 else 'plan'
+ if action=='prepare':print(json.dumps(build(True,'PREPARED_CORE_ONLY')))
+ elif action=='enable':
+  need((HERE/'TESTS.log').read_text().rstrip().endswith('OK'),'tests pass');need(json.loads((HERE/'PREPARED_SMOKE.json').read_bytes())['verified'],'prepared smoke');ident=secrets.token_hex(8);out=build(False,ident)
+  with (HERE/'ENABLED_COPY.json').open('x') as f:json.dump(out,f,indent=2);f.write('\n')
+  print(json.dumps(out))
+ else:print(json.dumps({'mode':'PLAN_ONLY','device_commands':False}))

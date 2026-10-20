@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Single-device, single-bundle Android A -> Linux B trial rearm.
+
+This separately reviewed LIVE helper writes only misc bytes [2048,2080).
+No boot/files writes, retry, rollback, subprocess shell, or reboot. The parent
+operator must inspect a successful durable result before separately rebooting.
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+
+WORK = Path(__file__).resolve().parents[2]
+CORE = WORK / "tools/e5_android_install_live_20261013/e5_install.py"
+CORE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+MANIFEST = WORK / "evidence/stage2-execution-20261013/final-install-bundle/final-manifest.json"
+MANIFEST_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+ORIGINAL_MISC = WORK / "evidence/preflight-20261013/recovery-backup-04/misc.full.raw.bin"
+ADB = Path("/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb")
+ADB_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+BOOT_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+LOG_START, LOG_END = 56 << 20, 60 << 20
+
+
+def load_core():
+    if CORE.is_symlink() or hashlib.sha256(CORE.read_bytes()).hexdigest() != CORE_SHA:
+        raise RuntimeError("frozen LIVE backend changed; stop before import/device access")
+    spec = importlib.util.spec_from_file_location("e5_bc32_frozen_core", CORE)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.require(module.LIVE_DISABLED is False, "wrong LIVE backend")
+    return module
+
+
+def fixed_inputs(e):
+    """All local validation, including actual full gzip/layout/provenance checks."""
+    profile = e.load_profile()
+    bundle, paths = e.validate_bundle(MANIFEST, MANIFEST_SHA)
+    e.require(bundle["adb_sha256"] == ADB_SHA, "unexpected ADB binding")
+    approved_boot = e.regular(paths["boot"]).read_bytes()
+    e.require(len(approved_boot) == e.BOOT_BYTES and e.digest(approved_boot) == BOOT_SHA,
+              "approved boot changed after bundle validation")
+    original_misc = e.regular(ORIGINAL_MISC).read_bytes()
+    e.require(len(original_misc) == e.MISC_BYTES and
+              e.digest(original_misc) == profile["original_misc_sha256"] == bundle["approved_misc_before_sha256"],
+              "original misc differs from this device's frozen backup")
+    e.bc_validate(original_misc[e.BC_OFFSET:e.BC_OFFSET+32])
+    return profile, approved_boot, original_misc
+
+
+def boot_matches(e, actual, approved):
+    e.require(len(actual) == len(approved) == e.BOOT_BYTES, "short boot B read")
+    e.require(actual[:LOG_START] == approved[:LOG_START] and actual[LOG_END:] == approved[LOG_END:],
+              "boot B differs outside approved [56,60) MiB diagnostic window")
+
+
+def rearm_transaction(e, device, profile, approved_boot, original_misc, evidence):
+    """Called only after fixed_inputs. Mock transport is used in offline tests."""
+    e.require(e.digest(approved_boot) == BOOT_SHA and len(approved_boot) == e.BOOT_BYTES,
+              "transaction boot binding changed")
+    e.require(profile == e.load_profile(), "profile changed")
+    e.require(len(original_misc) == e.MISC_BYTES and e.digest(original_misc) == profile["original_misc_sha256"],
+              "transaction original misc binding changed")
+    evidence = Path(evidence)
+    evidence.mkdir(mode=0o700, parents=False, exist_ok=False)
+    e.fsync_directory(evidence.parent); e.fsync_directory(evidence)
+    journal = e.Journal(evidence / "journal.jsonl")
+    try:
+        journal.event("START_BC32_ONLY", serial=e.SERIAL, manifest_sha256=MANIFEST_SHA,
+                      core_sha256=CORE_SHA, helper_sha256=e.file_hash(Path(__file__)),
+                      write_node="/dev/block/mmcblk0p3", write_offset=e.BC_OFFSET, write_bytes=32)
+        device.preflight()  # Exact serial/build/A/root/GPT/geometry/protected + bare rw F2FS.
+        protected = device.protected_hashes()
+        e.require(protected == profile["protected_hashes"], "protected chain mismatch")
+        current_boot = device.read("boot_b")
+        boot_matches(e, current_boot, approved_boot)
+        before = device.read("misc")
+        e.require(len(before) == e.MISC_BYTES, "short misc snapshot")
+        bc = e.bc_validate(before[e.BC_OFFSET:e.BC_OFFSET+32])
+        e.misc_changed_only_bc(original_misc, before, bc)
+        trial = e.bc_trial(bc)
+        e.durable_write(evidence / "misc.before.bin", before)
+        e.require((evidence / "misc.before.bin").read_bytes() == before, "host misc backup mismatch")
+        record = {"manifest_sha256": MANIFEST_SHA, "serial": e.SERIAL,
+                  "boot_b_sha256": e.digest(current_boot),
+                  "boot_b_prefix_sha256": e.digest(current_boot[:LOG_START]),
+                  "boot_b_diagnostic_sha256": e.digest(current_boot[LOG_START:LOG_END]),
+                  "boot_b_suffix_sha256": e.digest(current_boot[LOG_END:]),
+                  "misc_before_sha256": e.digest(before), "before_bc_hex": bc.hex(),
+                  "trial_bc_hex": trial.hex(), "protected_hashes": protected}
+        e.durable_write(evidence / "prewrite.json", (json.dumps(record, indent=2)+"\n").encode())
+        journal.event("BACKUP_VERIFIED", misc_sha256=e.digest(before), boot_b_sha256=e.digest(current_boot))
+        # Recheck state and every target immediately before the sole write.
+        device.preflight()
+        e.require(device.protected_hashes() == protected, "protected chain changed before write")
+        e.require(device.read("boot_b") == current_boot, "boot B changed before write")
+        e.require(device.read("misc") == before, "misc changed before write")
+        journal.event("BEGIN_MISC32", before_bc_hex=bc.hex(), after_bc_hex=trial.hex())
+        device.write_misc_bc(trial)
+        after = device.read("misc")
+        e.durable_write(evidence / "misc.readback.bin", after)
+        e.misc_changed_only_bc(before, after, trial)
+        e.require(device.read("boot_b") == current_boot, "boot B changed after misc write")
+        e.require(device.protected_hashes() == protected, "protected chain changed after misc write")
+        result = {"status": "VERIFIED_BC32_ONLY_NO_REBOOT", "serial": e.SERIAL,
+                  "manifest_sha256": MANIFEST_SHA, "misc_after_sha256": e.digest(after),
+                  "bc_after_hex": trial.hex(), "boot_b_unchanged": True,
+                  "protected_13_unchanged": True, "write_invocations": 1,
+                  "reboot_performed": False, "retry_performed": False}
+        e.durable_write(evidence / "result.json", (json.dumps(result, indent=2)+"\n").encode())
+        journal.event("COMPLETE_NO_REBOOT", misc_sha256=e.digest(after))
+        return result
+    except BaseException as error:
+        journal.event("STOP_NO_RETRY_NO_ROLLBACK_NO_REBOOT", error_type=type(error).__name__, reason=str(error))
+        raise
+    finally:
+        journal.close()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", choices=("plan", "live-rearm"))
+    parser.add_argument("--evidence", type=Path)
+    args = parser.parse_args()
+    if args.mode == "live-rearm" and args.evidence is None:
+        parser.error("live-rearm requires a NEW --evidence directory")
+    e = load_core()
+    profile, approved_boot, original_misc = fixed_inputs(e)
+    if args.mode == "plan":
+        print(json.dumps({"status": "LOCAL_PLAN_ONLY_DEVICE_STATE_UNCHECKED", "serial": e.SERIAL,
+                          "manifest_sha256": MANIFEST_SHA, "core_sha256": CORE_SHA,
+                          "helper_sha256": e.file_hash(Path(__file__)),
+                          "write": {"node": "/dev/block/mmcblk0p3", "offset": 2048, "bytes": 32},
+                          "boot_b_write": False, "reboot": False, "retry": False}, indent=2))
+        return
+    device = e.AdbBackend(ADB, ADB_SHA, profile)
+    result = rearm_transaction(e, device, profile, approved_boot, original_misc, args.evidence)
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

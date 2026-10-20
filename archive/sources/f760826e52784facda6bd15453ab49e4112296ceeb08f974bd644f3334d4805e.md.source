@@ -1,0 +1,45 @@
+# 有界 FD 对象观察候选
+
+本包完成主机验证和静态 ARM 构建，**尚未经过 Android 实机验证，不是继续执行许可**。原始 C 的 `DEVICE_EXECUTION_ENABLED=0`。`build/` 中另有经根任务明确要求生成的 gate1 ELF，仅为待独审材料，均为 0644；没有执行或上传生产 ELF，没有生成主机 live 执行包，没有访问 E5 或修改 marker/ledger。既有 Colima `e5-openwrt-prep` 从 Stopped 启动，现已恢复 Stopped，配置不变。
+
+## 改动与不变的门
+
+基线是已冻结 `e5_scanner_lifecycle_prepare_20261016/native_occupancy_scanner.c`，精确差异见 `SOURCE.patch`。保持 pinned task procdir/statfd、每任务 cwd/root/namespace、KCMP_FILES、代表退役重扫、loop/tree/inode、三轮及累计 32 MiB / 131072 FD / 131072 KCMP / 4096 task 上限。每次原生 5 秒预算、外部远端 6 秒和主机 8 秒约束未变。
+
+每个 FD 仍先核原 proc link 与目标 stat，再经 pinned task 的固定 `fd/N` magiclink 取得 O_PATH anchor。同一 held 对象的 fstat、fstatfs 和自身 anchor link 用于身份、路径及类型核验，随后重新核原 FD。初始/held/final 任一观察命中 protected 都立即 BUSY；观察身份不一致返回 UNKNOWN。无法获取、权限、未知类型和解析失败没有降级路径。
+
+只允许完整认证的 **PIPEFS + FIFO** 或 **SOCKFS + SOCK** 对象在两个完整观察间变化。其余对象保留 FD号/dev/inode/mode/link/fs/class 的严格投影比较。文件系统上的 named FIFO、UNIX socket 的路径 inode、memfd、普通文件与 anon_inode 不因字符串或类型获得豁免。已绑定路径的 UNIX socket **进程 FD** 仍可能属于 sockfs，这与路径 inode 是两个不同观察；不把绑定名称或隐藏的 SCM_RIGHTS/epoll 引用冒充已证明安全。
+
+新增诊断最多记录 **4 个发生差异的快照对、全局 8 个差异项**，其余只计 omitted；不输出任意路径。BEGIN/PHASE/RESULT 和原 schema 保持，添加 attempt/complete/discard/acquisition errno、分类与有限对象身份诊断。不是按每表无限累积。
+
+有限 FD 关闭沿用旧合同：失读使**整张当前表作废**，只可在原三次尝试内取得后续两张完整、严格投影一致的表才成功；不是直接忽略 ENOENT。持续获取失败不能完成两张完整表，仍 STOP。任何 BUSY 不会进入该重取分支。
+
+## 证据与测试
+
+- Mac native：132 项，128 通过，4 个 Linux 专属项目跳过。
+- Linux native：132 项全过，包括真正 syscall/capability 及清理测试。
+- 既有真实 Linux 生命周期场景：25 项全过，原四 suite、旧真实 harness/workload 字节保持不变。
+- 新 Linux 对象场景：22 项全过，其中 19 项为实际对象/动态交错，3 项在 test-only 分支注入 O_PATH 获取 errno；后者不是 Android SELinux 权限实测。
+- 独立纯模型：17 项通过，不当作原生证据。
+- 新 OLD_TX=`4d6efbbcd48f2d73` 归档器：Linux HOST_TEST 35 项、精确生产元数据谓词 6 项通过；源码由 `e5_postdeployment_probe_stop_prepare_20261016` 提供，本包只同次构建，没有改其行为。
+
+`TEST_RESULTS.json` 保存逐场景真实检查和日志 SHA。真实匿名 pipe/socket（含 bound UNIX socket 的 process FD）在两次完整观察中更换 inode 后通过；普通文件、named FIFO、路径 socket inode、memfd、epoll↔memfd 持续变化仍 STOP。初始普通文件→held pipe 及反向交错均 ESTALE；初始/held/final 三个受保护交错分别 BUSY。自身继承 protected FD 被 scanner 本身命中，临时 anchor 没有造成 self 无限重扫。
+
+`finite-close-before-pin` 的原生计数为 7 次尝试、6 次完整、1 次整表作废，最后一次失读 ENOENT；3 个表各获得两次完整观察。`fault-open-enoent` 明确三次失读作废，返回 STOP。最初测试误把有限 close 预期写成 STOP 的失败日志保留，后续只纠正测试并补计数，没有放宽旧失读处理。
+
+规模场景 `scale-new` 在 Linux 6.8 VM：1536 个任务、445 个 FD 表、累计 127862 次 FD，读取 **28,389,270 字节（约 27.07 MiB）**，1.284876865 秒。仅说明该 VM/负载在原上限内；不是 Android 5.15 性能保证。真实 12 表 stream churn 的诊断只记录 4 对、4 项并明确省略 8 项；另 12 表×20 FD 的 fixture 验证全局 8 项上限与总输出小于 256 KiB。
+
+原失败 PID1294 的 FD242 只是最后游标，旧原始证据没有变化对象明细。不能据本候选断言现场变动属于 pipe/socket，也不能承诺下一次必过。此工具仍是有界直接占用观察，不是全局原子快照；不能证明瞬时 ABA、隐藏内核引用、任意未来状态。实际 Android O_PATH/SELinux/KCMP 权限仍须真实同一次扫描自行验证，失败停止。
+
+## 构建与复现
+
+`build/BUILD.json` 绑定四个静态 ELF、gate0/1 精确单行差异、编译命令与 readelf 原文。独立 ELF 表解析确认 ELF64 little-endian AArch64，无 PT_INTERP、无 DT_NEEDED。生产构建不定义任何 HOST_TEST/INTEGRATION 宏。scanner 和 archiver 启用源都只把 `DEVICE_EXECUTION_ENABLED=0` 改为 `1`；这不等于部署许可。
+
+在本机只执行主机 fixture：
+
+```sh
+python3 -B -m unittest -v test_native_occupancy_scanner test_kcmp test_final_identity_diagnostics test_lifecycle test_fd_objects
+python3 -B -m unittest -v test_fd_object_model
+```
+
+模型的全进程/网络审计钩子与原生测试必须分进程运行。Linux 动态脚本只能在已批准的隔离 Linux VM，以 root 建独立 PID/mount namespace、临时 sandbox；不得对手机运行。构建命令在 `build/BUILD_COMMANDS.sh`。本次没有新增依赖、网络安装、虚拟机配置调整、USB passthrough、手机接口或设备请求。`DESIGN.md` 与 `DESIGN_MANIFEST.json` 是实现前评审稿，保留原字节；当前状态以本 README、TEST_RESULTS 与 BUILD 为准。

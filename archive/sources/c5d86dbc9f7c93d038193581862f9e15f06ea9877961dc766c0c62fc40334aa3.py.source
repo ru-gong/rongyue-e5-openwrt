@@ -1,0 +1,139 @@
+"""Host-only, default-plan source rebinder. Output remains SIM device-disabled."""
+import argparse, ast, copy, difflib, hashlib, json, os, re
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+BASE=ROOT/'tools/e5_sim_rearm_b56c_prepare_20261016'
+BASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CLOSURE=ROOT/'tools/e5_lifecycle_stop_recovery_prepare_20261016'
+CLOSURE_MANIFEST_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CLOSURE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+CASE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+COPY_DISABLED=True
+UNCHANGED=('observe.py','evidence_contract.py','recovery.py','rearm.py','sim_nv.py','nv_origin.py','nv_geometry.json','acceptance-contract.json')
+FUNCTIONS=('state_snapshot','normal_state','recovery_state','_closure_api')
+MARKERS=('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','RECOVERY_PENDING.json','RECOVERY_TRANSITION.json','RECOVERY_REPAIR_TRANSITION.json','RECOVERY_LIFECYCLE_TRANSITION.json')
+RUNTIME=('bounded_transport','bounded_boot_control','uncertainty_recovery','android_directory_adapter')
+FAMILY=('common.py','observe.py','evidence_contract.py','recovery.py','rearm.py')
+class Refusal(RuntimeError):pass
+def need(ok,why):
+ if not ok:raise Refusal(why)
+def sha(b):return hashlib.sha256(b).hexdigest()
+def encoded(o):return (json.dumps(o,indent=2,sort_keys=True,ensure_ascii=False)+'\n').encode()
+def safe(p):
+ p=Path(p);need(p.is_absolute() and not p.is_symlink() and all(not x.is_symlink() for x in p.parents),'unsafe path');return p
+def read(p):
+ p=safe(p);s=p.stat();need(p.is_file() and s.st_nlink==1 and s.st_size<=16<<20,'single bounded regular file');b=p.read_bytes();t=p.stat();need((s.st_dev,s.st_ino,s.st_size,s.st_mtime_ns,s.st_ctime_ns)==(t.st_dev,t.st_ino,t.st_size,t.st_mtime_ns,t.st_ctime_ns),'changed input');return b
+def bound(b):
+ need(isinstance(b,dict) and set(b)=={'path','sha256'} and re.fullmatch('[0-9a-f]{64}',b['sha256'] or ''),'binding');raw=read(b['path']);need(sha(raw)==b['sha256'],'binding SHA');return json.loads(raw)
+def pin(p):
+ b=read(p);return {'path':str(p),'bytes':len(b),'sha256':sha(b)}
+def node(s,name,kind=ast.FunctionDef):
+ a=[n for n in ast.parse(s).body if isinstance(n,kind) and (n.name==name if kind is ast.FunctionDef else any(isinstance(t,ast.Name) and t.id==name for t in n.targets))];need(len(a)==1,'exact source node '+name);return a[0]
+def textnode(s,n):return ''.join(s.splitlines(True)[n.lineno-1:n.end_lineno])
+def assign(s,name):return ast.literal_eval(node(s,name,ast.Assign).value)
+def replace(s,name,value,kind=ast.FunctionDef):
+ n=node(s,name,kind);lines=s.splitlines(True);return ''.join(lines[:n.lineno-1])+value.rstrip()+'\n'+''.join(lines[n.end_lineno:])
+def exact_functions(a,b):
+ return all(ast.dump(node(a,n),include_attributes=False)==ast.dump(node(b,n),include_attributes=False) for n in FUNCTIONS)
+def sources():
+ m=bound({'path':str(BASE/'MANIFEST.json'),'sha256':BASE_SHA});cm=bound({'path':str(CLOSURE/'MANIFEST.json'),'sha256':CLOSURE_MANIFEST_SHA})
+ for name,item in m['files'].items():need(pin(BASE/name)['sha256']==item['sha256'] and len(read(BASE/name))==item['bytes'],'base changed '+name)
+ for name in ('closure.py','CASE.json','overlay/recovery/common.py'):
+  item=cm['files'][name];b=read(CLOSURE/name);need(sha(b)==item['sha256'] and len(b)==item['bytes'],'closure source changed')
+ need(sha(read(CLOSURE/'closure.py'))==CLOSURE_SHA and sha(read(CLOSURE/'CASE.json'))==CASE_SHA,'fixed third closure')
+ return m
+
+def validate_inputs(v):
+ """Read immutable source files only; never import a runtime or read shared state."""
+ need(isinstance(v,dict) and set(v)=={'schema','result','closure_manifest','output_name'},'exact input fields')
+ need(v['schema']=='e5-sim-lifecycle-rebind-input-v1','input schema')
+ need(v['closure_manifest']=={'path':str(CLOSURE/'MANIFEST.json'),'sha256':CLOSURE_MANIFEST_SHA},'fixed closure manifest')
+ base=sources();r=bound(v['result']);family=r.get('activation_id')
+ old=bound({'path':str(ROOT/'tools/e5_activation_bundle_b56c60a03de00603/RESULT.json'),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'})
+ need(set(r.get('files',{}))==set(old['files']),'exact original 28 file keys')
+ need(re.fullmatch('[0-9a-f]{16}',family or '') and family!='b56c60a03de00603','new enabled family required')
+ need(v['output_name']==f'e5_sim_rearm_{family}_prepare_20261016','fixed output name')
+ result_path=safe(v['result']['path']);need(result_path==ROOT/f'tools/e5_activation_bundle_{family}/RESULT.json','result family path')
+ need(set(r['directories'])=={'core','recovery','scanner','acceptance'} and len(r['files'])==28,'four-family 28 files')
+ prefixes={'core':'e5_nextphase_core_live_','recovery':'e5_next_recovery_live_','scanner':'e5_scanner_deploy_next_live_','acceptance':'e5_next_acceptance_live_'}
+ for k,prefix in prefixes.items():need(r['directories'][k]==str(ROOT/'tools'/(prefix+family)),'directory family path')
+ filedata={}
+ for key,item in r['files'].items():
+  group,rel=key.split('/',1);need(group in prefixes and '..' not in Path(rel).parts,'file key')
+  p=Path(r['directories'][group])/rel;need(item['path']==str(p),'file path');b=read(p);need(sha(b)==item['sha256'] and len(b)==item['bytes'],'file binding');filedata[key]=b
+ required={f'core/{n}.py' for n in RUNTIME}|{'core/SOURCE_MANIFEST.json','core/workflow.py','core/nv_baseline.py','recovery/MANIFEST.json'}|{f'recovery/{n}' for n in FAMILY}
+ need(required<=set(filedata),'required runtime/history files')
+ core=json.loads(filedata['core/SOURCE_MANIFEST.json']);recovery=json.loads(filedata['recovery/MANIFEST.json'])
+ for key,path,digest in (('closure',CLOSURE/'closure.py',CLOSURE_SHA),('closure_case',CLOSURE/'CASE.json',CASE_SHA)):
+  need(core.get(key)==pin(path) and pin(path)['sha256']==digest,'new closure support binding')
+ common=filedata['recovery/common.py'].decode();template=read(CLOSURE/'overlay/recovery/common.py').decode()
+ need(assign(common,'MARKERS')==MARKERS,'third permanent/new temporary marker collection')
+ expected_live=ast.parse("LIVE=ROOT/'tools/e5_nextphase_core_live_"+family+"'").body[0]
+ need(ast.dump(node(common,'LIVE',ast.Assign),include_attributes=False)==ast.dump(expected_live,include_attributes=False),'history LIVE source family')
+ need(exact_functions(common,template),'reviewed closure state functions')
+ pins={n:sha(filedata[f'core/{n}.py']) for n in RUNTIME}
+ need(assign(common,'PINS')==pins,'family runtime pins')
+ for n,h in pins.items():need(core['modules'][n]==h,'core source manifest')
+ for n in FAMILY:need(recovery['files'][n]['sha256']==sha(filedata['recovery/'+n]),'history source manifest')
+ # The observer, policy, NV geometry and acceptance data must stay from b56c.
+ for key in ('recovery/observe.py','recovery/evidence_contract.py','core/nv_geometry.json','acceptance/contract.json'):
+  need(sha(filedata[key])==old['files'][key]['sha256'],'unrelated algorithm/data drift '+key)
+ return {'input':v,'result':r,'base':base,'family':family,'files':filedata,'pins':pins,'core':core,'common':common}
+
+def render(verified):
+ """Pure memory transform. No output directory or source execution."""
+ x=verified;r=x['result'];data=x['files'];family=x['family'];core=x['core'];source=x['common'];pins=x['pins']
+ d={'schema':'e5-sim-rearm-dependencies-v1','status':'BOUND_EXACT_OFFLINE_MATERIAL','not_device_authorization':True,
+    'activation_source':x['input']['result'],'closure':core['closure'],'closure_case':core['closure_case'],
+    'core_manifest':{k:r['files']['core/SOURCE_MANIFEST.json'][k] for k in ('path','sha256')},'core_path':r['directories']['core'],'core_pins':pins,
+    'first_install_sources':{'adapter_sha256':pins['android_directory_adapter'],'workflow_sha256':sha(data['core/workflow.py']),'nv_baseline_sha256':sha(data['core/nv_baseline.py'])},
+    'no_sim_family':{'path':r['directories']['recovery'],'manifest':{k:r['files']['recovery/MANIFEST.json'][k] for k in ('path','sha256')},'files':{n:sha(data['recovery/'+n]) for n in FAMILY}}}
+ out={n:read(BASE/n) for n in UNCHANGED};common=read(BASE/'common.py').decode()
+ for name in FUNCTIONS:common=replace(common,name,textnode(source,node(source,name)))
+ common=replace(common,'MARKERS','MARKERS='+repr(MARKERS),ast.Assign)
+ common=replace(common,'LIVE',"LIVE=ROOT/'tools/e5_nextphase_core_live_"+family+"'",ast.Assign)
+ common=replace(common,'PINS','PINS='+repr(pins),ast.Assign)
+ deps=encoded(d);common=replace(common,'DEPENDENCIES_SHA','DEPENDENCIES_SHA='+repr(sha(deps)),ast.Assign)
+ out.update({'common.py':common.encode(),'DEPENDENCIES.json':deps})
+ need(exact_functions(common,source) and assign(common,'MARKERS')==MARKERS,'output state functions')
+ for name in UNCHANGED:need(out[name]==read(BASE/name),'eight algorithm bytes')
+ for name,gate,value in (('observe.py','DEVICE_IO_ENABLED',False),('rearm.py','REARM_IO_DISABLED',True),('recovery.py','RECOVERY_IO_DISABLED',True),('sim_nv.py','NV_IO_DISABLED',True)):need(assign(out[name].decode(),gate) is value,'output device gate')
+ for name in ('test_regression.py','test_sim.py','test_origin.py'):out[name]=read(BASE/name)
+ out['test_closure_binding.py']=read(HERE/'test_closure_binding.template.py')
+ out['host_material_smoke.py']=read(HERE/'host_material_smoke.template.py')
+ out['SOURCE_BINDINGS.json']=encoded({'schema':'e5-sim-lifecycle-source-bindings-v1','base_manifest':{'path':str(BASE/'MANIFEST.json'),'sha256':BASE_SHA},'inputs':x['input'],'family':family,'state_functions_exact_source':r['files']['recovery/common.py'],'device_io':False,'state_accessed':False,'field_evidence_created':False})
+ out['README.md']=read(HERE/'OUTPUT_README.md')
+ files={n:{'bytes':len(b),'sha256':sha(b)} for n,b in out.items()}
+ manifest={'schema':'e5-next-recovery-tools-v1','files':files,'source_family':family,'runtime_pins':pins,'not_device_authorization':True,
+ 'purpose':'SIM-only DISABLED lifecycle source-family mechanical binding','first_install_and_NV_field_evidence':'PENDING_NOT_CREATED','independent_review':'PENDING_SEPARATE_REPORT',
+ 'unchanged_runtime_algorithms':list(UNCHANGED),'closure_state':{'permanent':list(MARKERS[3:6]),'unfinished_new_recovery':MARKERS[6],'new_unknown_not_waived':True},
+ 'budgets_unchanged':{'evidence_seconds_max':900,'phase_seconds_max':600,'host_request_seconds':8,'remote_request_seconds':6},
+ 'write_scope_if_separately_enabled':{'node':'/dev/block/mmcblk0p3','offset':2048,'bytes':32,'boot_b_written':False,'NV_written_or_refreshed':False},
+ 'gates':{'observe.DEVICE_IO_ENABLED':False,'rearm.REARM_IO_DISABLED':True,'recovery.RECOVERY_IO_DISABLED':True,'sim_nv.NV_IO_DISABLED':True}}
+ out['MANIFEST.json']=encoded(manifest)
+ out['changes.patch']=''.join(''.join(difflib.unified_diff(read(BASE/n).decode().splitlines(True),out[n].decode().splitlines(True),fromfile=str(BASE/n),tofile=x['input']['output_name']+'/'+n)) for n in ('common.py','DEPENDENCIES.json')).encode()
+ out['SHA256SUMS']=''.join(sha(b)+'  '+n+'\n' for n,b in sorted(out.items())).encode()
+ return out
+
+def build(v):
+ need(not COPY_DISABLED,'host copy disabled; plan only until final input and independent review')
+ x=validate_inputs(v);out=render(x);dest=safe(ROOT/'tools'/v['output_name']);need(not dest.exists(),'never overwrite output');dest.mkdir(mode=0o700)
+ # A partial host output is never a complete package. No automatic cleanup.
+ for name,b in sorted(out.items(),key=lambda item:item[0]=='MANIFEST.json'):
+  if name=='MANIFEST.json':
+   parent_fd=os.open(dest,os.O_RDONLY|os.O_DIRECTORY);os.fsync(parent_fd);os.close(parent_fd)
+  fd=os.open(dest/name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+  with os.fdopen(fd,'wb') as f:f.write(b);f.flush();os.fsync(f.fileno())
+ fd=os.open(dest,os.O_RDONLY|os.O_DIRECTORY);os.fsync(fd);os.close(fd)
+ return {'directory':str(dest),'manifest':pin(dest/'MANIFEST.json'),'device_io':False,'state_accessed':False,'field_authority_created':False}
+
+def main():
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('mode',nargs='?',choices=('plan','build'),default='plan');p.add_argument('--inputs');a=p.parse_args()
+ if a.inputs:
+  v=json.loads(read(Path(a.inputs).absolute()));x=validate_inputs(v)
+  result={'status':'VALIDATED_HOST_INPUT_ONLY','family':x['family'],'device_authority':False} if a.mode=='plan' else build(v)
+ else:
+  need(a.mode=='plan','inputs required');sources();result={'status':'UNBOUND_PLAN_ONLY','copy_disabled':COPY_DISABLED,'input_schema':'e5-sim-lifecycle-rebind-input-v1','required':['result path/SHA','fixed closure manifest path/SHA','output_name tied to result activation_id'],'final_bundle_missing':True,'device_authority':False}
+ print(json.dumps(result,sort_keys=True))
+if __name__=='__main__':main()

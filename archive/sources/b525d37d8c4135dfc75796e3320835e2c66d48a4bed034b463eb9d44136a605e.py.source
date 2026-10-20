@@ -1,0 +1,42 @@
+"""No live modules/transport or external process is loaded in these fixtures."""
+import contextlib,importlib.util,io,json,sys,tempfile,types,unittest
+from pathlib import Path
+from unittest.mock import patch
+
+def deny(event,args):
+    if event.startswith('socket.') or event in ('subprocess.Popen','os.system','os.exec','os.posix_spawn','os.posix_spawnp'):raise AssertionError('device/process/network forbidden')
+sys.addaudithook(deny)
+p=Path(__file__).with_name('runner.py');s=importlib.util.spec_from_file_location('stage2_runner_test',p);m=importlib.util.module_from_spec(s);sys.modules[s.name]=m;s.loader.exec_module(m)
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='e5-stage2-runner-');self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve()
+        self.here=self.root/'here';self.here.mkdir();self.core=self.root/'core';self.core.mkdir();self.cold=self.root/'cold';self.cold.mkdir()
+        for key,value in [('HERE',self.here),('CORE',self.core),('COLD',self.cold)]:
+            t=patch.object(m,key,value);t.start();self.addCleanup(t.stop)
+        for p in [self.here/'stage2_deploy.py',*[self.core/n for n in ('android_directory_adapter.py','bounded_transport.py')],*[self.cold/n for n in ('evidence_contract.py','common.py','observe.py')]]:p.write_text('# never imported fixture\n')
+        def b(p):return {'path':str(p),'sha256':m.sha(p.read_bytes())}
+        self.man={'schema':'e5-next-scanner-artifact-manifest-v1','runner_source_sha256':m.sha(p_source.read_bytes()),'host_source_sha256':b(self.here/'stage2_deploy.py')['sha256'],
+        'core':{n:b(self.core/n) for n in ('android_directory_adapter.py','bounded_transport.py')},'cold_contract':b(self.cold/'evidence_contract.py'),'cold_dependencies':{n:b(self.cold/n) for n in ('common.py','observe.py')}}
+        self.path=self.root/'manifest.json';self.mb=self.save()
+    def save(self):self.path.write_text(json.dumps(self.man));return {'path':str(self.path),'sha256':m.sha(self.path.read_bytes())}
+    def test_execute_disabled_before_read_or_import(self):
+        with patch.object(m,'validate',side_effect=AssertionError('must not validate/import')):self.assertRaises(m.Refusal,m.execute,{}, {}, {},'/not-used')
+    def test_manifest_valid_host_fixture(self):self.assertEqual(m.material_manifest(self.mb)['schema'],self.man['schema'])
+    def test_runner_pin_wrong(self):self.man['runner_source_sha256']='0'*64;self.mb=self.save();self.assertRaises(m.Refusal,m.material_manifest,self.mb)
+    def test_library_changed(self):(self.here/'stage2_deploy.py').write_text('changed');self.assertRaises(m.Refusal,m.material_manifest,self.mb)
+    def test_core_changed(self):(self.core/'bounded_transport.py').write_text('changed');self.assertRaises(m.Refusal,m.material_manifest,self.mb)
+    def test_cold_changed(self):(self.cold/'common.py').write_text('changed');self.assertRaises(m.Refusal,m.material_manifest,self.mb)
+    def test_extra_core_refused(self):self.man['core']['other.py']=self.man['core']['bounded_transport.py'];self.mb=self.save();self.assertRaises(m.Refusal,m.material_manifest,self.mb)
+    def test_draft_is_invalid_not_evidence(self):
+        out=self.root/'draft.json';r=m.draft(self.mb,out);d=json.loads(out.read_text());self.assertFalse(r['valid_execution_request']);self.assertEqual(d['schema'],'TEMPLATE_NOT_VALID');self.assertIsNone(d['boot_id']);self.assertFalse(d['device_execution_authorized'])
+    def test_draft_no_overwrite(self):out=self.root/'draft.json';out.write_text('keep');self.assertRaises(FileExistsError,m.draft,self.mb,out);self.assertEqual(out.read_text(),'keep')
+    def test_default_help_no_import(self):
+        with patch.object(m,'load',side_effect=AssertionError('no modules')):
+            with contextlib.redirect_stdout(io.StringIO()):self.assertEqual(m.main([]),0)
+    def test_execute_cli_remains_disabled(self):
+        argv=['execute','--manifest',str(self.path),'--manifest-sha256',self.mb['sha256'],'--request','/unused','--request-sha256','0'*64,'--review','/unused','--review-sha256','0'*64,'--evidence-dir','/unused']
+        self.assertRaises(m.Refusal,m.main,argv)
+    def test_module_name_conflict(self):
+        sys.modules['fixture_conflict']=types.SimpleNamespace(__file__='/other');self.addCleanup(sys.modules.pop,'fixture_conflict');self.assertRaises(m.Refusal,m.load,'fixture_conflict',self.here/'stage2_deploy.py')
+p_source=p
+if __name__=='__main__':unittest.main(verbosity=2)

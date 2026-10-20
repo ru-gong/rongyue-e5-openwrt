@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Verify the one-line enablement with all subprocesses blocked and mocked.
+No ADB, USB, device connection, shell script or collected binary is executed.
+"""
+import argparse
+import difflib
+import hashlib
+import importlib.util
+import json
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+from unittest.mock import patch
+
+ROOT=Path(__file__).resolve().parent.parent
+PREP=ROOT.parent/"e5_android_install_prepare_20261013"
+ACT=ROOT/"activation"
+checks=[];blocked=[]
+
+def require(condition,message):
+    if not condition:raise RuntimeError(message)
+
+def sha(path):return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+def no_subprocess(event,args):
+    if event.startswith("subprocess."):
+        blocked.append(event);raise RuntimeError("NO REAL SUBPROCESS PERMITTED IN ACTIVATION VERIFICATION")
+
+sys.addaudithook(no_subprocess)
+record=json.loads((ACT/"activation.json").read_text())
+old=(PREP/"e5_install.py").read_bytes();new=(ROOT/"e5_install.py").read_bytes()
+require(sha(PREP/"e5_install.py")==record["source_core_sha256"],"preparation source changed")
+require(sha(ROOT/"e5_install.py")==record["live_core_sha256"],"enabled source changed")
+require(new.count(b"LIVE_DISABLED = False")==1 and new.replace(b"LIVE_DISABLED = False",b"LIVE_DISABLED = True",1)==old,"enablement includes unreviewed edits")
+checks.append("inverse_one_line_diff_exactly_restores_reviewed_source")
+for row in record["copied_file_comparison"]:
+    require(sha(PREP/row["path"])==row["source_sha256"] and sha(ROOT/row["path"])==row["live_sha256"],"copied source changed")
+checks.append("all_copied_sources_match_frozen_inventory")
+
+spec=importlib.util.spec_from_file_location("enabled_e5_under_mock",ROOT/"e5_install.py")
+e=importlib.util.module_from_spec(spec);spec.loader.exec_module(e)
+require(e.LIVE_DISABLED is False,"copy not enabled")
+require(b"LIVE_DISABLED = True" in old,"preparation copy not disabled")
+checks.append("separate_copy_enabled_preparation_copy_still_disabled")
+
+try:subprocess.run(["sentinel-calibration-never-executed"])
+except RuntimeError as exc:require("NO REAL SUBPROCESS" in str(exc),"sentinel wrong refusal")
+else:raise RuntimeError("sentinel failed to block subprocess")
+checks.append("subprocess_sentinel_calibrated_without_process_creation")
+
+backend=e.AdbBackend(Path(record["adb_path"]),record["adb_sha256"],e.load_profile())
+captured=[]
+def fake_run(argv,**kwargs):
+    captured.append((argv,kwargs));return SimpleNamespace(returncode=0,stdout=b"mock-only",stderr=b"")
+script="printf '%s' 'mock-only'"
+with patch.object(e.subprocess,"run",side_effect=fake_run):
+    require(backend.shell(script)==b"mock-only","enabled transport did not reach mock")
+require(len(captured)==1,"unexpected retry")
+argv,kwargs=captured[0]
+require(argv[:5]==[record["adb_path"],"-s",e.SERIAL,"shell","-T"],"ADB target/transport differs")
+require(shlex.split(argv[5])==[e.SU,"-c","set -eu\n"+script],"su quoting differs")
+checks.append("enabled_transport_fixed_serial_shell_T_su_quote_single_mock_dispatch")
+
+with patch.object(e.subprocess,"run",return_value=SimpleNamespace(returncode=1,stdout=b"",stderr=b"mock failure")) as run:
+    try:backend.shell("mock-only")
+    except e.Refusal:pass
+    else:raise RuntimeError("failed remote execution accepted")
+    require(run.call_count==1,"failure retried")
+checks.append("remote_failure_stops_without_retry")
+
+events=[]
+class FakeBackend:
+    def __init__(self,adb,adb_sha,profile):events.append(("construct",str(adb),adb_sha,profile==e.load_profile()))
+    def collect_vendor(self,dest):events.append(("collect",str(dest)))
+
+request=ACT/"collect-request.json";request_sha=sha(request)
+require(request_sha==record["collect_request_sha256"],"collect request changed")
+with tempfile.TemporaryDirectory() as td:
+    evidence=Path(td)/"not-created-by-mock"
+    args=["e5_install.py","live-collect","--manifest",str(request),"--manifest-sha256",request_sha,
+          "--adb",record["adb_path"],"--evidence",str(evidence)]
+    with patch.object(e,"AdbBackend",FakeBackend),patch.object(sys,"argv",args):e.main()
+    require(len(events)==2 and events[0][0]=="construct" and events[0][3] and events[1]==("collect",str(evidence)),"collector dispatch mismatch")
+    require(not evidence.exists(),"mock unexpectedly created a collection")
+    checks.append("live_collect_cli_bound_request_dispatches_only_to_mock_collector")
+    events.clear();bad=args.copy();bad[bad.index("--manifest-sha256")+1]="0"*64
+    with patch.object(e,"AdbBackend",FakeBackend),patch.object(sys,"argv",bad):
+        try:e.main()
+        except e.Refusal:pass
+        else:raise RuntimeError("unbound request accepted")
+    require(not events,"invalid request constructed a backend")
+    checks.append("changed_request_hash_refused_before_backend")
+    image=Path(td)/"synthetic-boot"
+    with image.open("wb") as f:f.truncate(e.BOOT_BYTES)
+    calls=[]
+    with patch.object(backend,"shell",side_effect=lambda s,payload=None,timeout=1800:calls.append((s,len(payload)))):
+        backend.write_boot_b(image,sha(image));backend.write_misc_bc(bytes(32))
+    require(len(calls)==2 and "of=/dev/block/mmcblk0p37 bs=1048576 count=64" in calls[0][0] and calls[0][1]==67108864 and
+            "of=/dev/block/mmcblk0p3 bs=1 seek=2048 count=32" in calls[1][0] and calls[1][1]==32,"block scope changed")
+    require(all("p36" not in s for s,_ in calls),"A write target present")
+    checks.append("boot_B_and_misc32_exact_write_commands_captured_only_in_mock")
+
+workspace=ROOT.parents[1]
+audit=workspace/"materials/openwrt-build-20261013-569f13d4/runtime_audit.json"
+require(sha(audit)==record["runtime_audit_sha256"],"static runtime audit changed")
+require(json.loads(audit.read_text())["installer_contract"]["sha256"]==record["source_core_sha256"],"static audit reviewed different preparation core")
+require(sha(ROOT/"e5_install.py")==record["live_core_sha256"],"source changed during test")
+checks.append("unchanged_static_runtime_audit_links_original_core_and_exact_activation_diff")
+result={"schema":1,"status":"PASS_OFFLINE_ENABLEMENT_ONLY","checks":checks,"check_count":len(checks),
+        "live_core_sha256":record["live_core_sha256"],"source_core_sha256":record["source_core_sha256"],
+        "collect_request_sha256":request_sha,"real_subprocesses_executed":0,"blocked_calibration_events":blocked,
+        "device_io_performed":False,"protocol_or_scope_changes":False,"live_hardware_validation":False}
+if __name__=="__main__":
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument("--output",type=Path);a=ap.parse_args()
+    raw=(json.dumps(result,indent=2)+"\n").encode()
+    if a.output:e.durable_write(a.output,raw)
+    print(json.dumps({"status":result["status"],"checks":len(checks),"real_subprocesses_executed":0,"device_io_performed":False}))

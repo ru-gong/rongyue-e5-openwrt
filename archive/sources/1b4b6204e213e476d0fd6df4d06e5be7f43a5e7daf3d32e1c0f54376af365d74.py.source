@@ -1,0 +1,147 @@
+"""Offline fake transaction tests: audit hook forbids any real process/socket."""
+import contextlib
+import copy
+import io
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import trial as t
+
+def no_external(event, args):
+    if event.startswith("subprocess.") or event in ("os.system", "os.posix_spawn", "os.posix_spawnp") or event.startswith("socket."):
+        raise AssertionError("external I/O forbidden in offline tests: " + event)
+sys.addaudithook(no_external)
+E = t.load_core()
+PROFILE = E.load_profile()
+SNAP = json.loads(t.SNAPSHOT.read_bytes())
+B = t.ORIGINAL_B.read_bytes()
+M = t.ORIGINAL_MISC.read_bytes()
+NEW = t.BOOT.read_bytes()
+
+def audit_raw(full=True):
+    lines = ["BOOTID|00000000-0000-4000-8000-000000000001"]
+    lines += ["ENTRY|"+t.REMOTE+"/"+n for n in sorted(t.NAMES)]
+    for i, f in enumerate(SNAP["files"]):
+        lines.append("FILE|%s|8180|%s|42|%s|1700000000|1700000000|0|0|%s" %
+                     (f["path"],f["bytes"],100+i,f["sha256"] if full else "-"))
+    return ("\n".join(lines)+"\nINACTIVE_OK\n").encode()
+
+class FakeCore:
+    """Use frozen validation/BC logic; captures replace only host durable I/O."""
+    def __init__(self): self.saved={}; self.events=[]; self.fail_event=None; self.fail_save=None
+    def __getattr__(self,n): return getattr(E,n)
+    def durable_write(self,p,data):
+        if Path(p).name==self.fail_save: raise OSError("fake fsync/write failure")
+        if str(p) in self.saved: raise FileExistsError(p)
+        self.saved[str(p)]=data
+    def file_hash(self,p): return E.digest(self.saved[str(p)]) if str(p) in self.saved else E.file_hash(p)
+    def Journal(self,path):
+        outer=self
+        class J:
+            def event(self,event,**fields):
+                if event==outer.fail_event: raise OSError("fake journal fsync failure")
+                outer.events.append(event)
+            def close(self): pass
+        return J()
+
+class FakeDevice:
+    def __init__(self):
+        self.b=B; self.m=M; self.writes=[]; self.audit_calls=0; self.fail=None; self.preflights=0
+    def preflight(self): self.preflights+=1
+    def protected_hashes(self):
+        if self.fail=="protected" and self.writes: return {}
+        return PROFILE["protected_hashes"]
+    def read(self,part): return self.b if part=="boot_b" else self.m
+    def shell(self,script,timeout):
+        self.audit_calls+=1
+        raw=audit_raw("sha256sum" in script)
+        if self.fail=="hash-drift" and self.audit_calls==2: raw=raw.replace(SNAP["files"][0]["sha256"].encode(),b"0"*64)
+        if self.fail=="metadata-drift" and self.audit_calls==4: raw=raw.replace(b"1700000000",b"1700000001")
+        if self.fail=="busy" and self.audit_calls==3: raise RuntimeError("fuser busy")
+        return raw
+    def write_boot_b(self,path,sha):
+        assert path==t.BOOT and sha==t.BOOT_SHA
+        self.writes.append("B")
+        if self.fail=="B-error": raise OSError("write disconnected")
+        self.b = NEW if self.fail!="B-short" else NEW[:-1]
+    def write_misc_bc(self,bc):
+        self.writes.append("MISC32")
+        if self.fail=="misc-error": raise OSError("misc disconnected")
+        self.m=self.m[:2048]+bc+self.m[2080:]
+        if self.fail=="misc-outside": self.m=b"!"+self.m[1:]
+
+class TrialTests(unittest.TestCase):
+    def run_fake(self, fail=None, core=None, exists=False):
+        core=core or FakeCore(); device=FakeDevice(); device.fail=fail
+        with tempfile.TemporaryDirectory() as temp:
+            evidence=Path(temp)/"new"
+            if exists: evidence.mkdir()
+            if fail or exists or core.fail_event or core.fail_save:
+                with self.assertRaises((RuntimeError,OSError,ValueError)):
+                    t.transaction(core,device,PROFILE,SNAP,evidence)
+            else:
+                result=t.transaction(core,device,PROFILE,SNAP,evidence)
+                self.assertEqual(result["status"],"COMPLETE_NO_REBOOT")
+        return core,device
+    def test_success_exact_order(self):
+        core,d=self.run_fake()
+        self.assertEqual(d.writes,["B","MISC32"])
+        self.assertEqual(d.audit_calls,5)
+        self.assertEqual(d.preflights,2)
+        self.assertEqual(core.events,["START_D0_EXISTING_ROOTFS","BACKUPS_DURABLE_VERIFIED","BEGIN_BOOT_B",
+                                     "VERIFIED_BOOT_B","BEGIN_MISC32","COMPLETE_NO_REBOOT"])
+        E.misc_changed_only_bc(M,d.m,E.bc_trial(M[2048:2080]))
+    def test_b_failure_prevents_misc(self):
+        for fail in ("B-error","B-short","protected","metadata-drift"):
+            with self.subTest(fail=fail):
+                core,d=self.run_fake(fail)
+                self.assertEqual(d.writes,["B"])
+                self.assertEqual(core.events[-1],"STOP_NO_RETRY_NO_ROLLBACK_NO_REBOOT")
+    def test_file_drift_before_b_zero_writes(self):
+        _,d=self.run_fake("hash-drift"); self.assertEqual(d.writes,[])
+    def test_final_inactive_failure_zero_writes(self):
+        _,d=self.run_fake("busy"); self.assertEqual(d.writes,[])
+    def test_misc_outside_or_disconnect_stops(self):
+        for fail in ("misc-outside","misc-error"):
+            core,d=self.run_fake(fail)
+            self.assertEqual(d.writes,["B","MISC32"])
+            self.assertNotIn("COMPLETE_NO_REBOOT",core.events)
+    def test_existing_evidence_before_device(self):
+        _,d=self.run_fake(exists=True); self.assertEqual(d.preflights,0); self.assertEqual(d.writes,[])
+    def test_backup_fsync_failure_zero_writes(self):
+        c=FakeCore(); c.fail_save="misc.before.bin"
+        _,d=self.run_fake(core=c); self.assertEqual(d.writes,[])
+    def test_begin_journal_failure_zero_writes(self):
+        c=FakeCore(); c.fail_event="BEGIN_BOOT_B"
+        _,d=self.run_fake(core=c); self.assertEqual(d.writes,[])
+    def test_cli_hard_gate_before_import(self):
+        with patch.object(t,"load_core",side_effect=AssertionError("must not import")), contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as got: t.main(["execute"])
+            self.assertEqual(got.exception.code,2)
+    def test_cli_arbitrary_paths_rejected(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            for extra in ("--evidence", "--boot", "--serial"):
+                with self.assertRaises(SystemExit): t.main(["execute",extra,"arbitrary"])
+    def test_exact_parser(self):
+        self.assertEqual(len(t.parse_audit(E,audit_raw(),SNAP,True)["files"]),7)
+        for bad in (audit_raw().replace(b"8180",b"a1ff",1), audit_raw()+b"EXTRA\n",
+                    audit_raw().replace(b"INACTIVE_OK",b"BUSY"),audit_raw().replace(b"ENTRY|/data/e5linux/boot-os",b"ENTRY|/other")):
+            with self.assertRaises(RuntimeError): t.parse_audit(E,bad,SNAP,True)
+    def test_readonly_script(self):
+        script=t.audit_script(True)
+        for forbidden in ("dd "," of="," mount ","rm ","mv ","chmod ","touch "," > "):
+            self.assertNotIn(forbidden,script)
+        for required in ("fuser", "/proc/[0-9]*/mountinfo", "loop*/loop/backing_file", "stat", "sha256sum"):
+            self.assertIn(required,script)
+    def test_fixed_source_and_input_pins(self):
+        self.assertFalse(t.LIVE_ENABLED)
+        self.assertEqual(E.file_hash(t.CORE),t.CORE_SHA)
+        self.assertEqual(E.file_hash(t.SNAPSHOT),t.SNAPSHOT_SHA)
+        self.assertEqual(E.digest(B),t.ORIGINAL_B_SHA)
+        self.assertEqual(E.digest(M),t.ORIGINAL_MISC_SHA)
+        self.assertEqual(E.digest(NEW),t.BOOT_SHA)
+
+if __name__=="__main__": unittest.main(verbosity=2)

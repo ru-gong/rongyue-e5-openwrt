@@ -1,0 +1,120 @@
+"""BC32-only second trial. Fixed SIM purpose, helper owner and no B writes."""
+import argparse,datetime as dt,json,re,threading,uuid
+from pathlib import Path
+import importlib.util as _iu,sys as _sys
+_cp=Path(__file__).resolve().with_name('common.py');_key='_e5_sim_common'
+if _key not in _sys.modules:
+ _sp=_iu.spec_from_file_location(_key,_cp);_cm=_iu.module_from_spec(_sp);_sys.modules[_key]=_cm;_sp.loader.exec_module(_cm)
+c=_sys.modules[_key]
+if Path(c.__file__).resolve()!=_cp:raise RuntimeError('common module source conflict')
+e=c.sibling('evidence_contract');nv=c.sibling('sim_nv');origin=c.sibling('nv_origin')
+REARM_IO_DISABLED=True
+CANDIDATE=c.ROOT/'materials/openwrt-no-auto-fsck-20261015/candidate.json'
+CANDIDATE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+BOOT=c.ROOT/'materials/openwrt-no-auto-fsck-20261015/files/boot.img'
+BOOT_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+HEAD_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+TAIL_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+
+def check_candidate():
+ candidate=c.obj({'path':str(CANDIDATE),'sha256':CANDIDATE_SHA});raw=c.read(BOOT,BOOT_SHA,64<<20)
+ c.require(candidate['artifacts']['boot']=={'path':str(BOOT),'sha256':BOOT_SHA,'bytes':64<<20},'candidate boot binding')
+ c.require(c.sha(raw[:56<<20])==HEAD_SHA and c.sha(raw[60<<20:])==TAIL_SHA,'candidate boundary hashes')
+ return candidate
+
+def same_candidate(raw):
+ c.require(len(raw)==64<<20 and c.sha(raw[:56<<20])==HEAD_SHA and c.sha(raw[60<<20:])==TAIL_SHA,'B differs outside approved diagnostic window')
+def backend(m,boot,owner,evidence,cancel,readonly=False):
+ c.require(not REARM_IO_DISABLED,'REARM_IO_DISABLED: no device operation')
+ c.validtx(owner);b=m['bounded_boot_control'];t=m['bounded_transport'].BoundedTransport(evidence,c.STATE,c.SERIAL,boot,owner,cancel_event=cancel,reconciliation_only=readonly,recovery_source_sha=c.PINS['uncertainty_recovery'] if readonly else None)
+ class SimRearmBackend(b.NativeBackend):
+  def _base(self):return e.base(self.boot_id,'rearm-with-sim',self.txid)
+  def _request(self,*args,**kw):
+   c.require(not REARM_IO_DISABLED,'REARM_IO_DISABLED');return super()._request(*args,**kw)
+  def write_chunk(self,part,offset,data,op_id,budget):
+   c.require(part=='misc' and offset==2048 and len(data)==32,'BC32-only: B writes forbidden')
+   return super().write_chunk(part,offset,data,op_id,budget)
+  def execution_scope(self,*args):raise c.Refusal('generic installer/recovery execution forbidden for SIM rearm')
+ pins={'adb':c.ADB_SHA,'bounded_transport':c.PINS['bounded_transport'],'bounded_boot_control':c.PINS['bounded_boot_control'],'native_sha256':c.NATIVE_SHA,'directory_adapter':c.PINS['android_directory_adapter'],'uncertainty_recovery':c.PINS['uncertainty_recovery']}
+ return SimRearmBackend(t,c.ADB,'/data/local/tmp/e5-clean-io.'+owner,c.NATIVE_SHA,owner,boot,pins)
+
+def capture(envelope_binding,owner,out):
+ c.require(not REARM_IO_DISABLED,'REARM_IO_DISABLED: no device operation');cold=e.validate_cold(envelope_binding);env=c.obj(envelope_binding)
+ c.require(cold['purpose']=='rearm-with-sim','rearm cold purpose');state=c.obj(cold['state_snapshot']);c.normal_state(state);check_candidate();c.validtx(owner)
+ m=c.load_runtime();b=m['bounded_boot_control'];c.material_check(b);p=c.output(out);cancel=threading.Event();native=backend(m,cold['boot_id'],owner,p/'transport',cancel,readonly=True)
+ budget=b.Budget(min(600,int((c.timestamp(cold['expires_at'])-c.now()).total_seconds())-5),cancel)
+ with b.Ledger() as ledger,budget.signals():
+  c.assert_state(state);rawdir=b._directory(p/'raw');native.preflight(budget);values={};artifacts={}
+  for key in sorted(b.PROTECTED|{'boot_b','misc','gpt'}):
+   size=e.part_info(key,native.p)['bytes'];raw=b._read_all(native,key,size,budget);expected=None if key in ('boot_b','misc') else native.p['gpt_prefix_sha256'] if key=='gpt' else native.p['protected_hashes'][key]
+   c.require(expected is None or c.sha(raw)==expected,'protected data changed');path=rawdir/(key+'.observed.bin');b.durable_new(path,raw);artifacts[key]={'path':str(path),'sha256':c.sha(raw),'bytes':size}
+   if key in ('boot_b','misc'):values[key]=raw
+  b._protected(native,native.p,budget);c.require(b._read_all(native,'boot_b',b.BOOT_BYTES,budget)==values['boot_b'] and b._read_all(native,'misc',b.MISC_BYTES,budget)==values['misc'],'preimage changed during capture')
+  same_candidate(values['boot_b']);orig=c.read(c.ORIGINAL_MISC,native.p['original_misc_sha256'],b.MISC_BYTES);c.require(b.outside_bc(values['misc'])==b.outside_bc(orig),'misc outside32 changed');b.bc_valid(values['misc'][2048:2080],True)
+  nv_binding=nv.capture(native,budget,p/'nv')
+  rec={'schema':'e5-boot-reconciliation-v3','serial':c.SERIAL,'boot_id':cold['boot_id'],'ledger_head':ledger.head,'captured_at':c.now().isoformat(),'complete':True,'protected_match':True,'hashes':{k:c.sha(v) for k,v in values.items()},'artifacts':artifacts,'misc_outside_original_match':True,'does_not_clear_poison':True};c.save(rawdir/'reconciliation.json',rec);c.assert_state(state)
+ c.save(p/'READONLY_RESULT.json',{'schema':'e5-next-readonly-v1','serial':c.SERIAL,'boot_id':cold['boot_id'],'txid':owner,'purpose':'rearm-with-sim','nv_baseline':nv_binding,'reconciliation':c.binding(p/'raw/reconciliation.json'),'cold_envelope':e.binding_without_originals(env),'state_snapshot':cold['state_snapshot'],'helper_owner_tx':owner,'producer_source_sha256':c.sha(c.read(Path(__file__).resolve())),'source_pins':c.PINS,'transport_binding':c.binding(p/'transport/binding.json'),'device_writes':False,'native_helpers_executed':False,'approved_to_restore':False})
+ return rec
+
+def proposal(result_binding,request_id,nv_review,seconds=600):
+ c.require(isinstance(request_id,str) and re.fullmatch('[0-9a-f]{32}',request_id),'new request ID required')
+ source_gate=origin.validate_gate(result_binding,nv_review)
+ result=c.obj(result_binding);cold=e.validate_cold_object(result['cold_envelope'],c.now());c.require(cold['purpose']=='rearm-with-sim','SIM cold purpose');result,rec,p,digest=e.validate_readonly(result_binding,c.now(),'rearm-with-sim')
+ c.require(cold['boot_id']==rec['boot_id'] and cold['state_snapshot']==result['state_snapshot'],'cold/preimage linkage');state=c.obj(result['state_snapshot']);c.normal_state(state)
+ c.require(result['txid']==result['helper_owner_tx'],'existing helper owner tx required');check_candidate();raw=c.read(rec['artifacts']['boot_b']['path'],rec['hashes']['boot_b'],64<<20);same_candidate(raw)
+ m=c.load_runtime();b=m['bounded_boot_control'];misc=c.read(rec['artifacts']['misc']['path'],rec['hashes']['misc'],1<<20);target=b.trial_bc(misc[2048:2080]);rows,head,_=c.ledger_rows()
+ c.require(not any(x.get('request_id')==request_id for x in rows),'request ID replay');c.require(type(seconds) is int and 30<=seconds<=600 and seconds+5<c.remaining(rec),'rearm budget exceeds lease')
+ return {'schema':'e5-next-bc32-rearm-request-v1','serial':c.SERIAL,'boot_id':rec['boot_id'],'helper_owner_tx':result['helper_owner_tx'],'request_id':request_id,'purpose':'rearm-with-sim','readonly_result':result_binding,'nv_source_gate':source_gate,'candidate':{'path':str(CANDIDATE),'sha256':CANDIDATE_SHA},'expected_before':rec['hashes'],'target_bc32_hex':target.hex(),'ledger_head':head,'total_seconds':seconds,'expires_at':min(c.timestamp(cold['expires_at']),c.timestamp(rec['captured_at'])+dt.timedelta(seconds=900),c.timestamp(source_gate['expires_at'])).isoformat(),'write_range':{'node':'/dev/block/mmcblk0p3','offset':2048,'bytes':32},'boot_b_written':False}
+
+def draft(result_binding,request_id,nv_review,out,seconds=600):
+ request=proposal(result_binding,request_id,nv_review,seconds);p=c.output(out);rb=c.save(p/'REQUEST_PROPOSAL.json',request);c.save(p/'REVIEW.TEMPLATE.json',{'schema':'e5-next-bc32-rearm-review-v1','proposal':rb,'decision':'TEMPLATE_NOT_VALID_INDEPENDENT_REVIEW_REQUIRED','collector':'','reviewer':'','user_confirmed_slot1_mobile_slot2_unicom':False});return rb
+
+def validate(request_binding,review_binding):
+ r=c.obj(request_binding);c.require(r==proposal(r['readonly_result'],r['request_id'],r['nv_source_gate']['review'],r['total_seconds']),'rearm proposal changed');review=c.obj(review_binding);e.review_people(review)
+ c.require(review.get('schema')=='e5-next-bc32-rearm-review-v1' and review.get('proposal')==request_binding and review.get('decision')=='REARM_BC32_ONLY' and review.get('user_confirmed_slot1_mobile_slot2_unicom') is True and review.get('candidate_independently_reviewed')==r['candidate'],'independent rearm review missing')
+ expiry=e.lease(review,c.now());c.require(c.now()+dt.timedelta(seconds=r['total_seconds']+5)<min(expiry,c.timestamp(r['expires_at'])),'review/snapshot lease insufficient');return r
+
+def _engine(native,b,r,request_sha,out,cancel):
+ budget=b.Budget(r['total_seconds'],cancel);budget.end=min(budget.end,budget.clock()+(c.timestamp(r['expires_at'])-c.now()).total_seconds());budget.check()
+ with b.Ledger() as ledger,budget.signals():
+  c.normal_state(c.state_snapshot());c.require(not ledger.poisoned() and ledger.head==r['ledger_head'],'ledger changed/poisoned')
+  c.require(not any(x.get('request_sha256')==request_sha or x.get('request_id')==r['request_id'] for x in ledger.rows),'rearm replay')
+  ledger.event('START',txid=r['helper_owner_tx'],helper_owner_tx=r['helper_owner_tx'],request_id=r['request_id'],request_sha256=request_sha,boot_id=r['boot_id'],mode='rearm-bc32-only',evidence=str(out))
+  try:
+   b._protected(native,native.p,budget,ledger);before=b._read_all(native,'boot_b',b.BOOT_BYTES,budget,ledger);misc=b._read_all(native,'misc',b.MISC_BYTES,budget,ledger)
+   c.require({'boot_b':c.sha(before),'misc':c.sha(misc)}==r['expected_before'],'fresh preimage drift');same_candidate(before);orig=c.read(c.ORIGINAL_MISC,native.p['original_misc_sha256'],b.MISC_BYTES);c.require(b.outside_bc(misc)==b.outside_bc(orig),'misc outside32 drift');target=b.trial_bc(misc[2048:2080]);c.require(target.hex()==r['target_bc32_hex'],'BC target changed')
+   b.durable_new(out/'boot_b.before.bin',before);b.durable_new(out/'misc.before.bin',misc);ledger.event('PREIMAGES_DURABLE',boot_b=c.sha(before),misc=c.sha(misc),target_bc=target.hex())
+   nv.check_live(native,budget,r['nv_source_gate']['hashes'])
+   ledger.event('PREWRITE_NV_VERIFIED',hashes=r['nv_source_gate']['hashes'],no_nv_write=True)
+   c.require(c.now()<c.timestamp(r['expires_at']),'expired before only write');c.require(b._read_all(native,'misc',b.MISC_BYTES,budget,ledger)==misc,'misc changed before write')
+   b._write_one(native,'misc',2048,target,budget,ledger)
+   final=b._read_all(native,'misc',b.MISC_BYTES,budget,ledger);after=b._read_all(native,'boot_b',b.BOOT_BYTES,budget,ledger);b.durable_new(out/'misc.readback.bin',final);b.durable_new(out/'boot_b.readback.bin',after)
+   c.require(after==before and b.outside_bc(final)==b.outside_bc(misc) and final[2048:2080]==target,'postwrite B/misc integrity');b._protected(native,native.p,budget,ledger);budget.check();c.require(c.now()<c.timestamp(r['expires_at']),'expired after verification')
+   result={'schema':'e5-next-bc32-rearm-result-v1','serial':c.SERIAL,'boot_id':r['boot_id'],'helper_owner_tx':r['helper_owner_tx'],'request_id':r['request_id'],'request_sha256':request_sha,'boot_b_sha256':c.sha(after),'misc_sha256':c.sha(final),'bc32_hex':target.hex(),'complete':True,'boot_b_written':False,'reboot_performed':False,'automatic_retry':False};c.save(out/'result.json',result);ledger.event('COMPLETE',txid=r['helper_owner_tx'],request_id=r['request_id'],result_sha256=c.binding(out/'result.json')['sha256']);return result
+  except BaseException as exc:
+   try:native.poison(type(exc).__name__+': '+str(exc))
+   finally:ledger.event('UNKNOWN',txid=r['helper_owner_tx'],request_id=r['request_id'],reason=str(exc),no_retry=True)
+   raise
+
+def run(request_binding,review_binding,out):
+ c.require(not REARM_IO_DISABLED,'REARM_IO_DISABLED: no device operation');r=validate(request_binding,review_binding);m=c.load_runtime();b=m['bounded_boot_control'];c.material_check(b);p=c.output(out);c.save(p/'REQUEST_BINDING.json',{'request':request_binding,'review':review_binding});cancel=threading.Event();native=backend(m,r['boot_id'],r['helper_owner_tx'],p/'transport',cancel)
+ return _engine(native,b,r,request_binding['sha256'],p,cancel)
+def main(argv=None):
+ ap=argparse.ArgumentParser(description=__doc__);sub=ap.add_subparsers(dest='mode');sub.add_parser('plan')
+ for mode in ('capture','draft','validate','run'):
+  parser=sub.add_parser(mode);parser.add_argument('--input',required=True);parser.add_argument('--sha256',required=True);parser.add_argument('--tool-manifest-sha',required=True)
+  if mode!='validate':parser.add_argument('--output',required=True)
+  if mode=='capture':parser.add_argument('--helper-owner-tx',required=True)
+  if mode=='draft':parser.add_argument('--nv-review',required=True);parser.add_argument('--nv-review-sha256',required=True);parser.add_argument('--request-id',required=True);parser.add_argument('--seconds',type=int,default=600)
+  if mode in ('run','validate'):parser.add_argument('--review',required=True);parser.add_argument('--review-sha256',required=True)
+ args=ap.parse_args(argv);mode=args.mode or 'plan'
+ if mode=='plan':value={'io_disabled':REARM_IO_DISABLED,'purpose':'rearm-with-sim','sim_state_per_slot':['READY','LOADED'],'only_write':{'misc':[2048,32]},'B_written':False,'automatic_reboot_retry':False}
+ else:
+  if mode in ('capture','run'):c.require(not REARM_IO_DISABLED,'REARM_IO_DISABLED: no device operation')
+  c.verify_manifest(args.tool_manifest_sha);item={'path':args.input,'sha256':args.sha256}
+  if mode=='capture':value=capture(item,args.helper_owner_tx,args.output)
+  elif mode=='draft':value=draft(item,args.request_id,{'path':args.nv_review,'sha256':args.nv_review_sha256},args.output,args.seconds)
+  else:
+   review={'path':args.review,'sha256':args.review_sha256};value=run(item,review,args.output) if mode=='run' else {'request':validate(item,review),'offline_only':True,'approved_to_execute':False}
+ print(json.dumps(value,indent=2));return 0
+if __name__=='__main__':main()

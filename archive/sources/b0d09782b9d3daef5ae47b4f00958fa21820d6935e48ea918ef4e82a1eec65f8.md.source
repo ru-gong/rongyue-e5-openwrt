@@ -1,0 +1,5 @@
+已交付七消费者 overlay、固定部分部署 case、主机归档与测试。65 项合成主机测试通过并已独审；新完整 prepare 包可重放最近真实 cold 作为历史 boot 排除。
+
+原状态/ledger 未由本代理修改，没有设备操作。六项既成变更保留，scanner 及后置保护复核仍未通过；本交付不宣称安装完成。当前准备入口仍禁用。主代理后续实际 host close、新冷启动和 16raw 复核必须单独形成真实记录。
+
+精确 SHA 与独审链接见 [DELIVERY.json](/REDACTED_HOST_PATH [README.md](/REDACTED_HOST_PATH

@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""Preparation only: 1800 s passive RAM logs, then stop monitoring, never reboot."""
+import argparse
+import base64
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import selectors
+import resource
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+DEVICE_EXECUTION_ENABLED = False
+ROOT = Path('/tmp/e5-wan-trial-20261014')
+OBSERVER_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+DURATION = 1800
+INTERVAL = 20
+RING_BYTES = 2 << 20  # current + previous <=4 MiB, initial separate <=512 KiB
+COMMAND_CAP = 64 << 10
+ALLOWED = {
+    ('/bin/busybox', 'dmesg'), ('/sbin/logread',),
+    ('/bin/ubus', '-S', 'call', 'network.interface.wan', 'status'),
+    ('/usr/sbin/iw', 'dev'), ('/usr/sbin/iw', 'dev', 'wlan0', 'station', 'dump'),
+}
+CP_COMMAND = ('/usr/bin/python3', '-B', str(ROOT/'observer.py'), 'observe',
+              '--duration', '1800', '--max-raw-bytes', '1048576', '--max-output-bytes', '2097152')
+
+
+def stamp():
+    return {'utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'monotonic_ns':time.monotonic_ns(),
+            'boottime_ns':time.clock_gettime_ns(time.CLOCK_BOOTTIME)}
+
+
+def read_bounded(path, limit=16384, tail=False):
+    try:
+        with Path(path).open('rb') as f:
+            truncated=False
+            if tail:
+                f.seek(0,2);size=f.tell();truncated=size>limit;f.seek(max(0,size-limit))
+            data=f.read(limit+1)
+        return {'base64':base64.b64encode(data[-limit:] if tail else data[:limit]).decode(),
+                'truncated':truncated or len(data)>limit}
+    except OSError as e:
+        return {'error':type(e).__name__,'errno':e.errno}
+
+
+def run_read(argv, timeout=3):
+    if tuple(argv) not in ALLOWED:
+        raise ValueError('command outside passive allowlist')
+    p=subprocess.Popen(argv,stdin=subprocess.DEVNULL,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                       env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','PYTHONDONTWRITEBYTECODE':'1'},close_fds=True)
+    chunks=bytearray();total=0;deadline=time.monotonic()+timeout;timedout=False
+    selector=selectors.DefaultSelector();selector.register(p.stdout,selectors.EVENT_READ)
+    try:
+        while selector.get_map():
+            remaining=deadline-time.monotonic()
+            if remaining<=0:
+                timedout=True;p.kill();break
+            for key,_ in selector.select(min(.2,remaining)):
+                data=os.read(key.fd,8192)
+                if not data:selector.unregister(key.fileobj);continue
+                total+=len(data);chunks.extend(data)
+                if len(chunks)>COMMAND_CAP:del chunks[:-COMMAND_CAP]
+        p.wait(timeout=1)
+    finally:
+        selector.close();p.stdout.close()
+        if p.poll() is None:p.kill();p.wait(timeout=1)
+    return {'argv':list(argv),'exit':p.returncode,'timed_out':timedout,'observed_bytes':total,
+            'truncated':total>COMMAND_CAP,'tail_base64':base64.b64encode(chunks).decode()}
+
+
+def snapshot():
+    r={'event':'snapshot',**stamp(),'files':{},'commands':[]}
+    for path in ('/proc/uptime','/proc/net/route','/proc/net/dev','/proc/meminfo',
+                 '/sys/power/autosleep','/sys/power/state','/tmp/dhcp.leases'):
+        r['files'][path]=read_bounded(path)
+    for pattern in ('/sys/class/power_supply/*/uevent','/sys/class/udc/*/state',
+                    '/sys/class/extcon/*/state','/sys/class/thermal/thermal_zone*/temp',
+                    '/sys/class/net/*/operstate','/sys/class/net/*/carrier'):
+        for p in sorted(Path('/').glob(pattern.lstrip('/')))[:32]:
+            r['files'][str(p)]=read_bounded(p,4096)
+    r['vendor_log']=read_bounded('/var/log/e5-android-log.txt',COMMAND_CAP,tail=True)
+    for argv in sorted(ALLOWED):
+        try:r['commands'].append(run_read(argv))
+        except (OSError,subprocess.SubprocessError) as e:r['commands'].append({'argv':list(argv),'error':type(e).__name__,'detail':str(e)[:200]})
+    return r
+
+
+def write_new(name, data):
+    p=ROOT/name
+    with p.open('xb') as f:f.write(data)
+    p.chmod(0o600)
+
+
+def ring(record):
+    data=(json.dumps(record,separators=(',',':'))+'\n').encode()
+    if len(data)>512<<10:raise ValueError('record exceeds 512 KiB ceiling')
+    p=ROOT/'system-current.jsonl';old=ROOT/'system-previous.jsonl'
+    if p.exists() and p.stat().st_size+len(data)>RING_BYTES:
+        if old.exists():old.unlink()
+        p.rename(old)
+    with p.open('ab') as f:f.write(data)
+    p.chmod(0o600)
+
+
+def preflight():
+    if not DEVICE_EXECUTION_ENABLED:raise ValueError("PREPARATION_HARD_DISABLED")
+    if sys.platform!='linux' or os.uname().machine!='aarch64' or os.geteuid()!=0:
+        raise ValueError('requires approved E5 Linux root')
+    if ROOT.is_symlink() or ROOT.resolve()!=ROOT or not ROOT.is_dir():raise ValueError('exclusive ordinary /tmp directory required')
+    mounts=Path('/proc/mounts').read_text().splitlines()
+    if not any(x.split()[1:3]==['/tmp','tmpfs'] for x in mounts):raise ValueError('/tmp must be tmpfs')
+    if Path('/etc/e5/image-version').read_text().strip()!='569f13d-dirty':raise ValueError('image identity differs')
+    if os.uname().release!='6.18.54-e5-mobile4-g020b970e351e-dirty':raise ValueError('kernel identity differs')
+    expected={'trial_logs.py','observer.py'}
+    if {p.name for p in ROOT.iterdir()}!=expected:raise ValueError('directory is not a fresh two-script staging area')
+    for name in expected:
+        p=ROOT/name
+        if p.is_symlink() or not stat.S_ISREG(p.stat().st_mode):raise ValueError('ordinary script required')
+    if hashlib.sha256((ROOT/'observer.py').read_bytes()).hexdigest()!=OBSERVER_SHA:raise ValueError('observer hash mismatch')
+    if Path(__file__).resolve()!=ROOT/'trial_logs.py':raise ValueError('run only fixed staged script')
+    ROOT.chmod(0o700)
+    return {'event':'identity',**stamp(),'boot_id':Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+            'kernel':os.uname().release,'image':'569f13d-dirty','duration_seconds':DURATION,
+            'observer_sha256':OBSERVER_SHA,'script_sha256':hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            'cmdline':Path('/proc/cmdline').read_text().strip()}
+
+
+def collect(identity):
+    stop=False
+    def on_signal(signum,frame):
+        nonlocal stop
+        stop=True
+    signal.signal(signal.SIGTERM,on_signal);signal.signal(signal.SIGINT,on_signal)
+    signal.signal(signal.SIGHUP,signal.SIG_IGN)
+    started=time.clock_gettime(time.CLOCK_BOOTTIME);deadline=started+DURATION
+    write_new('identity.json',(json.dumps(identity,indent=2)+'\n').encode())
+    write_new('pid.json',(json.dumps({'pid':os.getpid(),'boot_id':identity['boot_id']})+'\n').encode())
+    cp=None;reason='duration_limit';error=None
+    with (ROOT/'cp.jsonl').open('xb') as cpout, (ROOT/'cp.stderr').open('xb') as cperr:
+        try:
+            cp=subprocess.Popen(CP_COMMAND,stdin=subprocess.DEVNULL,stdout=cpout,stderr=cperr,
+                                env={'PATH':'/usr/sbin:/usr/bin:/sbin:/bin','PYTHONDONTWRITEBYTECODE':'1'},close_fds=True)
+            first=True
+            while time.clock_gettime(time.CLOCK_BOOTTIME)<deadline:
+                if stop or (ROOT/'STOP').exists():reason='operator_stop';break
+                item=snapshot()
+                if first:
+                    data=(json.dumps(item,separators=(',',':'))+'\n').encode()
+                    if len(data)>512<<10:raise ValueError('initial snapshot too large')
+                    write_new('system-initial.jsonl',data);first=False
+                ring(item)
+                ring({'event':'observer_poll',**stamp(),'exit':cp.poll()})
+                for _ in range(INTERVAL):
+                    if stop or (ROOT/'STOP').exists() or time.clock_gettime(time.CLOCK_BOOTTIME)>=deadline:break
+                    time.sleep(1)
+        except BaseException as e:
+            reason='collector_error';error=type(e).__name__+': '+str(e)[:300]
+        finally:
+            if cp is not None and cp.poll() is None:
+                # Only the child created by this collector; never system service PIDs.
+                try:cp.send_signal(signal.SIGINT);cp.wait(timeout=3)
+                except subprocess.TimeoutExpired:cp.kill();cp.wait(timeout=1)
+            result={'event':'complete',**stamp(),'reason':reason,'error':error,
+                    'cp_exit':cp.returncode if cp else None,'monitoring_stopped':True,
+                    'network_radio_system_untouched':True,'system_remains_running':True}
+            ring(result);write_new('complete.json',(json.dumps(result,indent=2)+'\n').encode())
+
+
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=['start','stop','status'])
+    args=parser.parse_args(argv)
+    if not DEVICE_EXECUTION_ENABLED:raise ValueError("PREPARATION_HARD_DISABLED")
+    if args.mode in ('stop','status'):
+        if ROOT.is_symlink() or ROOT.resolve()!=ROOT or not (ROOT/'identity.json').is_file():raise ValueError('no trial identity')
+        identity=json.loads((ROOT/'identity.json').read_text())
+        if identity['boot_id']!=Path('/proc/sys/kernel/random/boot_id').read_text().strip():raise ValueError('boot changed')
+        if args.mode=='stop':
+            if not (ROOT/'STOP').exists():write_new('STOP',b'operator stop\n')
+        print(json.dumps({'complete':(ROOT/'complete.json').exists(),'stop_requested':(ROOT/'STOP').exists(),
+                          'files':[{ 'name':p.name,'bytes':p.stat().st_size} for p in sorted(ROOT.iterdir()) if p.is_file()]}))
+        return 0
+    identity=preflight()
+    # Exclusive create before fork also blocks two concurrent start attempts.
+    write_new('STARTING.json',(json.dumps(identity)+'\n').encode())
+    pid=os.fork()
+    if pid:
+        print(json.dumps({'launched_pid':pid,'directory':str(ROOT),'duration_seconds':DURATION}));return 0
+    os.setsid();os.umask(0o077)
+    # Kernel file-size ceiling applies to our own outputs and inherited children.
+    resource.setrlimit(resource.RLIMIT_FSIZE,(RING_BYTES,RING_BYTES))
+    # Disconnect from SSH's input/output; only our RAM log is used.
+    with open('/dev/null','rb') as null, (ROOT/'launcher.log').open('xb') as log:
+        os.dup2(null.fileno(),0);os.dup2(log.fileno(),1);os.dup2(log.fileno(),2)
+    try:collect(identity)
+    finally:os._exit(0)
+
+
+if __name__=='__main__':raise SystemExit(main())

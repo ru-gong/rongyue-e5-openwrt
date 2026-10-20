@@ -1,0 +1,34 @@
+# E5 只读分块采集 v2（备份用途）
+
+独立工具，不导入旧 live 安装器或目录写适配器。默认 `python3 -B capture.py` / `plan` 只打印主机计划，不调用 ADB。仅显式 `capture` 子命令连接设备。主线程是唯一设备操作者；本次开发和测试没有调用 ADB、USB、SSH 或 VM。
+
+固定本机串号 `DEVICE_SERIAL_REDACTED`、当前启动 ID `00000000-0000-4000-8000-000000000001`、Android A/root/无卡/启动完成，以及已固定的设备 profile 和本机 ADB 二进制 SHA。重启后会拒绝，不允许 CLI 替换设备、boot ID、节点、输入路径或分区。新 boot 必须重新审定版本。
+
+执行入口示例（仅由主线程使用，目录必须不存在）：
+
+```
+python3 -B capture.py capture --phase probe --chunk-mib 4 --output /绝对路径/新的校准证据目录
+python3 -B capture.py capture --phase blocks --chunk-mib 4 --output /绝对路径/新的分区证据目录
+python3 -B capture.py capture --phase metadata --chunk-mib 16 --output /绝对路径/新的清单证据目录
+python3 -B capture.py capture --phase directory --chunk-mib 16 --output /绝对路径/新的目录证据目录
+```
+
+`probe` 校准真实退出码 37 和 stdout/stderr 独立性、misc 4 KiB 双读与设备端 SHA、主 GPT 指纹，再读取所选块大小的 B 首块。`blocks` 读取 B 64 MiB、misc 1 MiB、GPT 前 32 KiB 和 profile 中固定的 13 个保护分区（保护集合合计 109,051,904 字节），逐项完整 SHA 核对。`metadata` 只读取 GPT 前缀、scope 检查标记和前后目录清单，不开始目录文件内容，也不会产生 full_directory 完成声明。`directory` 只额外读取 `/data/e5linux` 整目录；每个阶段都重新校准并读取 GPT 前缀。`all` 显式选择时执行分区和目录。每阶段前后核固定 profile 全分区 geometry。
+
+默认块大小 16 MiB；CLI 只另允许 4 MiB。可以在成功的小读校准后由主线程明确选择 16 MiB 的新采集，不会在失败后自动调参数重试。单请求 8 秒截止，stdout 上限为该块长度加 4096 字节封套，stderr 16 KiB；metadata 上限 1 MiB。超限、超时、非预期退出码、stderr、信号中断均停止。到截止时终止主机 ADB 子进程并有限等待清理；不能由此证明内核中阻塞的远端 read 已退出。
+
+传输固定为 `adb -s <固定串号> shell -T '/debug_ramdisk/su -c <完整引用脚本>'`。每块前后包络包含 boot ID、解析后的路径、请求偏移、请求长度与 stat；主机按固定长度拆二进制，拒绝 CRLF/PTY 污染和前一块重放。每块另发一次有同样包络、受限长度的 `dd | sha256sum`，比较独立读取的 SHA；不会让设备对整 2 GiB 文件执行一个长哈希命令。所有管道使用 `pipefail`。BusyBox 的 `dd iflag=count_bytes`、`find -print0`、`sort -z` 必须实际可用；不支持即停止，不自动降级。
+
+目录先只读 NUL 清单和 lstat 风格 stat（不跟随符号链接）；只接受固定目录内安全名称、普通单链接文件和目录、同一文件系统。清单最多 4096 项、文件总量最多 16 GiB。v2 只检查 `/proc/self/mountinfo` 和 `/proc/1/mountinfo` 的 root/mountpoint，以及最多 128 个全局 loop backing_file；不逐 PID 扫描、不枚举进程 FD，也不声称排除了所有其他 namespace 或打开的使用者。未知挂载读取、超过 loop 数量、检查命中路径均失败停止。
+
+metadata/directory 阶段先发独立 scope-check，依次留下 SCOPE_BEGIN、SELF_MOUNTS_OK、INIT_MOUNTS_OK、GLOBAL_LOOPS_OK、SCOPE_END 标记；超时保留已收到标记，不重试。每个数据块前同样核这两个 namespace/global loop，但不插入二进制帧以外的标记；紧接的独立块哈希仍重复 boot/path/stat，末尾完整清单再次检查范围。源身份、mtime/ctime、前后清单和逐块双读 SHA 用来发现普通读取期间的内容漂移，不能证明原子快照。
+
+这套较窄检查仅服务读取和 Mac 备份，明确 `satisfies_directory_mutation_gate=false`。未来目录改名、切换或回退仍需另行完成原目录写工具要求的真实 full-FD/namespace 检查及其他批准门；不得用此次备份通过代替。旧 capture、失败 directory-01 和旧归档器全部保留。
+
+主机证据目录独占创建；每请求脚本、原始 stdout/stderr、计时/返回码/SHA 分开保存并 fsync。原始二进制封套保留，同时重组每份内容文件并 fsync；至少预留目录总字节的两倍加 64 MiB。只有最终前后 stat/目录清单一致、分区 geometry 一致才生成 `COMPLETE.json`。存在 `STOP.json` 或没有 `COMPLETE.json` 不能称备份完成；部分 `.bin` 保留供审查，不自动续传或删除。
+
+清单记录类型、设备号、inode、bytes、uid/gid、mode、nlink、mtime/ctime 和纳秒格式文本。它不是一致时间点文件系统快照；外层 xattr、ACL、SELinux label 和 atime 没有完整归档保证。ext4 镜像作为原始普通文件读取，其内部元数据包含在镜像字节里。后续可纯主机按清单生成并验证 tar，不能误称本工具已提供适合直接恢复的 tar 或刷写授权。
+
+设备端没有输出文件、上传、锁创建、mount、AT、CP reset、分区写入或 reboot。普通只读访问仍可能触发系统访问计数；本工具不宣称整台运行中 Android 没有自己的背景写入。新的 Android 冷启动稳定性/故障审查仍由主线程独立判定。
+
+测试：`python3 -B -m unittest -v test_capture.py`，23 项主机 fake/匿名 pipe 测试，审计钩子禁止真实进程和 socket。覆盖二进制/NUL、错误退出码被吞、错偏移/长度、超时/输出上限、信号停止、二读哈希不符、文件类型/硬链接/跨文件系统以及五阶段的假执行和 metadata 不读取文件内容。本 v2 未在设备运行；原版 16 MiB 分块的历史实测只供选择块大小，不替代 v2 的 metadata/目录阶段实机验收。另有 15 项纯主机归档 fixture 测试。

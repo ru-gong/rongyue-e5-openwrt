@@ -1,0 +1,171 @@
+"""Fake backend and host temporary files only. No ADB/native device invocation."""
+import copy,hashlib,json,os,re,shlex,stat,sys,tempfile,threading,time,unittest
+from pathlib import Path
+from unittest.mock import patch,Mock
+import android_directory_adapter as a
+
+def audit(event,args):
+    if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.exec','os.posix_spawn'):raise AssertionError('device/process forbidden: '+event)
+sys.addaudithook(audit)
+BOOT='00000000-0000-4000-8000-000000000001';TX='0123456789abcdef'
+def meta(path):
+    s=path.stat();return dict(mode_bits=s.st_mode,dev=s.st_dev,inode=s.st_ino,bytes=s.st_size,mode=format(stat.S_IMODE(s.st_mode),'o'),uid=s.st_uid,gid=s.st_gid,nlink=s.st_nlink,mtime=str(int(s.st_mtime)),ctime=str(int(s.st_ctime)),mtime_text=str(s.st_mtime_ns),ctime_text=str(s.st_ctime_ns),rdev_major=0,rdev_minor=0,type='d' if path.is_dir() else 'f')
+class Poison:
+    def __init__(self):self.poisoned=False
+    def mark_uncertain(self,reason):self.poisoned=True
+class Fake(a.AndroidDirectoryAdapter):
+    def __init__(self,root):
+        super().__init__(None,None,TX,BOOT,scanner=None,io_helper=None,evidence_dir=root/'evidence')
+        self.io_helper=a.Artifact(root/'fakeio',1,'a'*64)
+        self.root=root;self.reads=0;self.scans=0;self.transport=Poison();self.fail_hash=False;self.drift=False
+        self.native_writes=0;self.status=[];self.bad_ack=False;self.short_write=False
+    def local(self,remote):
+        for role in a.ROLES:
+            p=self.path(role)
+            if remote==p:return self.root/role
+            if remote.startswith(p+'/'):return self.root/role/remote[len(p)+1:]
+        raise AssertionError(remote)
+    def occupancy(self):self.scans+=1;return {'complete':True}
+    def verify_file(self,remote,size,sha):return True
+    def _inventory(self,role):
+        root=self.root/role;paths=[root,*sorted(root.rglob('*'))]
+        rows=[{'path':'.' if p==root else './'+str(p.relative_to(root)),**meta(p)} for p in paths]
+        if self.drift and self.scans:rows[0]['ctime_text']+=str(self.reads)
+        return rows
+    def _read_once(self,path,offset,length,hash_only=False):
+        self.reads+=1;p=self.local(path)
+        with p.open('rb') as f:f.seek(offset);data=f.read(length)
+        if hash_only:data=(('0'*64 if self.fail_hash else hashlib.sha256(data).hexdigest())+'  -\n').encode()
+        return data,meta(p)
+    def _deadline(self):return 15000
+    def _request(self,label,script,**kw):
+        if label!='write-stage-chunk':raise AssertionError(label)
+        words=script.splitlines()[-1].split();action,tx,boot,op,deadline,d1,d2,ino,offset,length,total,name=words[1:]
+        p=self.root/'stage'/name;off=int(offset);payload=kw['payload'];self.status.append('IN_FLIGHT')
+        if off==0:
+            with p.open('xb') as f:f.write(payload[:3] if self.short_write else payload);f.flush();os.fsync(f.fileno())
+        else:
+            if p.stat().st_ino!=int(ino) or p.stat().st_size!=off:raise a.Refusal('fake native identity')
+            with p.open('ab') as f:f.write(payload);f.flush();os.fsync(f.fileno())
+        self.native_writes+=1
+        common=dict(op_id=op,boot_id=boot,txid=tx,deadline_ms=int(deadline),action=action)
+        ack=dict(common,event='DONE',ok=True,offset=off,bytes=len(payload),total=int(total),inode=p.stat().st_ino,dev=p.stat().st_dev,size=p.stat().st_size,fsync_completed=True)
+        if self.bad_ack:ack['op_id']='f'*32
+        raw=(json.dumps(dict(common,event='START'))+'\n'+json.dumps(ack)+'\n').encode()
+        try:
+            parsed=kw['validator'](raw);self.status.append('ACK_PARSED')
+            result=kw['followup'](parsed);self.status.append('COMPLETE');return result
+        except BaseException:self.status.append('UNCERTAIN');self.transport.mark_uncertain('failure');raise
+class Tests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.root=Path(self.tmp.name).resolve()
+        for name in ('active','stage','archive','failed'):(self.root/name).mkdir()
+        (self.root/'active'/'openwrt.ext4').write_bytes(b'original\0bytes')
+        self.fake=Fake(self.root);self.enabled=patch.object(a,'DEVICE_IO_DISABLED',False);self.enabled.start()
+    def tearDown(self):self.enabled.stop();self.tmp.cleanup()
+    def test_production_gate_before_transport(self):
+        ad=a.AndroidDirectoryAdapter(None,None,TX,BOOT,scanner=None,io_helper=None,evidence_dir=self.root/'never')
+        with patch.object(a,'DEVICE_IO_DISABLED',True):
+            for call in (ad.acquire,ad.upload_helper,lambda:ad.inspect('active'),ad.check_baseline,lambda:ad.stage({},0,''),lambda:ad.backup_to_mac('active',{},self.root/'x')):
+                with self.assertRaisesRegex(a.Refusal,'DEVICE_IO_DISABLED'):call()
+        self.assertFalse((self.root/'never').exists())
+    def test_nonmutating_shell_has_remote_timeout_and_nested_quotes(self):
+        ad=a.AndroidDirectoryAdapter(a.Artifact(Path('/fixed/adb'),1,'a'*64),None,TX,BOOT,scanner=None,io_helper=None,evidence_dir=self.root/'never')
+        transport=Mock();transport.request.return_value=b'OK'
+        with patch.object(ad,'_ensure_transport',return_value=transport):
+            ad._request('fixed-read',"printf '%s' 'quoted value'\n",limit=20)
+        args=transport.request.call_args.args;su=shlex.split(args[1][-1]);self.assertEqual(su[:2],[a.SU,'-c'])
+        timeout=shlex.split(su[2]);self.assertEqual(timeout[:7],[a.BB,'timeout','-s','TERM','6','/system/bin/sh','-c'])
+        self.assertEqual(timeout[7],ad._guard()+"printf '%s' 'quoted value'\n")
+    def test_transport_requires_short_phase_deadline_before_any_io(self):
+        ad=a.AndroidDirectoryAdapter(None,None,TX,BOOT,scanner=None,io_helper=None,evidence_dir=self.root/'never',cancel_event=threading.Event())
+        for deadline in (None,float('inf'),float('nan'),time.monotonic()-1,time.monotonic()+3601):
+            ad.transaction_deadline=deadline
+            with self.subTest(deadline=deadline),self.assertRaisesRegex(a.Refusal,'transaction deadline'):ad._ensure_transport()
+        self.assertFalse((self.root/'never').exists())
+    def test_transport_requires_cancellation_control_before_any_io(self):
+        ad=a.AndroidDirectoryAdapter(None,None,TX,BOOT,scanner=None,io_helper=None,evidence_dir=self.root/'never',transaction_deadline=time.monotonic()+60)
+        with self.assertRaisesRegex(a.Refusal,'cancellation event'):ad._ensure_transport()
+        ad.cancel_event=threading.Event();ad.cancel_event.set()
+        with self.assertRaisesRegex(a.Refusal,'cancellation event'):ad._ensure_transport()
+        ad.cancel_event.clear();ad.transport=Poison()
+        self.assertIs(ad._ensure_transport(),ad.transport)
+    def test_inspect_double_read_and_cache(self):
+        first=self.fake.inspect('active');self.assertEqual(self.fake.reads,2);self.assertEqual(self.fake.scans,2)
+        self.assertEqual(self.fake.inspect('active'),first);self.assertEqual(self.fake.reads,2);self.assertEqual(self.fake.scans,4)
+    def test_changed_stat_invalidates_cache(self):
+        self.fake.inspect('active');(self.root/'active'/'openwrt.ext4').write_bytes(b'changed length')
+        result=self.fake.inspect('active');self.assertEqual(self.fake.reads,4);self.assertEqual(result['rows'][1]['sha256'],hashlib.sha256(b'changed length').hexdigest())
+    def test_rename_same_inode_cache_reuse(self):
+        first=self.fake.inspect('active');(self.root/'archive').rmdir();(self.root/'active').rename(self.root/'archive')
+        second=self.fake.inspect('archive');self.assertEqual(first['rows'],second['rows']);self.assertEqual(self.fake.reads,2)
+    def test_new_instance_never_inherits_cache(self):
+        self.fake.inspect('active');other=Fake(self.root);other.inspect('active');self.assertEqual(other.reads,2)
+    def test_changed_boot_does_not_reuse_cache(self):
+        self.fake.inspect('active');self.fake.boot_id='00000000-0000-4000-8000-000000000001';self.fake.inspect('active');self.assertEqual(self.fake.reads,4)
+    def test_double_read_mismatch_poison(self):
+        self.fake.fail_hash=True
+        with self.assertRaisesRegex(a.Refusal,'chunk SHA'):self.fake.inspect('active')
+        self.assertTrue(self.fake.transport.poisoned);self.assertFalse(self.fake._hash_cache)
+    def test_metadata_drift_poison(self):
+        self.fake.drift=True
+        with self.assertRaisesRegex(a.Refusal,'directory changed'):self.fake.inspect('active')
+        self.assertTrue(self.fake.transport.poisoned)
+    def test_write_chunk_ack_then_full_readback(self):
+        payload=b'a'*(4<<20);item=a.Artifact(self.root/'unused',len(payload)+7,'a'*64);identity=(self.root/'stage').stat()
+        ack=self.fake._write_file_chunk('openwrt.ext4',item,0,payload,0,(identity.st_dev,identity.st_ino))
+        self.assertEqual(self.fake.status,['IN_FLIGHT','ACK_PARSED','COMPLETE']);self.assertEqual(self.fake.reads,2)
+        self.fake._write_file_chunk('openwrt.ext4',item,len(payload),b'b'*7,ack['inode'],(identity.st_dev,identity.st_ino))
+        self.assertEqual((self.root/'stage'/'openwrt.ext4').read_bytes(),payload+b'b'*7)
+    def test_existing_stage_file_is_not_overwritten(self):
+        target=self.root/'stage'/'boot-os';target.write_bytes(b'old');st=(self.root/'stage').stat()
+        with self.assertRaises(FileExistsError):self.fake._write_file_chunk('boot-os',a.Artifact(target,8,'a'*64),0,b'openwrt\n',0,(st.st_dev,st.st_ino))
+        self.assertEqual(target.read_bytes(),b'old')
+    def test_wrong_ack_not_complete(self):
+        self.fake.bad_ack=True;st=(self.root/'stage').stat()
+        with self.assertRaises(a.Refusal):self.fake._write_file_chunk('boot-os',a.Artifact(self.root/'x',8,'a'*64),0,b'openwrt\n',0,(st.st_dev,st.st_ino))
+        self.assertNotIn('COMPLETE',self.fake.status);self.assertTrue(self.fake.transport.poisoned)
+    def test_partial_write_not_complete(self):
+        self.fake.short_write=True;st=(self.root/'stage').stat()
+        with self.assertRaises(a.Refusal):self.fake._write_file_chunk('boot-os',a.Artifact(self.root/'x',8,'a'*64),0,b'openwrt\n',0,(st.st_dev,st.st_ino))
+        self.assertEqual((self.root/'stage'/'boot-os').read_bytes(),b'ope');self.assertNotIn('COMPLETE',self.fake.status)
+    def test_write_readback_failure_keeps_unknown(self):
+        self.fake.fail_hash=True;st=(self.root/'stage').stat()
+        with self.assertRaises(a.Refusal):self.fake._write_file_chunk('boot-os',a.Artifact(self.root/'x',8,'a'*64),0,b'openwrt\n',0,(st.st_dev,st.st_ino))
+        self.assertNotIn('COMPLETE',self.fake.status)
+    def test_unknown_stage_target_and_unbounded_shell_refused(self):
+        with self.assertRaises(a.Refusal):self.fake._write_file_chunk('boot_a',a.Artifact(self.root/'x',8,'a'*64),0,b'x'*8,0,(1,1))
+        with self.assertRaises(a.Refusal):self.fake._shell('anything',timeout=1800)
+    def test_backup_real_host_tar_includes_content_and_empty_dir(self):
+        (self.root/'active'/'empty').mkdir();snap=self.fake.inspect('active');reads=self.fake.reads
+        receipt=self.fake.backup_to_mac('active',snap,self.root/'backup.tar')
+        self.assertTrue(receipt['complete']);self.assertGreater(self.fake.reads,reads)
+        self.assertEqual(a.verify_backup_tar(self.root/'backup.tar',snap)['sha256'],receipt['sha256'])
+    def test_boot_mismatch_native_record_rejected(self):
+        row=dict(event='START',op_id='a'*32,boot_id='bad',txid=TX,deadline_ms=15000)
+        with self.assertRaises(a.Refusal):self.fake._native_records((json.dumps(row)+'\n'+json.dumps(row)+'\n').encode(),'a'*32,15000)
+    def test_read_envelope_exact_operation_offset_and_binary(self):
+        ad=a.AndroidDirectoryAdapter(None,None,TX,BOOT,scanner=None,io_helper=None,evidence_dir=self.root/'never')
+        payload=b'\0\xff\nDATA';rawstat=b'8180|1|2|7|600|0|0|1|100|100|mtime-ns|ctime-ns|0|0'
+        def answer(label,script,**kw):
+            op=kw['op_id'];parts=f'{op}\t{BOOT}\t{ad.path("active")}/file\t0\t7\t'.encode()+rawstat
+            return kw['validator'](b'META\t'+parts+b'\n'+payload+b'\nEND\t'+parts+b'\n')
+        with patch.object(ad,'_request',side_effect=answer):self.assertEqual(ad._read_once(ad.path('active')+'/file',0,7)[0],payload)
+
+    def test_read_envelope_wrong_offset_rejected(self):
+        ad=a.AndroidDirectoryAdapter(None,None,TX,BOOT,scanner=None,io_helper=None,evidence_dir=self.root/'never')
+        def answer(label,script,**kw):
+            parts=f'{kw["op_id"]}\t{BOOT}\t{ad.path("active")}/file\t4096\t1\t8180|1|2|1|600|0|0|1|100|100|m|c|0|0'.encode()
+            return kw['validator'](b'META\t'+parts+b'\nx\nEND\t'+parts+b'\n')
+        with patch.object(ad,'_request',side_effect=answer):
+            with self.assertRaisesRegex(a.Refusal,'offset'):ad._read_once(ad.path('active')+'/file',0,1)
+
+    def test_full_hash_refuses_extra_tail(self):
+        with self.assertRaisesRegex(a.Refusal,'length differs'):self.fake._hash(self.fake.path('active')+'/openwrt.ext4',1)
+
+    def test_no_long_request_or_device_decompress(self):
+        source=Path(a.__file__).read_text()
+        self.assertNotIn('timeout=1800',source);self.assertNotIn('timeout=2400',source)
+        self.assertNotIn('gzip -dc',source);self.assertNotIn('/proc/[0-9]*/fd',source)
+        self.assertIn('self.occupancy()',source);self.assertIn('MAX_INVENTORY',source)
+if __name__=='__main__':unittest.main(verbosity=2)

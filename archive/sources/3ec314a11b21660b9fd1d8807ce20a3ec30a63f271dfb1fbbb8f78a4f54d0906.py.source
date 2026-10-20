@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Fixed Stage2 entry. Draft/validate are host-only; execute remains disabled."""
+from pathlib import Path
+from datetime import datetime,timezone
+import argparse,hashlib,importlib.util,json,os,signal,stat,sys,threading,time
+
+DEVICE_IO_DISABLED=False
+HERE=Path(__file__).resolve().parent
+ROOT=HERE.parents[1]
+CORE=ROOT/'tools/e5_nextphase_core_live_b36a719a15cd4241'
+COLD=ROOT/'tools/e5_next_recovery_live_b36a719a15cd4241'
+class Refusal(RuntimeError):pass
+def need(ok,why):
+    if not ok:raise Refusal(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def read(path,digest=None,cap=4<<20):
+    p=Path(path);need(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe input path')
+    s=p.stat();need(stat.S_ISREG(s.st_mode) and s.st_nlink==1 and 0<s.st_size<=cap,'input type/size')
+    raw=p.read_bytes();after=p.stat();need(all(getattr(s,k)==getattr(after,k) for k in ('st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns')),'input drift')
+    need(digest is None or sha(raw)==digest,'input SHA');return raw
+def binding(path,digest):return {'path':str(Path(path).absolute()),'sha256':digest}
+def load(name,path):
+    p=Path(path).resolve()
+    if name in sys.modules:
+        module=sys.modules[name];need(Path(module.__file__).resolve()==p,'module conflict: '+name);return module
+    spec=importlib.util.spec_from_file_location(name,p);module=importlib.util.module_from_spec(spec);sys.modules[name]=module
+    spec.loader.exec_module(module);return module
+
+def material_manifest(b):
+    manifest=json.loads(read(b['path'],b['sha256']))
+    need(manifest['schema']=='e5-next-scanner-artifact-manifest-v1','manifest schema')
+    need(sha(read(Path(__file__).resolve()))==manifest['runner_source_sha256'],'runner source pin')
+    read(HERE/'stage2_deploy.py',manifest['host_source_sha256'])
+    need(set(manifest['core'])=={'android_directory_adapter.py','bounded_transport.py'},'core set')
+    for name,v in manifest['core'].items():need(v['path']==str(CORE/name),'core path');read(v['path'],v['sha256'])
+    need(manifest['cold_contract']['path']==str(COLD/'evidence_contract.py'),'cold path')
+    read(manifest['cold_contract']['path'],manifest['cold_contract']['sha256'])
+    need(set(manifest['cold_dependencies'])=={'common.py','observe.py'},'cold deps')
+    for name,v in manifest['cold_dependencies'].items():need(v['path']==str(COLD/name),'cold dep path');read(v['path'],v['sha256'])
+    return manifest
+
+def validate(rb,mb,vb):
+    manifest=material_manifest(mb)
+    library=load('_e5_stage2_deploy',HERE/'stage2_deploy.py')
+    cold=load('_e5_stage2_evidence_contract',COLD/'evidence_contract.py')
+    request,manifest,gate,restoration=library.validate_request(rb,mb,vb,cold.validate_directory_ready)
+    return library,cold,request,manifest,gate,restoration
+
+def draft(mb,output):
+    material_manifest(mb)
+    value={'schema':'TEMPLATE_NOT_VALID','intended_schema':'e5-next-scanner-deployment-v1','serial':'DEVICE_SERIAL_REDACTED',
+        'txid':None,'boot_id':None,'created_at':None,'expires_at':None,'total_seconds':600,'manifest':mb,
+        'postcold':{'path':None,'sha256':None},'restoration':{'path':None,'sha256':None},
+        'device_execution_authorized':False,'instructions':'Fill only from actual completed original restoration, new cold/raw evidence and separate independent review. This draft is rejected by validate/execute.'}
+    p=Path(output).absolute();need(p.parent.is_dir() and all(not q.is_symlink() for q in p.parents),'draft parent')
+    fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f:f.write((json.dumps(value,indent=2)+'\n').encode());f.flush();os.fsync(f.fileno())
+    d=os.open(p.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(d)
+    finally:os.close(d)
+    return {'schema':'e5-stage2-draft-v1','path':str(p),'sha256':sha(read(p)),'valid_execution_request':False}
+
+def execute(rb,mb,vb,evidence_dir):
+    need(not DEVICE_IO_DISABLED,'DEVICE_IO_DISABLED: preparation runner; no device execution')
+    library,cold,request,manifest,gate,_=validate(rb,mb,vb)
+    transport=load('bounded_transport',CORE/'bounded_transport.py')
+    adapter=load('android_directory_adapter',CORE/'android_directory_adapter.py')
+    need(adapter.transport_api is transport,'transport module identity')
+    need(not library.DEVICE_IO_DISABLED and not adapter.DEVICE_IO_DISABLED,'runtime gates remain disabled')
+    base=Path(evidence_dir).absolute();need(base.is_relative_to(ROOT/'evidence') and not base.exists() and not base.is_symlink() and all(not q.is_symlink() for q in base.parents),'new evidence base')
+    cancel=threading.Event();old={}
+    def stop(signum,frame):cancel.set()
+    for sig in (signal.SIGINT,signal.SIGTERM,signal.SIGHUP):old[sig]=signal.signal(sig,stop)
+    try:
+        remaining=min(request['total_seconds'],(library.stamp(request['expires_at'])-datetime.now(timezone.utc)).total_seconds()-5)
+        need(remaining>0,'lease exhausted');deadline=time.monotonic()+remaining
+        base.mkdir(mode=0o700);library.fsync_dir(base.parent)
+        library.durable(base/'SOURCE_BINDING.json',library.canonical({'runner':binding(Path(__file__).resolve(),manifest['runner_source_sha256']),
+            'request':rb,'manifest':mb,'review':vb,'boot_id':request['boot_id'],'txid':request['txid'],'gate_sha256':library.gate_digest(gate)})+b'\n')
+        art=lambda name:adapter.Artifact(Path(manifest['artifacts'][name]['path']),manifest['artifacts'][name]['bytes'],manifest['artifacts'][name]['sha256'])
+        adb=adapter.Artifact(library.ADB,library.ADB.stat().st_size,library.ADB_SHA)
+        a=adapter.AndroidDirectoryAdapter(adb,art('helper'),request['txid'],request['boot_id'],scanner=art('scanner'),io_helper=art('io_helper'),
+            evidence_dir=base/'transport',cancel_event=cancel,transaction_deadline=deadline)
+        # The library owns the sole whole-phase host lock; no second flock here.
+        return library.Stage2Deploy(a,rb,mb,vb,cold.validate_directory_ready,base/'result').run()
+    finally:
+        for sig,handler in old.items():signal.signal(sig,handler)
+
+def main(argv=None):
+    p=argparse.ArgumentParser(description=__doc__);sub=p.add_subparsers(dest='action')
+    for action in ('draft','validate','execute'):
+        q=sub.add_parser(action);q.add_argument('--manifest',required=True);q.add_argument('--manifest-sha256',required=True)
+        if action=='draft':q.add_argument('--output',required=True)
+        else:
+            q.add_argument('--request',required=True);q.add_argument('--request-sha256',required=True);q.add_argument('--review',required=True);q.add_argument('--review-sha256',required=True)
+            if action=='execute':q.add_argument('--evidence-dir',required=True)
+    a=p.parse_args(argv)
+    if a.action is None:
+        p.print_help();return 0
+    mb=binding(a.manifest,a.manifest_sha256)
+    if a.action=='draft':result=draft(mb,a.output)
+    else:
+        rb=binding(a.request,a.request_sha256);vb=binding(a.review,a.review_sha256)
+        if a.action=='validate':
+            _,_,request,_,gate,_=validate(rb,mb,vb);result={'schema':'e5-stage2-host-validation-v1','valid_contract':True,'boot_id':request['boot_id'],'txid':request['txid'],
+                'expires_at':request['expires_at'],'device_io_performed':False,'device_execution_authorized':False}
+        else:result=execute(rb,mb,vb,a.evidence_dir)
+    print(json.dumps(result,indent=2));return 0
+if __name__=='__main__':
+    try:raise SystemExit(main())
+    except Exception as e:print(json.dumps({'error':type(e).__name__,'reason':str(e),'automatic_retry_or_cleanup':False}),file=sys.stderr);raise SystemExit(70)

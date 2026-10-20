@@ -1,0 +1,91 @@
+"""Real reviewed closure engine on host fixtures; no current-state or device mutations."""
+import test_regression as t
+import ast,copy,datetime as dt,hashlib,importlib.util,json,sys,unittest
+from pathlib import Path
+from unittest.mock import patch
+c=t.c
+ROOT=Path(__file__).resolve().parents[2]
+SOURCE=ROOT/'tools/e5_closed_fd_stop_prepare_20261019'
+
+def load(name,path):
+ spec=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(spec);sys.modules[name]=m;spec.loader.exec_module(m);return m
+
+class ClosureBindingTests(unittest.TestCase):
+ @classmethod
+ def setUpClass(cls):
+  cls.api=c._closure_api()
+  old=sys.modules.get('closure');sys.modules['closure']=cls.api
+  try:cls.fixture=load('_sim_closure_host_fixture',SOURCE/'test_closure.py').Fixture
+  finally:
+   if old is None:sys.modules.pop('closure',None)
+   else:sys.modules['closure']=old
+ def setUp(self):
+  self.f=self.fixture();self.addCleanup(self.f.tmp.cleanup)
+  # Give the synthetic prior barrier the same identity fields that the real
+  # common snapshot requires; never edit an actual shared-state file.
+  prior=self.f.e.parent_view
+  for name,value in prior['fixture_barriers'].items():
+   layer=prior
+   while Path(layer['barrier']['path']).name!=name:layer=layer['prior_closure']
+   value.update(serial='TEST123',boot_id=layer['excluded_boot_id'],txid=layer['retired_txid'])
+   self.f.save('state/'+name,value);layer['barrier']['sha256']=self.f.pin(self.f.state/name)['sha256']
+  self.f.e.close()
+  for p in (patch.object(self.api,'validate_closed',side_effect=lambda state,ledger:self.f.e.closed()),
+            patch.object(c,'_closure_api',return_value=self.api),patch.object(c,'STATE',self.f.state),
+            patch.object(c,'LEDGER',self.f.e.ledger),patch.object(c,'SERIAL','TEST123')):
+   p.start();self.addCleanup(p.stop)
+ def marker(self,name):
+  (self.f.state/name).write_bytes(c.canonical({'serial':'TEST123','boot_id':'00000000-0000-4000-8000-000000000001','txid':'b'*16})+b'\n')
+ def test_closed_snapshot_preserves_actual_barrier_and_retired_identity(self):
+  s=c.state_snapshot();c.normal_state(s);c.recovery_state(s)
+  self.assertIn(self.f.case['txid'],s['used_txids']);self.assertIn(self.f.case['boot_id'],s['previous_boots'])
+  self.assertNotEqual(s['markers']['RECOVERY_PENDING.json'],'ABSENT')
+  self.assertNotEqual(s['markers']['RECOVERY_TRANSITION.json'],'ABSENT')
+  self.assertNotEqual(s['markers']['RECOVERY_REPAIR_TRANSITION.json'],'ABSENT')
+  self.assertNotEqual(s['markers']['RECOVERY_LIFECYCLE_TRANSITION.json'],'ABSENT')
+  self.assertNotEqual(s['markers']['RECOVERY_POSTDEPLOY_TRANSITION.json'],'ABSENT')
+  self.assertEqual(s['markers']['RECOVERY_CLOSED_FD_TRANSITION.json'],'ABSENT')
+  self.assertEqual(set(s['readonly_abort_closure']['retired_txids']),set(s['used_txids'])-{'a'*16})
+  self.assertTrue(s['readonly_abort_closure']['deployment_completed'])
+ def test_new_unknown_not_waived_by_old_closure(self):
+  self.marker('UNCERTAIN.json');s=c.state_snapshot()
+  with self.assertRaises(RuntimeError):c.normal_state(s)
+  c.recovery_state(s)
+ def test_new_transition_blocks_both_modes(self):
+  self.marker('RECOVERY_CLOSED_FD_TRANSITION.json');s=c.state_snapshot()
+  for fn in (c.normal_state,c.recovery_state):
+   with self.assertRaises(RuntimeError):fn(s)
+ def test_receipt_tampering_refused(self):
+  (self.f.e.archive/self.api.RECEIPT).write_bytes(b'{}')
+  with self.assertRaises(RuntimeError):c.state_snapshot()
+ def test_missing_barrier_refused(self):
+  (self.f.state/self.api.PENDING).rename(self.f.state/'retained.fixture')
+  with self.assertRaises(OSError):c.state_snapshot()
+ def test_retired_snapshot_identity_cannot_be_omitted(self):
+  s=c.state_snapshot();s['used_txids']=[]
+  with self.assertRaises(RuntimeError):c.normal_state(s)
+ def test_marker_hashes_keeps_original_three_plus_ledger_contract(self):
+  s=c.state_snapshot();v=c.marker_hashes(s)
+  self.assertEqual(set(v),{'ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','boot_ledger'})
+  self.assertNotIn('RECOVERY_PENDING.json',v)
+
+class MechanicalBindingTests(unittest.TestCase):
+ def test_exact_reviewed_state_functions(self):
+  old=(Path(c.dependencies()['no_sim_family']['path'])/'common.py').read_text();new=Path(c.__file__).read_text()
+  def node(source,name):return ast.dump(next(n for n in ast.parse(source).body if isinstance(n,ast.FunctionDef) and n.name==name),include_attributes=False)
+  for n in ('state_snapshot','normal_state','recovery_state','_closure_api'):self.assertEqual(node(old,n),node(new,n))
+ def test_bound_new_dependencies_real_material(self):
+  d=c.dependencies();self.assertEqual(d['core_path'],str(c.LIVE));self.assertIn('closure_case',d)
+  self.assertEqual(d['core_pins'],c.PINS)
+ def test_unchanged_SIM_and_NV_and_write_and_budget_algorithms(self):
+  old=ROOT/'tools/e5_sim_rearm_prepare_20261015'
+  for name in ('observe.py','evidence_contract.py','recovery.py','rearm.py','sim_nv.py','nv_origin.py','nv_geometry.json','acceptance-contract.json'):
+   self.assertEqual((old/name).read_bytes(),(c.HERE/name).read_bytes(),name)
+ def test_900_second_limit_and_all_gates_remain_disabled(self):
+  self.assertFalse(t.o.DEVICE_IO_ENABLED);self.assertTrue(t.arm.REARM_IO_DISABLED)
+  self.assertTrue(c.sibling('sim_nv').NV_IO_DISABLED)
+  now=c.now()
+  with self.assertRaises(RuntimeError):c.remaining({'captured_at':(now-dt.timedelta(seconds=901)).isoformat()},now)
+  with self.assertRaisesRegex(RuntimeError,'IO_DISABLED'):t.arm.run({}, {},'/unused')
+
+if __name__=='__main__':unittest.main(verbosity=2)

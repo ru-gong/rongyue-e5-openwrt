@@ -1,0 +1,26 @@
+# 固定三助手的有界准备包装器
+
+本目录修复已批准 owner 锁及前三助手上传的超时实现差异。`bounded_provision.py` 的 `PROVISION_IO_DISABLED=True`；无 CLI/env/调用参数开启方式。未访问设备/VM，未运行 enabled 模块或 native binary，未改变冻结 v3/live adapter、transport 或 probe。未来需独立审查的单门 enabled 副本，不能直接修改此文件或临时 patch gate。
+
+唯一未来接口：`BoundedProvision(exact_live_adapter).run()`。必须是 SHA 固定的真实 `AndroidDirectoryAdapter`，不是 subclass/替代 backend。adapter 自身仍强制显式取消事件、有限阶段 monotonic deadline、固定串号/boot/txid、正常 transport/shared state；恢复与 reconciliation 模式拒绝。本包装器不绕过任何运行门。材料 hashes 不是新的设备操作授权。
+
+固定写集恰为已约定的锁和三助手：
+
+- `/data/local/tmp/e5-clean-directory.lock` 及其 `owner`，0700/0600，owner 为当前16hex txid加换行。
+- `/data/local/tmp/e5-clean-scanner.<txid>`，固定707752B/SHA f6c39e…72c0c。
+- `/data/local/tmp/e5-clean-io.<txid>`，固定708592B/SHA 0837b1…efc05。
+- `/data/local/tmp/e5-clean-helper.<txid>`，固定707896B/SHA ab43a8…07539。
+
+完整路径、长度、SHA、Artifact类在源码固定，不接收自由目标或文件参数。它不上传第四probe，不调用native/scanner/probe，不写/data/e5linux或块分区，不创建stage，不重启。
+
+所有host材料先校验，再检查三层父目录类型/同文件系统/实际identity、锁和三个目标全部不存在。父目录可以是已观察的shell uid，不能凭名字假定root；前后dev/inode/mode/uid/gid必须一致。新锁和owner必须root，owner字节/SHA/完整stat固定。任何预存锁或助手都拒绝，这里没有续用、接管、重复执行或覆盖模式。
+
+整个mkdir+owner脚本及每个helper的cat+长度校验+chmod700脚本各自套远端BusyBox `timeout -s TERM 6`。每次修改前检查绝对/proc/uptime期限，mkdir后owner写前再次检查；上传EOF后chmod前再次检查，chmod后亦检查。标准adapter的只读身份guard位于包装脚本之外，仍受host8s限制；不能声称被阻塞的guard/内核syscall必在远端6s内消失。
+
+每个修改均通过真实adapter._request(mutating=True,followup=...)。同一ACTIVE内独立读取完整helper raw和第二次远端SHA，核文件类型、长度、单链接、mode0700/root、固定filesystem和前后stat，再核父链/lock/owner。最后一项的ACTIVE还重核三助手全bytes/SHA/metadata，并保存fsync后的主机结果。没有把本地SHA代替设备读回，也没有修改既有read allowlist。
+
+成功必须同时满足 `BOUNDED_PROVISION_RESULT.json`、其中4个op_id分别对应transport COMPLETE、无ACTIVE/UNKNOWN/UNCERTAIN或recovery barrier。结果文件会先于最后COMPLETE持久，因此结果文件单独存在不算成功。取消、SIGINT/TERM导致的异常、超时、EOF/ACK异常、身份/内容变化、证据落盘失败均保留UNKNOWN，停止后续动作；不清理、重试或恢复。新的wrapper实例也不能绕过共享barrier或远端exclusive创建。host杀adb不证明远端cat、fsync或内核IO已退出。bootstrap未调用远端fsync，不宣称助手/锁断电持久；未来使用前仍核完整bytes。
+
+`python3 -B -m unittest -v test_bounded_provision` 为21项host/fake测试，导入生产模块前禁止所有process/socket。覆盖禁用、exact class、普通模式、预存目标、三件材料预检、每步timeout停、SHA/metadata漂移、取消、落盘失败、result先于COMPLETE、真实快照parser、父目录shell UID与漂移、脚本timeout/noclobber/EOF期限。fake只验证状态机/边界，未证明Android shell、权限、6秒吞吐或硬件行为。未重复已有transport/native大套。
+
+在主序列中，本包装器替代旧 `adapter.acquire(); adapter.upload_helper()` 的实际调用；完成后才调用现有 `adapter.occupancy()` 校准、第四probe、完整目录备份。原 frozen 方法保留不动，不能把它们与新包装器交错使用。详见 `evidence/clean-reinstall-v3-execution-20261014/session-01/PROVISION_READONLY_SEQUENCE.md`。

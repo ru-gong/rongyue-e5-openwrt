@@ -1,0 +1,39 @@
+import fcntl,json,os,subprocess,sys,tempfile,unittest
+from pathlib import Path
+import checkpoint as c
+
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(prefix='e5-checkpoint-test-');self.addCleanup(self.tmp.cleanup)
+  self.root=Path(self.tmp.name);self.op=self.root/'000001-clock';self.op.mkdir()
+  self.begin={'status':'IN_FLIGHT','op_id':'a'*32,'label':'clock','mutating':False,'payload_bytes':0}
+  self.write('IN_FLIGHT.json',self.begin);self.write('COMPLETE.json',dict(self.begin,status='COMPLETE',validated=True))
+  self.write('transport-result.json',{'failure':None,'returncode':0,'host_child_reaped':True})
+ def write(self,name,v):(self.op/name).write_text(json.dumps(v))
+ def test_default_disabled(self):self.assertFalse(c.ENABLED)
+ def test_complete_request(self):self.assertEqual(len(c.completed_requests(self.root)),1)
+ def test_missing_complete(self):
+  (self.op/'COMPLETE.json').unlink()
+  with self.assertRaises(Exception):c.completed_requests(self.root)
+ def test_mismatched_complete(self):
+  self.write('COMPLETE.json',dict(self.begin,status='COMPLETE',validated=False))
+  with self.assertRaises(RuntimeError):c.completed_requests(self.root)
+ def test_failed_transport(self):
+  self.write('transport-result.json',{'failure':'timeout','returncode':0,'host_child_reaped':True})
+  with self.assertRaises(RuntimeError):c.completed_requests(self.root)
+ def test_unreaped_transport(self):
+  self.write('transport-result.json',{'failure':None,'returncode':0,'host_child_reaped':False})
+  with self.assertRaises(RuntimeError):c.completed_requests(self.root)
+ def test_mutation_requires_readback(self):
+  self.begin['mutating']=True;self.write('IN_FLIGHT.json',self.begin);self.write('COMPLETE.json',dict(self.begin,status='COMPLETE',validated=True))
+  with self.assertRaises(RuntimeError):c.completed_requests(self.root)
+ def test_kernel_lock_denies_next_worker_before_dispatch(self):
+  p=self.root/'LOCK';fd=os.open(p,os.O_RDWR|os.O_CREAT,0o600)
+  try:
+   fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+   script='import fcntl,sys;from pathlib import Path;f=open(sys.argv[1],"r+");fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB);Path(sys.argv[2]).write_text("DISPATCHED")'
+   r=subprocess.run([sys.executable,'-c',script,str(p),str(self.root/'DISPATCH')],capture_output=True,timeout=3)
+   self.assertNotEqual(r.returncode,0);self.assertFalse((self.root/'DISPATCH').exists())
+  finally:os.close(fd)
+
+if __name__=='__main__':unittest.main(verbosity=2)

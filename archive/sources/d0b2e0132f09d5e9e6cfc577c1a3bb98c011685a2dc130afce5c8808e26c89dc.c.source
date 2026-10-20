@@ -1,0 +1,31 @@
+/* Read-only Android/Linux probe. Build static for aarch64 Linux, not macOS.
+ * ENODATA alone means no fscrypt policy; unsupported/error stays unknown.
+ * Linux UAPI <linux/fscrypt.h>, FS_IOC_GET_ENCRYPTION_POLICY_EX.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <linux/fscrypt.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2 || strncmp(argv[1], "/data/", 6) || strstr(argv[1], "/../")) return 2;
+    int fd = open(argv[1], O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0) { perror("open"); return 3; }
+    struct stat st;
+    if (fstat(fd, &st) || (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))) {
+        close(fd); return 4;
+    }
+    struct fscrypt_get_policy_ex_arg arg = {0};
+    arg.policy_size = sizeof(arg.policy);
+    int rc = ioctl(fd, FS_IOC_GET_ENCRYPTION_POLICY_EX, &arg);
+    int saved = errno;
+    close(fd);
+    if (rc == 0) { puts("encrypted"); return 10; }
+    if (saved == ENODATA) { puts("unencrypted"); return 0; }
+    errno = saved; perror("policy unknown"); return 11;
+}

@@ -1,0 +1,139 @@
+# Native occupancy and directory gates — offline preparation
+
+These sources are deliberately disabled for production execution by the literal
+`DEVICE_EXECUTION_ENABLED = 0`. Environment variables and compiler flags do not
+enable that path. Host tests build a separate fixture-only path. No Android,
+ADB, USB, phone SSH or target execution was used. Initial tests ran on macOS;
+a subsequent existing local Colima VM performed Linux AArch64 compilation and
+synthetic host tests only.
+
+The reviewed caller must pin source/build artifacts, hold its transaction lock,
+bind a fresh boot ID and an independent 32-character operation ID, and record
+the raw JSONL. Neither helper is a standalone authorization mechanism. A new
+enabled build, integration review and device validation would still be needed.
+
+## Read-only scanner
+
+```
+native_occupancy_scanner scan TXID BOOT_UUID OPID32 DEADLINE_BOOTTIME_MS
+```
+
+TXID is exactly 16 lowercase hex characters; OPID32 is 32 lowercase hex
+characters. The deadline is absolute `CLOCK_BOOTTIME` milliseconds, greater
+than current time and at most 7,000 ms away. A host deadline of 8 seconds is
+separate. Host tests use C/Python `CLOCK_MONOTONIC` explicitly; Python's generic
+`time.monotonic()` is not assumed to have the same epoch on macOS.
+
+The scanner reads `/proc` and each leader's `task` list, checks every discovered
+TID's starttime and kernel-thread flag, deduplicates mountinfo by mount namespace
+identity, and inspects every TID's FD links, cwd and root. It checks both the
+mount root and mount point after decoding Linux mountinfo escapes. It also
+checks global loop backing paths. Protected paths are the four exact roles:
+
+* `/data/e5linux`
+* `/data/e5linux.stage.TXID`
+* `/data/e5linux.archive.TXID`
+* `/data/e5linux.failed.TXID`
+
+The corresponding filesystem-root paths (`/e5linux...`) are recognized too.
+The scanner walks existing role trees without reading contents, records their
+device/inode pairs, and checks FD and loop aliases against those pairs. A role
+tree must be on the same filesystem, with only directories and singleton
+regular files. Known paths including a deleted suffix are busy.
+
+Limits are 4,096 distinct task IDs, 131,072 FD observations, 256 distinct mount
+namespaces, 1 MiB per mountinfo file, 32 MiB of total text reads, 128 loop nodes,
+1,024 protected tree entries and depth 16. Exceeding a limit is failure, not
+partial success. Fields called `processes` in the v1 JSON count checked TIDs.
+Kernel threads may lack namespace/cwd/root links only when PF_KTHREAD and
+stable starttime are known and their FD list is empty. An unconfigured loop is
+accepted only if the loop node exists and its entire loop-attribute directory
+is absent; a missing backing file inside an existing attribute directory fails.
+
+Task lists are enumerated again at the end. A disappearing process/FD, changed
+task set, changed PID starttime or mount namespace, malformed/unreadable input,
+busy target, deadline or cancellation yields an incomplete result. There is no
+automatic retry and no race exception that silently skips a process. A natural
+exit is not itself a device fault; it simply makes this scan inconclusive.
+
+JSONL schema `e5-native-occupancy-v1` emits `BEGIN`, `PHASE`, final `RESULT` with
+txid/opid/boot_id/self_pid/self_starttime/deadline, coverage counts, failure phase,
+PID/FD and `unknown`. Accept only exit 0, a single final `RESULT`, matching all
+bindings and `complete: true`, `unknown: []`. It is explicitly **not an atomic
+snapshot** or proof that no process can open the directory after the scan.
+The caller must keep exclusive ownership and recheck immediately before a
+directory mutation, along with its independent tree/manifest/boot checks.
+
+## Directory seal / no-replace rename
+
+```
+device_directory_helper ACTION TXID BOOT_UUID OPID32 DEADLINE_BOOTTIME_MS DATA_DEV DATA_INO SOURCE_DEV SOURCE_INO ROLE
+```
+
+Actions are exactly `seal`, `move-active-to-archive`, `move-stage-to-active`,
+`move-active-to-failed`, `move-archive-to-active`. ROLE must be the exact source
+role (or selected role for seal). All actions, including seal, require the same
+maximum 7-second absolute deadline. The fixed directory names, layouts,
+device/inode matching, singleton-file rules, 256 entries/depth 8 limits,
+file/directory/parent fsync and `RENAME_NOREPLACE`/`RENAME_EXCL` behavior are
+retained. Unsupported no-replace operations stop without fallback.
+
+TERM, INT, HUP and PIPE set a cancellation flag. Every tree iteration and each
+fsync has control checks before and after it. Boot ID is checked before opening,
+before rename and before a success result. Immediately before rename, the
+helper blocks cancellation signals briefly, examines pending cancellation,
+checks the deadline, and calls no-replace once. It records whether the syscall
+was attempted and whether it returned success before unblocking signals.
+
+Cancellation observed before this final admission prevents rename. A signal
+that races an already committed syscall cannot undo it: the tool returns an
+error with `mutation_attempted: true`, and `renamed: true` when success was
+observed. It never retries or rolls back. Failed/lost replies after mutation
+admission require a new read-only inspection; `renamed: false` alone does not
+prove an attempted syscall had no effect.
+
+JSONL schema `e5-native-directory-v3` emits `BEGIN`, `PHASE`, final `RESULT`.
+Accept only exit 0, matching bindings and final `ok: true`,
+`fsync_completed: true`, `outcome: COMPLETED`. Any post-admission failure is
+`UNKNOWN_AFTER_MUTATION_ATTEMPT`. A successful fsync sequence is not an empirical
+power-loss guarantee (`power_loss_safety_proven: false`). A blocked kernel I/O
+may outlive the host timeout or resist cancellation: the host must retain
+UNKNOWN and establish process quiescence before another writer. These helpers
+do not bypass a watchdog or assert that killing a host process killed Android.
+
+## Host validation and limits
+
+`test_native_occupancy_scanner.py`: 35 synthetic proc/sys fixture tests.
+`test_device_directory_helper.py`: 37 real temporary-filesystem tests.
+Both compile with `-std=c11 -Wall -Wextra -Werror -O2`, test disabled production
+entrypoints and restrict subprocesses to the compiler and produced host test
+binaries. Tests include actual TERM/INT/HUP delivery, elapsed native deadlines,
+alias/namespace checks, unknown task/FD coverage, no-replace and fsync failures,
+and post-rename cancellation with preserved moved state.
+
+Scanner fixtures are only canonical `/tmp/e5-native-test-*/sandbox` (Darwin
+`/private/tmp` spelling accepted). Helper fixtures are only canonical
+`/tmp/e5-directory-test-*/data`. Test boot IDs are fixture files and test
+`self_starttime` is explicitly synthetic 1. Fault hooks exist only in host-test
+builds. No host test measures Android scan latency, kernel/fsync cancellation,
+power loss, F2FS durability or integration with the eventual live adapter.
+
+## Linux build and single-chunk I/O integration
+
+`research/author-clean-reinstall-20261014/helper-build-v3/build.json` binds
+three static AArch64 **DISABLED** executables, source hashes, compiler arguments,
+ELF inspection, exit-70 disabled-entry probes and Linux test logs. The same
+final sources pass 39 I/O + 35 scanner + 37 directory tests on macOS and Linux.
+The Linux build required only GCC warning cleanup in addition to the substantive
+cancellation gates; no warning was disabled. Production constant folding can
+remove unreachable implementations, so these disabled binaries do not prove
+algorithm execution; separate fixture-only builds exercise the algorithms.
+
+`native_io.c` is the parent's fixed single-chunk primitive. During review we
+added final signal/deadline admission around exclusive file creation and the
+single pwrite: pending cancellation refuses the syscall, while signals racing
+an already committed syscall yield ERROR / `possibly_modified: true`. Six new
+tests cover these boundaries. Its 6-second limit, fixed eight stage files,
+4 MiB chunks, exact p37 B slot and misc p3 offset 2048 length 32 remain unchanged.
+Because this reviewer contributed that patch, the final I/O source requires a
+separate review and is not presented as independently reviewed here.

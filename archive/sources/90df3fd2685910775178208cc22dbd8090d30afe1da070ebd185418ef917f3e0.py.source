@@ -1,0 +1,233 @@
+"""Host evidence and immutable v3 bindings; no device operation on import."""
+import datetime as dt
+import hashlib, importlib.util, json, os, re, sys, uuid
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2]
+HERE=Path(__file__).resolve().parent
+LIVE=ROOT/'tools/e5_nextphase_core_live_20890624cf33b6b6'
+NATIVE_LOCAL=ROOT/'tools/e5_clean_author_live_v3_20261014/native_io.aarch64.ENABLED'
+SERIAL='DEVICE_SERIAL_REDACTED'
+STATE=ROOT/('evidence/e5-clean-v3-device-state-'+SERIAL)
+LEDGER=ROOT/('evidence/.bounded-boot-v3-'+SERIAL)/'ledger.jsonl'
+HOST_LOCK=ROOT/('evidence/.e5-clean-directory-'+SERIAL+'.lock')
+PINS={'bounded_transport': '0000000000000000000000000000000000000000000000000000000000000000', 'bounded_boot_control': '0000000000000000000000000000000000000000000000000000000000000000', 'uncertainty_recovery': '0000000000000000000000000000000000000000000000000000000000000000', 'android_directory_adapter': '0000000000000000000000000000000000000000000000000000000000000000'}
+ADB=Path('/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb')
+ADB_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+NATIVE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+ORIGINAL_B=ROOT/'evidence/stage2-execution-20261013/android-install-01/boot_b.before.bin'
+ORIGINAL_MISC=ROOT/'evidence/stage2-execution-20261013/android-install-01/misc.before.bin'
+MARKERS=('ACTIVE.json', 'UNCERTAIN.json', 'RECOVERY_ONLY.json', 'RECOVERY_PENDING.json', 'RECOVERY_TRANSITION.json', 'RECOVERY_REPAIR_TRANSITION.json', 'RECOVERY_LIFECYCLE_TRANSITION.json', 'RECOVERY_POSTDEPLOY_TRANSITION.json', 'RECOVERY_CLOSED_FD_TRANSITION.json', 'RECOVERY_NEW_SLOT_REPAIR_TRANSITION.json')
+class Refusal(RuntimeError):pass
+def require(ok,why):
+ if not ok:raise Refusal(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def canonical(x):return json.dumps(x,sort_keys=True,separators=(',',':')).encode()
+def now():return dt.datetime.now(dt.timezone.utc)
+def timestamp(s):
+ v=dt.datetime.fromisoformat(s);require(v.tzinfo is not None,'timezone required');return v
+def validsha(s):return isinstance(s,str) and re.fullmatch('[0-9a-f]{64}',s) is not None
+def validboot(s):
+ require(isinstance(s,str) and str(uuid.UUID(s))==s,'boot UUID');return s
+def validtx(s):require(isinstance(s,str) and re.fullmatch('[0-9a-f]{16}',s),'tx16');return s
+def read(p,digest=None,size=None):
+ p=Path(p);require(p.is_absolute() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'unsafe path')
+ st=p.stat();require(p.is_file() and st.st_nlink==1,'single regular file required');raw=p.read_bytes()
+ require((digest is None or sha(raw)==digest) and (size is None or len(raw)==size),'hash/length differs');return raw
+def binding(p):p=Path(p);return {'path':str(p),'sha256':sha(read(p))}
+def obj(b):
+ require(isinstance(b,dict) and set(b)=={'path','sha256'} and validsha(b['sha256']),'binding fields')
+ require(Path(b['path']).stat().st_size<=4<<20,'metadata cap');return json.loads(read(b['path'],b['sha256']))
+def sync(p):
+ fd=os.open(p,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:os.fsync(fd)
+ finally:os.close(fd)
+def output(p):
+ p=Path(p);require(p.is_absolute() and p.is_relative_to(ROOT/'evidence') and not p.exists() and not p.is_symlink() and all(not q.is_symlink() for q in p.parents),'new evidence output required');p.mkdir(mode=0o700);sync(p.parent);return p
+def save(p,value):
+ p=Path(p);raw=value if isinstance(value,bytes) else canonical(value)+b'\n';fd=os.open(p,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+ sync(p.parent);return binding(p)
+def ledger_rows():
+ if not LEDGER.exists():require(not LEDGER.is_symlink(),'dangling ledger');return [],'0'*64,'ABSENT'
+ raw=read(LEDGER);require(raw.endswith(b'\n') or not raw,'torn ledger');head='0'*64;rows=[]
+ for line in raw.splitlines():
+  row=json.loads(line);v=dict(row);digest=v.pop('chain_sha256');require(v['seq']==len(rows) and v['previous']==head and sha(canonical(v))==digest,'ledger chain');head=digest;rows.append(row)
+ return rows,head,sha(raw)
+def state_snapshot():
+ require(STATE.is_dir() and not STATE.is_symlink() and all(not p.is_symlink() for p in STATE.parents),'fixed shared state')
+ statebinding=obj(binding(STATE/'STATE_BINDING.json'));require(statebinding=={'schema':'e5-transport-state-v1','serial':SERIAL},'state serial')
+ markers={};boots=set();txs=set()
+ for name in MARKERS:
+  p=STATE/name
+  if not p.exists():require(not p.is_symlink(),'dangling marker');markers[name]='ABSENT';continue
+  b=binding(p);v=obj(b);require(v.get('serial')==SERIAL,'marker serial');markers[name]=b
+  boot=v.get('boot_id') or v.get('context',{}).get('boot_id');tx=v.get('txid') or v.get('context',{}).get('txid')
+  require(boot is not None,'marker missing boot');boots.add(validboot(boot))
+  if tx is not None:txs.add(validtx(tx))
+ rows,head,digest=ledger_rows();starts=[x for x in rows if x['event']=='START']
+ if starts:boots.add(validboot(starts[-1]['boot_id']))
+ txs.update(validtx(x['txid']) for x in rows if 'txid' in x)
+ snapshot={'schema':'e5-next-state-v1','serial':SERIAL,'state_path':str(STATE),'state_binding':binding(STATE/'STATE_BINDING.json'),'markers':markers,'ledger_sha256':digest,'ledger_head':head,'ledger_rows':len(rows),'ledger_last_event':rows[-1]['event'] if rows else None,'previous_boots':sorted(boots),'used_txids':sorted(txs)}
+ return _closure_api().augment_snapshot(snapshot,STATE,LEDGER)
+def assert_state(snapshot):require(snapshot==state_snapshot(),'shared state/ledger changed')
+def marker_hashes(snapshot):return {n:(snapshot['markers'][n] if snapshot['markers'][n]=='ABSENT' else snapshot['markers'][n]['sha256']) for n in MARKERS[:3]}|{'boot_ledger':snapshot['ledger_sha256']}
+def normal_state(s):
+ _closure_api().snapshot_gate(s,STATE,LEDGER,normal=True)
+def recovery_state(s):_closure_api().snapshot_gate(s,STATE,LEDGER,normal=False)
+def load_runtime():
+ dependencies()
+ for name,digest in PINS.items():read(LIVE/(name+'.py'),digest)
+ modules={}
+ for name in ('bounded_transport','bounded_boot_control','uncertainty_recovery'):
+  p=LIVE/(name+'.py');old=sys.modules.get(name)
+  if old is not None:require(Path(old.__file__).resolve()==p,'module conflict');module=old
+  else:
+   spec=importlib.util.spec_from_file_location(name,p);module=importlib.util.module_from_spec(spec);sys.modules[name]=module;spec.loader.exec_module(module)
+  modules[name]=module
+ return modules
+def material_check(b):
+ p=b.profile();read(ORIGINAL_B,p['original_boot_b_sha256'],b.BOOT_BYTES);read(ORIGINAL_MISC,p['original_misc_sha256'],b.MISC_BYTES);read(NATIVE_LOCAL,NATIVE_SHA);read(ADB,ADB_SHA);return p
+def backend(m,boot,tx,evidence,cancel,helper_tx,readonly=False,context=None):
+ raise Refusal("generic restore/directory backend is unavailable in SIM-only package")
+ validtx(helper_tx);t=m['bounded_transport'].BoundedTransport(evidence,STATE,SERIAL,boot,tx,cancel_event=cancel,recovery_context=context,reconciliation_only=readonly,recovery_source_sha=PINS['uncertainty_recovery'] if readonly or context else None)
+ pins={'adb':ADB_SHA,'bounded_transport':PINS['bounded_transport'],'bounded_boot_control':PINS['bounded_boot_control'],'native_sha256':NATIVE_SHA,'directory_adapter':PINS['android_directory_adapter'],'uncertainty_recovery':PINS['uncertainty_recovery']}
+ return m['bounded_boot_control'].NativeBackend(t,ADB,'/data/local/tmp/e5-clean-io.'+helper_tx,NATIVE_SHA,tx,boot,pins)
+def remaining(rec,at=None):
+ age=((at or now())-timestamp(rec['captured_at'])).total_seconds();require(0<=age<900,'fresh raw snapshot required');return 900-age
+
+def sibling(name):
+ key='_e5_sim_'+name;path=HERE/(name+'.py')
+ if key in sys.modules:
+  module=sys.modules[key];require(Path(module.__file__).resolve()==path,'sibling module conflict');return module
+ spec=importlib.util.spec_from_file_location(key,path);module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module);return module
+
+def verify_manifest(expected_sha):
+ require(validsha(expected_sha),'explicit tool-manifest SHA required')
+ manifest=obj({'path':str(HERE/'MANIFEST.json'),'sha256':expected_sha})
+ require(manifest.get('schema')=='e5-next-recovery-tools-v1','tool manifest schema')
+ for name,item in manifest['files'].items():
+  require(Path(name).name==name,'manifest filename');read(HERE/name,item['sha256'],item['bytes'])
+ return manifest
+
+
+# Historical boot identity only; never a fresh lease or device authorization.
+ANCHOR_ROOT=ROOT/'evidence/scanner-repair-readonly-20261015'
+READ_DIR=ANCHOR_ROOT/'readonly-reconcile-20261015T031119Z-36afcb2dbab84e09'
+COLD_DIR=ANCHOR_ROOT/'cold-diagnostic-20261015T025834Z-3a867796'
+ANCHOR={'path':str(READ_DIR/'READONLY_RESULT.json'),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'}
+ANCHOR_COLD={'path':str(COLD_DIR/'COMPLETE.json'),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'}
+ANCHOR_COLD_REVIEW={'path':str(COLD_DIR/'COLD_READONLY_REVIEW.json'),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'}
+ANCHOR_READ_REVIEW={'path':str(READ_DIR/'POST_READONLY_INDEPENDENT_REVIEW.json'),'sha256':'0000000000000000000000000000000000000000000000000000000000000000'}
+ANCHOR_BOOT='00000000-0000-4000-8000-000000000001'
+BOOT_LINEAGE_MAX_DEPTH=8
+_boot_lineage_stack=[]
+
+def _lineage_unstopped(folder):
+ for n in ('STOP','STOP.json','INVALID_NOT_READY.json'):
+  p=folder/n;require(not p.exists() and not p.is_symlink(),'historical observation stopped')
+
+def _anchor(binding):
+ require(binding==ANCHOR,'initial history must be the exact captured readonly anchor')
+ result=obj(binding);cold=obj(ANCHOR_COLD);cr=obj(ANCHOR_COLD_REVIEW);rr=obj(ANCHOR_READ_REVIEW)
+ require(all(x['serial']==SERIAL and x['boot_id']==ANCHOR_BOOT for x in (result,cold,cr,rr)),'anchor device/boot mismatch')
+ require(result['schema']=='e5-recovery-entry-readonly-v1' and result['device_writes'] is False and result['native_helpers_executed'] is False,'anchor readonly scope')
+ require(result['cold_complete']==ANCHOR_COLD and result['cold_review']==ANCHOR_COLD_REVIEW and cr['cold_complete']==ANCHOR_COLD,'anchor cold linkage')
+ require({k:rr['readonly_result'][k] for k in ('path','sha256')}==binding and rr['cold_review']==ANCHOR_COLD_REVIEW and
+           {k:rr['reconciliation'][k] for k in ('path','sha256')}==result['reconciliation'],'anchor independent review linkage')
+ require(rr['schema']=='e5-post-readonly-independent-review-v1' and rr['status']=='READONLY_CAPTURE_COMPLETE_VERIFIED_NOT_WRITE_APPROVAL' and rr['block_writes_allowed'] is False,'anchor review scope')
+ rec=obj(result['reconciliation']);require(rec['boot_id']==ANCHOR_BOOT and rec['serial']==SERIAL and rec['complete'] is True,'anchor reconciliation')
+ _lineage_unstopped(READ_DIR);_lineage_unstopped(COLD_DIR)
+ return {'boot_id':ANCHOR_BOOT,'observed_boots':sorted({ANCHOR_BOOT,validboot(cold['old_boot_id'])}),'evidence':binding,'kind':'fixed-reviewed-readonly-anchor','historical_only':True,'freshness_or_execution_granted':False}
+
+def validate_boot_observation(binding,at=None):
+ """Derive the most recent supplied boot from pinned evidence, never a caller UUID.
+
+Cold sources are replayed as historical records with no current-state equality
+or age lease. A readonly source additionally binds its producer and completed
+reconciliation to that cold boot; its old block data is not a new preimage.
+"""
+ at=at or now();value=obj(binding);key=(binding['path'],binding['sha256'])
+ require(key not in _boot_lineage_stack and len(_boot_lineage_stack)<BOOT_LINEAGE_MAX_DEPTH,'cyclic or too deep boot lineage')
+ _boot_lineage_stack.append(key)
+ try:
+  if binding==ANCHOR:return _anchor(binding)
+  external=historical_external(binding,at)
+  if external is not None:return external
+  e=sibling('evidence_contract');folder=Path(binding['path']).parent;_lineage_unstopped(folder)
+  if value.get('schema')=='e5-next-cold-observation-v1':
+   require(Path(binding['path']).name=='COMPLETE.json','historical cold filename')
+   cold,_,ended=e.cold_evidence(binding,at,check_state=False)
+   request=obj(cold['request']);prior=validate_boot_observation(request['previous_observation'],at)
+   boot=validboot(cold['boot_id']);require(boot not in prior['observed_boots'],'historical boot reused')
+   return {'boot_id':boot,'observed_boots':sorted(set(prior['observed_boots'])|{boot}),
+           'evidence':binding,'kind':'raw-cold-complete','historical_only':True,'freshness_or_execution_granted':False}
+  require(value.get('schema')=='e5-next-readonly-v1' and Path(binding['path']).name=='READONLY_RESULT.json','unsupported historical boot source')
+  require(value.get('serial')==SERIAL and value.get('purpose') in ('directory','recovery','rearm-with-sim') and
+            value.get('device_writes') is False and value.get('native_helpers_executed') is False,'historical readonly scope')
+  purpose=value['purpose'];gate=b'REARM_IO_DISABLED=True' if purpose=='rearm-with-sim' else b'RECOVERY_IO_DISABLED=True'
+  producer=HERE/('rearm.py' if purpose=='rearm-with-sim' else 'recovery.py')
+  require(value.get('producer_source_sha256') in e.source_variants(producer,gate) and value.get('source_pins')==PINS,'historical readonly producer')
+  env=value['cold_envelope'];prior=validate_boot_observation(env['cold_complete'],at);cold=obj(env['cold_complete'])
+  require(value['boot_id']==env['boot_id']==prior['boot_id'] and env['cold_request']==cold['request'] and env['serial']==SERIAL,'historical readonly cold linkage')
+  rec=obj(value['reconciliation']);tb=obj(value['transport_binding'])
+  require(value['reconciliation']['path']==str(folder/'raw/reconciliation.json') and value['transport_binding']['path']==str(folder/'transport/binding.json'),'historical readonly layout')
+  require(rec.get('schema')=='e5-boot-reconciliation-v3' and rec.get('serial')==SERIAL and rec.get('boot_id')==prior['boot_id'] and rec.get('complete') is True,'historical readonly incomplete')
+  require(tb.get('serial')==SERIAL and tb.get('boot_id')==prior['boot_id'] and tb.get('txid')==value['txid'] and tb.get('reconciliation_only') is True and tb.get('recovery_context') is None,'historical transport identity')
+  require(timestamp(rec['captured_at'])<=at,'future historical capture');_lineage_unstopped(folder/'transport')
+  return {**prior,'evidence':binding,'kind':'readonly-with-raw-cold-lineage'}
+ finally:_boot_lineage_stack.pop()
+
+def excluded_boots(request,snapshot,at=None):
+ prior=validate_boot_observation(request['previous_observation'],at)
+ require(request['previous_boot_id']==prior['boot_id'],'previous UUID differs from observed evidence')
+ return set(prior['observed_boots'])|{validboot(x) for x in snapshot['previous_boots']}
+
+DEPENDENCIES_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+def dependencies():
+ require(validsha(DEPENDENCIES_SHA),'UNBOUND budget dependencies; no runtime/foreign history allowed')
+ d=obj({'path':str(HERE/'DEPENDENCIES.json'),'sha256':DEPENDENCIES_SHA})
+ require(d.get('schema')=='e5-sim-rearm-dependencies-v1' and d.get('status')=='BOUND_EXACT_OFFLINE_MATERIAL','unbound dependency template')
+ require(d['core_path']==str(LIVE) and d['core_pins']==PINS,'core pins differ from compiled source')
+ for name,digest in PINS.items():read(LIVE/(name+'.py'),digest)
+ for name,key in (('workflow','workflow_sha256'),('nv_baseline','nv_baseline_sha256'),('android_directory_adapter','adapter_sha256')):read(LIVE/(name+'.py'),d['first_install_sources'][key])
+ manifest=obj(d['core_manifest']);require(Path(d['core_manifest']['path']).parent==LIVE,'core manifest location')
+ for name,digest in PINS.items():require(manifest['modules'][name]==digest,'manifest/core source pin mismatch')
+ for key in ('closure','closure_case'):
+  require(d.get(key)==manifest.get(key),'fixed closure support binding differs')
+  item=d[key];read(item['path'],item['sha256'],item['bytes'])
+ return d
+def historical_external(item,at):
+ value=obj(item)
+ if value.get('purpose')=='rearm-with-sim':return None
+ require(value.get('purpose') in ('directory','recovery'),'historical source purpose not recognized')
+ d=dependencies();family=d['no_sim_family'];folder=Path(family['path'])
+ require(folder.is_absolute() and folder.is_relative_to(ROOT/'tools'),'history family path')
+ manifest=obj(family['manifest'])
+ require(Path(family['manifest']['path']).parent==folder,'family manifest location')
+ require(set(family['files'])=={'common.py','observe.py','evidence_contract.py','recovery.py','rearm.py'},'exact historical source family')
+ for name,digest in family['files'].items():
+  read(folder/name,digest);require(manifest['files'][name]['sha256']==digest,'family source/manifest mismatch')
+ key='_e5_next_common';path=folder/'common.py'
+ if key in sys.modules:module=sys.modules[key];require(Path(module.__file__).resolve()==path,'foreign history module conflict')
+ else:
+  spec=importlib.util.spec_from_file_location(key,path);module=importlib.util.module_from_spec(spec);sys.modules[key]=module;spec.loader.exec_module(module)
+ # Pinned family's pure validator replays raw cold scripts/21 health/logs and
+ # recursively binds previous history. It does not import live transport.
+ result=module.validate_boot_observation(item,at)
+ require(result['historical_only'] is True and result['freshness_or_execution_granted'] is False,'history is never fresh authority')
+ return {**result,'kind':'fixed-nosim-family-history-only'}
+
+
+def _closure_api():
+    import hashlib as _h, stat as _s, types as _t
+    _p = Path('/REDACTED_HOST_PATH')
+    if _p.is_symlink() or any(x.is_symlink() for x in _p.parents):
+        raise RuntimeError('unsafe fixed closure source')
+    _before = _p.stat(); _raw = _p.read_bytes(); _after = _p.stat()
+    _identity = lambda s: (s.st_dev,s.st_ino,s.st_mode,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+    if not (_s.S_ISREG(_before.st_mode) and _before.st_nlink == 1 and
+            _identity(_before) == _identity(_after) and _h.sha256(_raw).hexdigest() == '0000000000000000000000000000000000000000000000000000000000000000'):
+        raise RuntimeError('fixed closure source pin changed')
+    _m = _t.ModuleType('_e5_fixed_readonly_closure'); _m.__file__ = str(_p)
+    exec(compile(_raw,str(_p),'exec'),_m.__dict__)
+    return _m

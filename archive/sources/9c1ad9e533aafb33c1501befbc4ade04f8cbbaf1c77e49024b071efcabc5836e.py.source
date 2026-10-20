@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""Explicit, separately reviewed directory/install steps. Never auto-advance.
+
+Default invocation only describes scope. Prepared source cannot perform device
+I/O. No command, environment variable, or request enables its literal gate.
+"""
+import argparse
+from datetime import datetime, timezone
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import threading
+import time
+
+WORKFLOW_IO_DISABLED = False
+BASE = Path(__file__).resolve().parent
+ROOT = BASE.parents[1]
+SERIAL = "DEVICE_SERIAL_REDACTED"
+MANIFEST = BASE / "SOURCE_MANIFEST.json"
+MANIFEST_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+PHASES = {"probe", "inventory", "backup", "stage", "activate", "rollback", "install"}
+MODULES = ("bounded_transport", "uncertainty_recovery", "android_directory_adapter",
+           "bounded_boot_control", "cold_bridge", "directory_session", "bounded_stage", "probe_host", "phase_evidence", "nv_baseline")
+
+
+class Refusal(RuntimeError):
+    pass
+
+
+def require(ok, why):
+    if not ok:
+        raise Refusal(why)
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+
+
+def sha(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def hash_file(path):
+    h = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def safe_file(path):
+    path = Path(path)
+    require(path.is_absolute() and not path.is_symlink() and
+            all(not p.is_symlink() for p in path.parents), "unsafe input path")
+    info = path.stat()
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, "input type or hardlink")
+    return path
+
+
+def json_binding(binding):
+    require(isinstance(binding, dict) and set(binding) == {"path", "sha256"}, "exact file binding required")
+    require(isinstance(binding["sha256"], str) and re.fullmatch("[a-f0-9]{64}", binding["sha256"]), "bad digest")
+    path = safe_file(binding["path"])
+    require(path.stat().st_size <= 4 << 20, "oversized JSON")
+    raw = path.read_bytes()
+    require(sha(raw) == binding["sha256"], "bound JSON changed")
+    return json.loads(raw)
+
+
+def save_new(path, value):
+    path = Path(path)
+    require(path.is_absolute() and not path.exists() and not path.is_symlink() and
+            all(not p.is_symlink() for p in path.parents), "new output path required")
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600), "wb") as f:
+        f.write(value if isinstance(value, bytes) else canonical(value) + b"\n"); f.flush(); os.fsync(f.fileno())
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def verify_materials():
+    require(MANIFEST_SHA != "0" * 64, "source manifest not yet frozen")
+    manifest = json_binding({"path": str(MANIFEST), "sha256": MANIFEST_SHA})
+    require(manifest.get("schema") == "e5-nextphase-core-sources-v1" and
+            manifest.get("device_execution_authorized") is False, "manifest boundary")
+    require(set(manifest["modules"]) == set(MODULES), "unexpected module set")
+    for name, digest in manifest["modules"].items():
+        require(hash_file(safe_file(BASE / (name + ".py"))) == digest, "core module changed: " + name)
+    verify_support_bindings(manifest)
+    require(set(manifest["artifacts"]) == {"adb", "scanner", "io_helper", "directory_helper", "probe"},
+            "helper set differs")
+    for name, binding in manifest["artifacts"].items():
+        require(set(binding) == {"path", "bytes", "sha256"}, "artifact binding fields")
+        path = safe_file(binding["path"])
+        require(path.stat().st_size == binding["bytes"] and hash_file(path) == binding["sha256"],
+                "artifact differs: " + name)
+    candidate = json_binding(manifest["candidate"])
+    require(candidate.get("approved_for_device_execution") is False and
+            candidate.get("schema") == "e5-clean-author-candidate-v1", "candidate authority")
+    require(set(manifest["stage_inputs"]) == set(candidate["outer_file_set"]), "stage set differs")
+    for name, item in manifest["stage_inputs"].items():
+        path = safe_file(item["path"])
+        expected = candidate["outer_file_set"][name]
+        require(item["bytes"] == expected["bytes"] and item["sha256"] == expected["sha256"] and
+                path.stat().st_size == item["bytes"] and hash_file(path) == item["sha256"], "stage source differs: " + name)
+    return manifest
+
+
+def verify_support_bindings(manifest):
+    schemas = {"deployment_manifest": "e5-next-scanner-artifact-manifest-v1",
+               "recovery_manifest": "e5-next-recovery-tools-v1",
+               "nv_geometry": "e5-fixed-nine-nv-geometry-v1",
+               "independent_candidate_review": "e5-independent-candidate-delivery-v1"}
+    for key, schema in schemas.items():
+        require(key in manifest, "missing supporting binding: " + key)
+        document = json_binding(manifest[key])
+        require(document.get("schema") == schema, "supporting schema differs: " + key)
+        if key == "independent_candidate_review":
+            require(document.get("decision") == "HOST_ARTIFACT_REVIEW_PASSED_ONLY" and
+                    document.get("approved_to_flash") is False and
+                    {k: document["candidate"][k] for k in ("path", "sha256")} == manifest["candidate"],
+                    "candidate review binding or boundary differs")
+
+
+def load_modules(manifest):
+    loaded = {}
+    for name in MODULES:
+        path = BASE / (name + ".py")
+        require(hash_file(safe_file(path)) == manifest["modules"][name], "source changed before import")
+        old = sys.modules.get(name)
+        if old is not None:
+            require(Path(old.__file__).resolve() == path, "foreign core module already loaded: " + name)
+            loaded[name] = old
+            continue
+        spec = importlib.util.spec_from_file_location(name, path)
+        mod = importlib.util.module_from_spec(spec); sys.modules[name] = mod
+        spec.loader.exec_module(mod); loaded[name] = mod
+    return loaded
+
+
+def request_binding(request):
+    return sha(canonical({k: v for k, v in request.items() if k != "technical_review"}))
+
+
+def validate_request(binding, now=None):
+    now = now or datetime.now(timezone.utc)
+    r = json_binding(binding)
+    require(set(r) == {"schema", "phase", "serial", "boot_id", "txid", "total_seconds", "manifest_sha256", "runner_sha256",
+                       "cold_ready", "requirements", "inputs", "evidence_directory", "user_confirmation", "technical_review"}, "workflow request fields")
+    require(r["schema"] == "e5-nextphase-workflow-request-v1" and r["phase"] in PHASES and r["serial"] == SERIAL,
+            "workflow phase or device")
+    require(re.fullmatch("[a-f0-9]{16}", r["txid"]) and
+            re.fullmatch(r"[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}", r["boot_id"]), "workflow identity")
+    max_seconds = 900 if r["phase"] in {"probe", "activate", "rollback", "install"} else 3600
+    require(type(r["total_seconds"]) is int and 30 <= r["total_seconds"] <= max_seconds, "phase time budget")
+    require(MANIFEST_SHA != "0" * 64 and r["manifest_sha256"] == MANIFEST_SHA, "manifest binding")
+    require(r["runner_sha256"] == hash_file(safe_file(Path(__file__).resolve())), "workflow source changed")
+    require(isinstance(r["user_confirmation"], str) and r["user_confirmation"].strip(), "explicit phase confirmation required")
+    review = json_binding(r["technical_review"])
+    reviewed = datetime.fromisoformat(review["reviewed_at"])
+    require(set(review) == {"schema", "request_binding_sha256", "reviewer", "reviewed_at", "decision"} and
+            review["schema"] == "e5-nextphase-workflow-review-v1" and
+            review["request_binding_sha256"] == request_binding(r) and
+            review["decision"] == "EXACT_ONE_PHASE_ONLY" and
+            isinstance(review["reviewer"], str) and review["reviewer"].strip() and
+            reviewed.tzinfo is not None and 0 <= (now - reviewed).total_seconds() < 900,
+            "missing/stale exact phase review")
+    expected = {"probe": set(), "inventory": {"roles"}, "backup": {"inventory", "output"}, "stage": set(),
+                "activate": {"directory_request"}, "rollback": {"directory_request"}, "install": {"boot_request"}}
+    require(isinstance(r["inputs"], dict) and set(r["inputs"]) == expected[r["phase"]], "phase input set")
+    needed = {"deployment"} | ({"probe"} if r["phase"] in {"stage", "activate", "rollback", "install"} else set())
+    if r["phase"] == "install": needed.add("activation")
+    require(isinstance(r["requirements"], dict) and set(r["requirements"]) == needed, "phase requirement set")
+    if r["phase"] == "inventory":
+        roles = r["inputs"]["roles"]
+        require(isinstance(roles, list) and roles and len(set(roles)) == len(roles) and
+                set(roles) <= {"active", "stage", "archive", "failed"}, "fixed inventory roles")
+    folder = Path(r["evidence_directory"])
+    require(folder.is_absolute() and folder.is_relative_to(ROOT / "evidence") and
+            not folder.exists() and not folder.is_symlink() and all(not p.is_symlink() for p in folder.parents), "fresh workflow evidence folder")
+    return r
+
+
+def make_adapter(mods, manifest, request, folder, cancel, deadline):
+    api = mods["android_directory_adapter"]
+    def artifact(key):
+        a = manifest["artifacts"][key]
+        return api.Artifact(Path(a["path"]), a["bytes"], a["sha256"])
+    return api.AndroidDirectoryAdapter(artifact("adb"), artifact("directory_helper"), request["txid"],
+        request["boot_id"], scanner=artifact("scanner"), io_helper=artifact("io_helper"),
+        evidence_dir=folder / "transport", cancel_event=cancel, transaction_deadline=deadline)
+
+
+def execute(binding):
+    require(not WORKFLOW_IO_DISABLED, "WORKFLOW_IO_DISABLED: no device operations during preparation")
+    request = validate_request(binding)
+    manifest = verify_materials(); manifest["_bound_manifest_sha256"] = MANIFEST_SHA
+    mods = load_modules(manifest)
+    session = mods["directory_session"]; boot = mods["bounded_boot_control"]
+    proof_api = mods["phase_evidence"]
+    prerequisites = proof_api.validate_requirements(request["requirements"], manifest, request["phase"], request["txid"])
+    ready = mods["cold_bridge"].validate_directory_ready(request["cold_ready"], request["boot_id"])
+    if request["phase"] in {"probe", "activate", "rollback", "install"}:
+        remain = (datetime.fromisoformat(ready["expires_at"]) - datetime.now(timezone.utc)).total_seconds()
+        require(request["total_seconds"] + 5 < remain, "full phase does not fit evidence lease")
+    folder = Path(request["evidence_directory"]); folder.mkdir(mode=0o700)
+    original_request = safe_file(binding["path"]).read_bytes()
+    require(sha(original_request) == binding["sha256"], "request changed before evidence copy")
+    save_new(folder / "REQUEST.json", original_request)
+    cancel = threading.Event(); deadline = time.monotonic() + request["total_seconds"]
+    adapter = make_adapter(mods, manifest, request, folder, cancel, deadline)
+    # These bound read-only checks run inside each subsystem's existing lock.
+    # Preserve the adapter's full original baseline/occupancy check first.
+    fresh_gate = adapter.fresh_gate
+    def checked_fresh_gate(binding):
+        result = fresh_gate(binding)
+        proof_api.verify_current(adapter, prerequisites, manifest)
+        return result
+    adapter.fresh_gate = checked_fresh_gate
+    phase = request["phase"]
+    # Each delegated subsystem owns the shared host flock; do not double-lock.
+    try:
+        with mods["bounded_transport"].cancellation_signals():
+            if phase in {"probe", "inventory", "stage"}:
+                with session._device_lock():
+                    adapter.fresh_gate({"request_sha256": binding["sha256"], "txid": request["txid"],
+                        "boot_id": request["boot_id"], "expires_at": ready["expires_at"]})
+                    if phase == "probe":
+                        item = manifest["artifacts"]["probe"]
+                        artifact = mods["android_directory_adapter"].Artifact(Path(item["path"]), item["bytes"], item["sha256"])
+                        result = mods["probe_host"].ProbeHost(adapter, artifact,
+                            approved_sha256=item["sha256"], approved_bytes=item["bytes"]).run()
+                    elif phase == "inventory":
+                        result = {}
+                        for role in request["inputs"]["roles"]:
+                            value = adapter.inventory_optional(role)
+                            save_new(folder / (role + ".inventory.json"), value); result[role] = value
+                    else:
+                        api = mods["android_directory_adapter"]
+                        def stage_artifact(name):
+                            item = manifest["stage_inputs"][name]
+                            return api.Artifact(Path(item["path"]), item["bytes"], item["sha256"])
+                        fixed = {n: stage_artifact(n) for n in api.STAGE_INPUTS}
+                        result = mods["bounded_stage"].BoundedStage(adapter).run(fixed, stage_artifact("openwrt.ext4"))
+                        save_new(folder / "stage.inventory.json", result)
+            elif phase == "backup":
+                result = session.capture_backup(adapter, cold_resume=request["cold_ready"], request_sha256=binding["sha256"],
+                    txid=request["txid"], boot_id=request["boot_id"], inventory_binding=request["inputs"]["inventory"],
+                    output=request["inputs"]["output"])
+            elif phase in {"activate", "rollback"}:
+                inner = request["inputs"]["directory_request"]
+                ir = json_binding(inner)
+                require(ir.get("mode") == phase and ir.get("cold_resume") == request["cold_ready"] and
+                        ir.get("boot_id") == request["boot_id"] and ir.get("txid") == request["txid"], "inner directory request differs")
+                tx = session.DirectorySession.open(adapter, inner["path"], inner["sha256"], folder / "directory-session")
+                result = tx.activate() if phase == "activate" else tx.rollback()
+            else:
+                inner = request["inputs"]["boot_request"]
+                br = json_binding(inner)
+                require(br.get("mode") == "install-linux" and br.get("recovery") is None and
+                        br.get("boot_id") == request["boot_id"] and br.get("txid") == request["txid"] and
+                        br.get("total_seconds") == request["total_seconds"], "inner install request differs")
+                require(br.get("install_ready") == prerequisites["activation"]["receipt"],
+                        "install readiness is not the proven activation receipt")
+                pins = {"adb": manifest["artifacts"]["adb"]["sha256"],
+                    "bounded_transport": manifest["modules"]["bounded_transport"],
+                    "bounded_boot_control": manifest["modules"]["bounded_boot_control"],
+                    "directory_adapter": manifest["modules"]["android_directory_adapter"],
+                    "uncertainty_recovery": manifest["modules"]["uncertainty_recovery"],
+                    "native_sha256": manifest["artifacts"]["io_helper"]["sha256"]}
+                backend = boot.NativeBackend(adapter._ensure_transport(), adapter.adb.path, adapter.remote_io,
+                    adapter.io_helper.sha256, adapter.txid, adapter.boot_id, pins, directory_adapter=adapter)
+                install_ready = backend.verify_install_ready
+                def checked_install_ready(binding, budget):
+                    proof_api.verify_current(adapter, prerequisites, manifest)
+                    return install_ready(binding, budget)
+                backend.verify_install_ready = checked_install_ready
+                # Preserve a new nine-partition NV source baseline immediately
+                # before this trial. These are reads only, never writer targets.
+                with session._device_lock():
+                    adapter.fresh_gate({"request_sha256": binding["sha256"], "txid": request["txid"],
+                        "boot_id": request["boot_id"], "expires_at": ready["expires_at"]})
+                    nv_binding = mods["nv_baseline"].capture(adapter, folder / "physical-nv-before")
+                    save_new(folder / "NV_BASELINE_BINDING.json", nv_binding)
+                require(time.monotonic() < deadline and not cancel.is_set(), "NV baseline exceeded phase budget")
+                # Ledger owns this same device flock for the whole block transaction.
+                result = boot.execute(backend, inner["path"], inner["sha256"], folder / "block-install", cancel=cancel,
+                    absolute_deadline=deadline)
+        require(time.monotonic() < deadline and not cancel.is_set(), "phase deadline/cancellation after operation")
+        transport = adapter.transport
+        require(transport is not None and not transport.poisoned, "transport not complete")
+        for name in ("ACTIVE.json", "UNCERTAIN.json", "RECOVERY_PENDING.json", "RECOVERY_ONLY.json"):
+            require(not (transport.state / name).exists() and not (transport.state / name).is_symlink(), "shared stop state remains")
+        result = {"schema": "e5-nextphase-workflow-result-v1", "phase": phase, "request_sha256": binding["sha256"],
+            "serial": SERIAL, "boot_id": request["boot_id"], "txid": request["txid"], "complete": True,
+            "reboot_performed": False, "automatic_next_phase": False, "automatic_retry": False,
+            "requires_new_fresh_evidence_for_next_phase": True, "result": result}
+        save_new(folder / "COMPLETE.json", result)
+        return result
+    except BaseException as exc:
+        cancel.set()
+        if adapter.transport is not None:
+            adapter.transport.mark_uncertain("workflow phase: " + type(exc).__name__ + ": " + str(exc))
+        save_new(folder / "STOP.json", {"phase": phase, "request_sha256": binding["sha256"],
+            "reason": str(exc), "no_retry_or_cleanup": True})
+        raise
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("plan"); sub.add_parser("verify-materials")
+    for command in ("validate", "execute"):
+        p = sub.add_parser(command); p.add_argument("request"); p.add_argument("sha256")
+    args = parser.parse_args()
+    if args.command in (None, "plan"):
+        result = {"status": "PREPARATION_ONLY", "device_io_disabled": WORKFLOW_IO_DISABLED,
+            "phases": sorted(PHASES), "automatic_reboot_retry_or_recovery": False}
+    elif args.command == "verify-materials":
+        verify_materials(); result = {"host_materials_match": True, "hardware_acceptance": False}
+    elif args.command == "validate":
+        r = validate_request({"path": str(Path(args.request).absolute()), "sha256": args.sha256})
+        result = {"phase": r["phase"], "request_shape_valid": True, "execution_authorized_by_validation": False}
+    else:
+        result = execute({"path": str(Path(args.request).absolute()), "sha256": args.sha256})
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

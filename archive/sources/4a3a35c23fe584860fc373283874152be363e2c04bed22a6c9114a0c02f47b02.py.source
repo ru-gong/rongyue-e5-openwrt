@@ -1,0 +1,212 @@
+"""Fixed v3 owner/three-helper bootstrap, prepared and hard disabled.
+
+No CLI/env enablement, cleanup, continuation, retry, native invocation or block
+writes. Uses the exact frozen adapter request/followup without altering it.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import sys
+import uuid
+
+PROVISION_IO_DISABLED = False
+ROOT = Path(__file__).resolve().parents[2]
+LIVE = ROOT / 'tools/e5_clean_author_live_v3_20261014'
+ADAPTER_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+TRANSPORT_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+SERIAL = 'DEVICE_SERIAL_REDACTED'
+BB = '/data/adb/magisk/busybox'
+LOCK = '/data/local/tmp/e5-clean-directory.lock'
+STAT = '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T'
+# Attribute, remote stem, exact enabled local filename, bytes, sha256.
+HELPERS = (
+    ('scanner','scanner','native_occupancy_scanner.aarch64.ENABLED',707752,'0000000000000000000000000000000000000000000000000000000000000000'),
+    ('io_helper','io','native_io.aarch64.ENABLED',708592,'0000000000000000000000000000000000000000000000000000000000000000'),
+    ('helper','helper','device_directory_helper.aarch64.ENABLED',707896,'0000000000000000000000000000000000000000000000000000000000000000'),
+)
+
+class Refusal(RuntimeError): pass
+
+def require(value, message):
+    if not value: raise Refusal(message)
+
+def sha(data): return hashlib.sha256(data).hexdigest()
+
+def source_sha(path):
+    path = Path(path)
+    require(path.is_absolute() and not path.is_symlink() and all(not x.is_symlink() for x in path.parents),'unsafe host source')
+    info = path.stat()
+    require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1,'host source type/link')
+    return sha(path.read_bytes())
+
+def parse_stat(raw):
+    p = raw.decode('ascii').split('|')
+    require(len(p) == 14, 'stat fields')
+    bits = int(p[0], 16)
+    return dict(mode_bits=bits,dev=int(p[1]),inode=int(p[2]),bytes=int(p[3]),mode=p[4],uid=int(p[5]),gid=int(p[6]),
+                nlink=int(p[7]),mtime=p[8],ctime=p[9],mtime_text=p[10],ctime_text=p[11],rdev_major=int(p[12],16),rdev_minor=int(p[13],16),
+                type='f' if stat.S_ISREG(bits) else 'd' if stat.S_ISDIR(bits) else 'unknown')
+
+def identity(row): return {k:row[k] for k in ('mode_bits','dev','inode','mode','uid','gid')}
+
+def same_snapshot(before, after):
+    for key in ('data','local','tmp'):
+        require(identity(before[key]) == identity(after[key]), 'parent identity changed: '+key)
+    if 'lock' in before:
+        require(identity(before['lock']) == identity(after['lock']), 'lock identity changed')
+        require(before['owner'] == after['owner'] and before['owner_sha256'] == after['owner_sha256'],'owner changed')
+
+def durable_result(path, value):
+    fd = os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'wb') as f:
+        f.write(json.dumps(value,sort_keys=True,separators=(',',':')).encode()+b'\n');f.flush();os.fsync(f.fileno())
+    fd = os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+class BoundedProvision:
+    def __init__(self, adapter):
+        self.adapter = adapter
+        require(re.fullmatch('[a-f0-9]{16}',adapter.txid) is not None and re.fullmatch(r'[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}',adapter.boot_id) is not None,'tx/boot')
+        self.used = False
+        self.remote = {a:'/data/local/tmp/e5-clean-'+s+'.'+adapter.txid for a,s,_,_,_ in HELPERS}
+        self.operations = []
+
+    def _contract(self):
+        require(source_sha(LIVE/'android_directory_adapter.py') == ADAPTER_SHA,'adapter source changed')
+        require(source_sha(LIVE/'bounded_transport.py') == TRANSPORT_SHA,'transport source changed')
+        module = sys.modules.get(type(self.adapter).__module__)
+        require(module is not None and Path(module.__file__).resolve() == LIVE/'android_directory_adapter.py' and
+                type(self.adapter) is module.AndroidDirectoryAdapter,'exact live adapter required')
+        require(self.adapter.lock == LOCK and self.adapter._part is None,'fixed lock/no enclosing operation')
+        for attribute,stem,name,size,digest in HELPERS:
+            item = getattr(self.adapter,attribute)
+            require(type(item) is module.Artifact and item.path == LIVE/name and item.size == size and item.sha256 == digest,'fixed artifact binding')
+            expected = self.adapter.remote_io if attribute == 'io_helper' else getattr(self.adapter,'remote_'+attribute)
+            require(expected == self.remote[attribute], 'fixed helper path')
+        t = self.adapter._ensure_transport()
+        require(t.recovery_context is None and not t.reconciliation_only,'normal-only provisioning')
+        require(t.serial == SERIAL and t.boot_id == self.adapter.boot_id and t.txid == self.adapter.txid and
+                t.state == ROOT/('evidence/e5-clean-v3-device-state-'+SERIAL),'shared transport identity')
+        return t
+
+    def _snapshot(self, *, locked, all_absent=False):
+        op = uuid.uuid4().hex
+        paths = {'data':'/data','local':'/data/local','tmp':'/data/local/tmp'}
+        if locked: paths.update(lock=LOCK, owner=LOCK+'/owner')
+        script = f"printf 'STATE\\t{op}\\t{self.adapter.boot_id}\\n'\n"
+        for key,path in paths.items():
+            script += f'test ! -L {path}; test "$(readlink -f {path})" = {path}; test -'+('f' if key=='owner' else 'd')+f' {path}\nprintf "{key}\\t"; stat -c \'{STAT}\' {path}\n'
+        if locked:
+            script += self.adapter._locked()+f"printf 'OWNER\\t'; {BB} sha256sum {LOCK}/owner\n"
+        else: script += f'test ! -e {LOCK}; test ! -L {LOCK}\n'
+        if all_absent:
+            for path in self.remote.values(): script += f'test ! -e {path}; test ! -L {path}\n'
+        script += f"printf 'END\\t{op}\\t%s\\n' \"$(cat /proc/sys/kernel/random/boot_id)\"\n"
+        def parse(raw):
+            lines = raw.splitlines(); bound = f'{op}\t{self.adapter.boot_id}'.encode()
+            require(len(lines) == len(paths)+2+int(locked) and lines[0] == b'STATE\t'+bound and lines[-1] == b'END\t'+bound,'snapshot framing')
+            rows = {}
+            for line,key in zip(lines[1:],paths):
+                name,sep,value=line.partition(b'\t');require(sep and name.decode() == key,'snapshot order')
+                rows[key]=parse_stat(value)
+            for key in paths:
+                row=rows[key]
+                require(row['inode']>0 and row['dev']==rows['data']['dev'],'filesystem/identity')
+                require(row['type']==('f' if key=='owner' else 'd'),'path type')
+            if locked:
+                require(rows['lock']['uid']==rows['owner']['uid']==0 and rows['lock']['mode']=='700' and rows['owner']['mode']=='600' and rows['owner']['nlink']==1 and rows['owner']['bytes']==17,'lock/owner metadata')
+                expected=sha((self.adapter.txid+'\n').encode())
+                require(lines[-2]==('OWNER\t'+expected+'  '+LOCK+'/owner').encode(),'owner hash')
+                rows['owner_sha256']=expected
+            return rows
+        return self.adapter._request('provision-state',script,limit=8192,validator=parse,op_id=op)
+
+    def _bindings_guard(self, before):
+        script=''
+        for key,path in (('data','/data'),('local','/data/local'),('tmp','/data/local/tmp'),('lock',LOCK)):
+            if key not in before: continue
+            row=before[key]
+            script+=f'test ! -L {path}; test -d {path}; test "$(readlink -f {path})" = {path}\n'
+            script+=f'test "$(stat -c \'%f|%d|%i|%a|%u|%g\' {path})" = '+shlex.quote('|'.join([format(row['mode_bits'],'x'),str(row['dev']),str(row['inode']),row['mode'],str(row['uid']),str(row['gid'])]))+'\n'
+        if 'owner' in before:
+            script+=self.adapter._locked()+f'test -f {LOCK}/owner; test "$(stat -c %h {LOCK}/owner)" = 1\n'
+            script+=f'test "$({BB} sha256sum {LOCK}/owner)" = '+shlex.quote(before['owner_sha256']+'  '+LOCK+'/owner')+'\n'
+        return script
+
+    @staticmethod
+    def _wrap(body):
+        return BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote('set -eu\nset -o pipefail\nset -C\n'+body)
+
+    @staticmethod
+    def _empty(raw):
+        require(raw==b'', 'unexpected bootstrap output');return None
+
+    def _verify_helper(self, attribute, before):
+        item=getattr(self.adapter,attribute)
+        digest,meta=self.adapter._hash(self.remote[attribute],item.size)
+        require(digest==item.sha256 and meta['type']=='f' and meta['bytes']==item.size and meta['nlink']==1 and
+                meta['mode']=='700' and meta['uid']==0 and meta['dev']==before['data']['dev'],'helper readback hash/type/identity')
+        return meta
+
+    def run(self):
+        require(not PROVISION_IO_DISABLED,'PROVISION_IO_DISABLED: no device entry enabled')
+        require(not self.used,'no replay');self.used=True;t=None
+        try:
+            t=self._contract()
+            require(t.recovery_context is None and not t.reconciliation_only,'normal-only provisioning')
+            output=t.evidence/'BOUNDED_PROVISION_RESULT.json'
+            require(not output.exists() and not output.is_symlink(),'existing result/no replay')
+            # Precheck all three material hashes before any device mutation.
+            for attribute,_,_,size,digest in HELPERS:
+                item=getattr(self.adapter,attribute);item.verify()
+                require(item.size==size and item.sha256==digest,'artifact differs from frozen build')
+            before=self._snapshot(locked=False,all_absent=True)
+            deadline=self.adapter._deadline();op=uuid.uuid4().hex
+            tick=f"awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime\n"
+            body=self._bindings_guard(before)+tick+f'umask 077; mkdir {LOCK}\n'+tick
+            body+=f'printf "%s\\n" {self.adapter.txid} > {LOCK}/owner\n'+tick
+            self.operations.append(dict(op_id=op,label='bounded-provision-lock'))
+            def lock_follow(ack):
+                after=self._snapshot(locked=True,all_absent=True);same_snapshot(before,after);return after
+            locked=self.adapter._request('bounded-provision-lock',self._wrap(body),mutating=True,limit=4096,
+                                         validator=self._empty,followup=lock_follow,op_id=op)
+            completed={}
+            for index,(attribute,_,_,size,digest) in enumerate(HELPERS):
+                item=getattr(self.adapter,attribute);item.verify();payload=item.path.read_bytes()
+                require(len(payload)==size and sha(payload)==digest,'helper changed before upload')
+                before=self._snapshot(locked=True);same_snapshot(locked,before)
+                path=self.remote[attribute];deadline=self.adapter._deadline();op=uuid.uuid4().hex
+                tick=f"awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime\n"
+                body=self._bindings_guard(before)+f'test ! -e {path}; test ! -L {path}\n'+tick
+                body+=f'umask 077; cat > {path}\ntest "$(stat -c %s {path})" = {size}\n'+tick+f'chmod 700 {path}\n'+tick
+                label='bounded-provision-'+attribute;self.operations.append(dict(op_id=op,label=label))
+                def upload_follow(ack, attribute=attribute, before=before, last=index==len(HELPERS)-1):
+                    metadata=self._verify_helper(attribute,before)
+                    after=self._snapshot(locked=True);same_snapshot(locked,after)
+                    completed[attribute]={'path':self.remote[attribute],'bytes':getattr(self.adapter,attribute).size,
+                        'sha256':getattr(self.adapter,attribute).sha256,'metadata':metadata}
+                    if last:
+                        for prior,record in completed.items():
+                            require(self._verify_helper(prior,after)==record['metadata'],'previous helper changed')
+                        final=self._snapshot(locked=True);same_snapshot(locked,final)
+                        result={'schema':'e5-bounded-provision-v1','serial':SERIAL,'boot_id':self.adapter.boot_id,'txid':self.adapter.txid,
+                            'lock':final,'helpers':completed,'operations':list(self.operations),'approved_to_activate':False,
+                            'device_rootfs_or_block_writes':False,'native_helpers_executed':False,'automatic_cleanup_retry_or_resume':False,
+                            'success_requires_all_matching_transport_complete':True}
+                        durable_result(output,result);return result
+                    return metadata
+                result=self.adapter._request(label,self._wrap(body),payload=payload,mutating=True,limit=4096,
+                    validator=self._empty,followup=upload_follow,op_id=op)
+            return result
+        except BaseException as exc:
+            if t is not None:
+                try:t.mark_uncertain('bounded provisioning: '+type(exc).__name__+': '+str(exc))
+                except BaseException:pass
+            raise
+
+if __name__=='__main__': raise SystemExit('Preparation-only library; no device CLI; PROVISION_IO_DISABLED.')

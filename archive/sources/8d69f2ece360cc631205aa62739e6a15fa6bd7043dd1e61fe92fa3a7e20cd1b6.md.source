@@ -1,0 +1,9 @@
+# FD 扫描修复与部分部署续接：主机集成准备
+
+默认 plan。输入现已固定来源哈希；prepare 仅创建本机禁用副本，启用与实际执行须消费后续真实校验结果。
+
+基础包是已实际运行的 b36a719a15cd4241。新输入仅接受七份固定消费者覆盖（六个状态/部署入口，加 phase_evidence 的旧 owner 和精确保留物证据重放），新的部分部署闭包/CASE，以及经独审的 scanner 和当前旧 owner 归档助手两份 ARM ELF。旧观察器、证据策略、分区 geometry、Linux 验收合同和全部 OpenWrt 材料不改。
+
+复制/重封沿既有已审 Builder，保留 13 个执行门、精确 source/pin、独占输出、中断残件与源漂移拒绝；生成器禁止进程和网络。prepare 是默认禁用设备入口的全新兄弟包；之后另审启用复制，不能原地改 live 包。
+
+输入已绑定测试过的七份源码与 ARM 材料；整包独审仍在启用前完成。该准备目录没有设备批准票据，用户已有继续修复/安装授权记录在 evidence/author-fd-repair-install-20261016/AUTHORIZATION_AND_START_STATE.json。

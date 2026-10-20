@@ -1,0 +1,39 @@
+import copy,hashlib,unittest
+import bounded_stage_fixed as s
+TX='855ae61b90f0f332';BOOT='00000000-0000-4000-8000-000000000001'
+class Fake:
+ txid=TX;boot_id=BOOT
+ def __init__(self):
+  self.meta={'type':'f','bytes':8,'nlink':1,'dev':66367,'inode':19373,'uid':0,'gid':0,'mode':'600'}
+  self.rows=[{'path':'.','type':'d','dev':66367,'inode':19372,'uid':0,'gid':0,'mode':'700'},dict(self.meta,path='./boot-os')];self.data=b'openwrt\n';self.calls=[];self.change=False
+ def path(self,role):return '/data/e5linux.stage.'+TX
+ def occupancy(self):self.calls.append('occupancy')
+ def _inventory(self,role):
+  self.calls.append('inventory');r=copy.deepcopy(self.rows)
+  if self.change and self.calls.count('inventory')>1:r[1]['inode']+=1
+  return r
+ def _read_twice(self,path,offset,length,expected):self.calls.append('read-twice');return self.data,dict(self.meta)
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.a=Fake();self.p={'schema':'e5-stage-eight-byte-preimage-v1','txid':TX,'boot_id':BOOT,'path':self.a.path('stage'),'identity':[66367,19372],'file_meta':dict(self.a.meta),'file_sha256':hashlib.sha256(self.a.data).hexdigest()}
+ def reject(self):
+  with self.assertRaises(s.Refusal):s.validate_partial(self.a,self.p)
+ def test_exact_committed_partial_passes(self):self.assertEqual(s.validate_partial(self.a,self.p),(66367,19372));self.assertEqual(self.a.calls.count('occupancy'),2)
+ def test_extra_file_refused(self):self.a.rows.append(dict(self.a.meta,path='./extra'));self.reject()
+ def test_missing_file_refused(self):self.a.rows.pop();self.reject()
+ def test_wrong_name_refused(self):self.a.rows[1]['path']='./boot.img';self.reject()
+ def test_root_inode_refused(self):self.a.rows[0]['inode']+=1;self.reject()
+ def test_root_device_refused(self):self.a.rows[0]['dev']+=1;self.reject()
+ def test_root_uid_refused(self):self.a.rows[0]['uid']=1;self.reject()
+ def test_root_mode_refused(self):self.a.rows[0]['mode']='777';self.reject()
+ def test_file_inode_refused(self):self.a.rows[1]['inode']+=1;self.reject()
+ def test_hardlink_refused(self):self.a.rows[1]['nlink']=2;self.reject()
+ def test_wrong_bytes_refused(self):self.a.data=b'android\n';self.reject()
+ def test_wrong_length_refused(self):self.a.data=b'openwrt';self.reject()
+ def test_read_metadata_refused(self):self.a.meta['inode']+=1;self.reject()
+ def test_second_inventory_drift_refused(self):self.a.change=True;self.reject()
+ def test_wrong_boot_refused(self):self.p['boot_id']='a'*36;self.reject()
+ def test_wrong_tx_refused(self):self.p['txid']='a'*16;self.reject()
+ def test_wrong_path_refused(self):self.p['path']='/data/e5linux';self.reject()
+ def test_unknown_binding_field_refused(self):self.p['skip_safety']=True;self.reject()
+if __name__=='__main__':unittest.main(verbosity=2)

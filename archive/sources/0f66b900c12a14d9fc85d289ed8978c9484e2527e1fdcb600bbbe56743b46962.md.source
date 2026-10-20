@@ -1,0 +1,54 @@
+# Fixed no-replace probe host wrapper (preparation only)
+
+`probe_host.py` is a library with `PROBE_IO_DISABLED = True`. There is no CLI or
+environment switch. No enabled probe was built or run for this work; the native
+binary currently present is disabled and must never be treated as a passing
+live probe. The supplemental device scope still requires separate approval,
+an independently reviewed enabled source/build, and its exact binary digest.
+
+Future interface:
+
+`ProbeHost(adapter, artifact, approved_sha256=..., approved_bytes=...).run()`
+
+The material digest and byte length are integrity bindings, **not permission**.
+The exact frozen LIVE v3 adapter class/source and transport source are pinned.
+The wrapper uses the existing same-device global uncertainty state. It requires
+normal transport, not reconciliation or recovery mode. Existing explicit
+cancellation and finite phase deadline requirements remain enforced by the
+adapter. It never changes either module, its gates, or its read allowlist.
+
+The only extra uploaded path is
+`/data/local/tmp/e5-clean-noreplace-probe.<txid>`. Upload is capped at 4 MiB,
+uses no-clobber redirection, a 6-second remote timeout, and absolute deadline
+checks before receiving and after EOF before chmod 700. The full bytes are
+independently read back and hashed twice with exact stat/boot/path/length frames
+before the enclosing ACTIVE can complete. Host timeout or lost input does not
+prove a remote cat/syscall exited; failure remains UNKNOWN, with no cleanup.
+
+The native call uses the fixed data/lock inode identities and only the three
+approved names within the existing lock: `probe-source.<txid>`,
+`probe-destination.<txid>`, `probe-renamed.<txid>`. Every native JSON record's
+boot, transaction, operation, process identity and deadline is checked, including
+the exact ordered phase sequence and success proof fields. Native code observes
+the intermediate EEXIST and missing-destination rename. The host independently
+observes only the final state: all three names absent, data/local/tmp/lock
+identity unchanged, and owner bytes/hash/full metadata unchanged. It also
+rechecks the helper. The host receipt is fsynced while ACTIVE is still present.
+There is no claim that the host independently witnessed the intermediate rename.
+Success requires the host result **and** the matching transport COMPLETE record,
+with no ACTIVE/UNKNOWN/UNCERTAIN barrier left by that operation. A result file
+alone is insufficient: its persistence can succeed before the later transport
+completion fails, in which case the outcome remains UNKNOWN.
+
+Any error, timeout, invalid ACK, readback drift or host persistence failure
+poisons the existing transport and forbids retry. No rootfs/B/misc write,
+reboot, automatic resume, recursive cleanup or recovery operation is included.
+The normal native success path removes only its own verified empty test dirs;
+the host issues no removal command. This is not a power-loss safety proof.
+
+`test_probe_host.py` has 18 pure fake/host tests and an audit hook denying all
+subprocess and socket calls. It checks the same-ACTIVE callback sequence and
+failure boundaries, not Android timing, permission behavior, native execution,
+remote signal termination or F2FS durability. Existing v3 transport tests and
+native probe tests remain separate evidence. The frozen v3/live sources are not
+modified by this wrapper.

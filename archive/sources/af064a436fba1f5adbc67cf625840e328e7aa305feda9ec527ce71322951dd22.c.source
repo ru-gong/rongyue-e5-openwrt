@@ -1,0 +1,262 @@
+/* Fixed-directory E5 transaction primitive. No block I/O, deletion, subprocess,
+ * network, reboot or automatic retry. Hash/manifest, unmounted/no-writer, boot-ID,
+ * fscrypt and transaction journal gates belong to the reviewed host caller.
+ *
+ * Production CLI (all identity numbers unsigned decimal):
+ * ACTION TXID DATA_DEV DATA_INO SOURCE_DEV SOURCE_INO LAST
+ * LAST: ROLE for seal; mandatory DEADLINE_BOOTTIME_MS for every move
+ * ACTION: seal | move-active-to-archive | move-stage-to-active |
+ *         move-active-to-failed | move-archive-to-active
+ * TXID: exactly 16 lower-case hex digits. ROOT is /data. Names are e5linux,
+ * e5linux.stage.TXID, e5linux.archive.TXID, e5linux.failed.TXID.
+ * A source revision, rebuild and independent review are required to enable.
+ * No -D macro can change the production gate below.
+ *
+ * HOST_TEST is a separate build, requiring --test-root under an exclusive
+ * /tmp/e5-directory-test-<name>/data (Darwin canonical /private/tmp allowed).
+ * It cannot target /data. Its fault injection is absent in production.
+ */
+#define _GNU_SOURCE 1
+#define _DARWIN_C_SOURCE 1
+#include <sys/types.h>
+#include <sys/stat.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+#include <dirent.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <limits.h>
+#include <time.h>
+
+static const int DEVICE_EXECUTION_ENABLED = 0;
+#define MAX_ENTRIES 256
+#define MAX_DEPTH 8
+static const char *phase = "arguments";
+static int renamed = 0;
+static unsigned files_seen, dirs_seen;
+static uintmax_t deadline_ms, checked_boottime_ms;
+
+static int fail(const char *why) {
+    int e = errno;
+    printf("{\"ok\":false,\"phase\":\"%s\",\"reason\":\"%s\",\"errno\":%d,\"renamed\":%s,\"fsync_completed\":false}\n",
+           phase, why, e, renamed ? "true" : "false");
+    return 70;
+}
+static int fault(const char *point) {
+#ifdef E5_DIRECTORY_HOST_TEST
+    const char *p = getenv("E5_DIRECTORY_TEST_FAULT");
+    if (p && !strcmp(p,"rename-unsupported") && !strcmp(point,"rename")) { errno=ENOSYS; return -1; }
+    if (p && strcmp(p, point) == 0) { errno = EIO; return -1; }
+#else
+    (void)point;
+#endif
+    return 0;
+}
+static int checked_fsync(int fd, const char *point) {
+    if (fault(point)) return -1;
+    return fsync(fd); /* EINTR/unsupported/errors stop; no retries. */
+}
+static int decimal(const char *s, uintmax_t *out) {
+    if (!s || !*s || (*s == '0' && s[1])) return -1;
+    for (const char *p = s; *p; p++) if (*p < '0' || *p > '9') return -1;
+    errno = 0; char *end; uintmax_t x = strtoumax(s, &end, 10);
+    if (errno || *end) return -1;
+    *out = x; return 0;
+}
+static int identity(const struct stat *s, uintmax_t dev, uintmax_t ino) {
+    return (uintmax_t)s->st_dev == dev && (uintmax_t)s->st_ino == ino;
+}
+static int same_stat(const struct stat *a, const struct stat *b) {
+    return a->st_dev == b->st_dev && a->st_ino == b->st_ino &&
+           a->st_mode == b->st_mode && a->st_nlink == b->st_nlink &&
+           a->st_size == b->st_size && a->st_mtime == b->st_mtime &&
+           a->st_ctime == b->st_ctime
+#ifdef __APPLE__
+           && a->st_mtimespec.tv_nsec == b->st_mtimespec.tv_nsec && a->st_ctimespec.tv_nsec == b->st_ctimespec.tv_nsec
+#else
+           && a->st_mtim.tv_nsec == b->st_mtim.tv_nsec && a->st_ctim.tv_nsec == b->st_ctim.tv_nsec
+#endif
+           ;
+}
+/* At most 256 entries/depth 8; only ordinary singleton files and directories.
+ * Content SHA is deliberately not approximated here: the caller checks the
+ * approved complete manifest before AND after, while ensuring no writers. */
+static int sync_tree(int dirfd, dev_t dev, unsigned depth) {
+    if (depth > MAX_DEPTH) { errno = E2BIG; return -1; }
+    int scan = openat(dirfd, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+    if (scan < 0) return -1;
+    DIR *d = fdopendir(scan);
+    if (!d) { int e=errno; close(scan); errno=e; return -1; }
+    struct dirent *de; int rc=0, saved=0;
+    for (;;) {
+        errno=0; de=readdir(d);
+        if (!de) { if (errno) { rc=-1; saved=errno; } break; }
+        if (!strcmp(de->d_name,".") || !strcmp(de->d_name,"..")) continue;
+        if (++files_seen + dirs_seen > MAX_ENTRIES) { rc=-1; saved=E2BIG; break; }
+        struct stat pre, actual, post, named;
+        if (fstatat(dirfd,de->d_name,&pre,AT_SYMLINK_NOFOLLOW) || pre.st_dev != dev ||
+            !(S_ISREG(pre.st_mode) || S_ISDIR(pre.st_mode)) ||
+            (S_ISREG(pre.st_mode) && pre.st_nlink != 1)) { rc=-1; saved=errno ? errno : EPERM; break; }
+        int flags=O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK;
+        if (S_ISDIR(pre.st_mode)) flags |= O_DIRECTORY;
+        int child=openat(dirfd,de->d_name,flags);
+        if (child<0) { rc=-1; saved=errno; break; }
+        if (fstat(child,&actual) || !same_stat(&pre,&actual)) { rc=-1; saved=errno ? errno : ESTALE; }
+        else if (S_ISDIR(actual.st_mode)) {
+            files_seen--; dirs_seen++;
+            if (sync_tree(child,dev,depth+1)) { rc=-1; saved=errno; }
+        } else if (checked_fsync(child,"file-fsync")) { rc=-1; saved=errno; }
+        if (!rc && (fstat(child,&post) || fstatat(dirfd,de->d_name,&named,AT_SYMLINK_NOFOLLOW) ||
+                    !same_stat(&actual,&post) || !same_stat(&post,&named))) { rc=-1; saved=errno ? errno : ESTALE; }
+        if (close(child) && !rc) { rc=-1; saved=errno; }
+        if (rc) break;
+    }
+    if (closedir(d) && !rc) { rc=-1; saved=errno; }
+    if (!rc && checked_fsync(dirfd,"directory-fsync")) { rc=-1; saved=errno; }
+    if (rc) errno=saved;
+    return rc;
+}
+static int deadline_check(int after_flush) {
+    struct timespec ts;
+#if defined(__linux__)
+    if (clock_gettime(CLOCK_BOOTTIME,&ts)) return -1;
+#elif defined(__APPLE__) && defined(E5_DIRECTORY_HOST_TEST)
+    if (clock_gettime(CLOCK_MONOTONIC,&ts)) return -1;
+#else
+    (void)after_flush; errno=ENOSYS; return -1;
+#endif
+    if(ts.tv_sec<0 || (uintmax_t)ts.tv_sec>UINTMAX_MAX/1000U) {errno=EOVERFLOW;return -1;}
+    checked_boottime_ms=(uintmax_t)ts.tv_sec*1000U+(uintmax_t)ts.tv_nsec/1000000U;
+#ifdef E5_DIRECTORY_HOST_TEST
+    const char *p=getenv("E5_DIRECTORY_TEST_FAULT");
+    if(after_flush && p && !strcmp(p,"deadline-after-fsync")) checked_boottime_ms=deadline_ms;
+#else
+    (void)after_flush;
+#endif
+    if(checked_boottime_ms>=deadline_ms){errno=ETIMEDOUT;return -1;}
+    return 0;
+}
+static int noreplace(int rootfd, const char *src, const char *dst) {
+    if (fault("rename")) return -1;
+    /* Final write admission, after every source/parent flush. No IO between
+     * this CLOCK_BOOTTIME check and the no-replace syscall below. */
+    if (deadline_check(1)) return -1;
+#ifdef __linux__
+#ifdef SYS_renameat2
+    return (int)syscall(SYS_renameat2,rootfd,src,rootfd,dst,1U /* RENAME_NOREPLACE */);
+#else
+    errno=ENOSYS; return -1;
+#endif
+#elif defined(__APPLE__)
+    return renameatx_np(rootfd,src,rootfd,dst,RENAME_EXCL);
+#else
+    (void)rootfd; (void)src; (void)dst; errno=ENOSYS; return -1;
+#endif
+}
+#ifdef E5_DIRECTORY_HOST_TEST
+static int test_root_ok(const char *s) {
+    const char *p = NULL;
+    if (!strncmp(s,"/tmp/e5-directory-test-",23)) p=s+23;
+    if (!strncmp(s,"/private/tmp/e5-directory-test-",31)) p=s+31;
+    if (!p || !*p) return 0;
+    while (*p && *p!='/') { if (!((*p>='a'&&*p<='z')||(*p>='A'&&*p<='Z')||(*p>='0'&&*p<='9')||*p=='_'||*p=='-')) return 0; p++; }
+    return !strcmp(p,"/data");
+}
+#endif
+int main(int argc, char **argv) {
+    const char *root="/data";
+#ifdef E5_DIRECTORY_HOST_TEST
+    (void)DEVICE_EXECUTION_ENABLED;
+    if (argc<4 || strcmp(argv[1],"--test-root")) { errno=EPERM; return fail("host-test-root-required"); }
+    root=argv[2];
+    char resolved[PATH_MAX];
+    if (!test_root_ok(root) || !realpath(root,resolved) || !test_root_ok(resolved) || strcmp(root,resolved)) { errno=EPERM; return fail("host-test-root-refused"); }
+    argc-=2; argv+=2;
+#else
+    if (!DEVICE_EXECUTION_ENABLED) { errno=EPERM; return fail("production-device-execution-disabled"); }
+    if (geteuid()!=0) { errno=EPERM; return fail("root-required"); }
+#endif
+    if (argc!=8) { errno=EINVAL; return fail("exact-arguments-required"); }
+    const char *action=argv[1],*tx=argv[2];
+    if (strlen(tx)!=16 || strspn(tx,"0123456789abcdef")!=16) { errno=EINVAL; return fail("invalid-txid"); }
+    uintmax_t dd,di,sd,si;
+    if (decimal(argv[3],&dd)||decimal(argv[4],&di)||decimal(argv[5],&sd)||decimal(argv[6],&si)||!di||!si||dd!=sd) { errno=EINVAL; return fail("invalid-decimal-identities"); }
+    const char *roles[]={"active","stage","archive","failed"};
+    char names[4][80];
+    snprintf(names[0],sizeof names[0],"e5linux");
+    for (int i=1;i<4;i++) snprintf(names[i],sizeof names[i],"e5linux.%s.%s",roles[i],tx);
+    int from=-1,to=-1,seal=!strcmp(action,"seal");
+    if (seal) { if (argc!=8) { errno=EINVAL; return fail("seal-role-required"); } for(int i=0;i<4;i++) if(!strcmp(argv[7],roles[i])) from=i; }
+    else if (!strcmp(action,"move-active-to-archive")) {from=0;to=2;}
+    else if (!strcmp(action,"move-stage-to-active")) {from=1;to=0;}
+    else if (!strcmp(action,"move-active-to-failed")) {from=0;to=3;}
+    else if (!strcmp(action,"move-archive-to-active")) {from=2;to=0;}
+    if(from<0) {errno=EINVAL;return fail("unknown-action-or-role");}
+    if(!seal) {
+        if(decimal(argv[7],&deadline_ms)||!deadline_ms){errno=EINVAL;return fail("move-deadline-required");}
+        phase="deadline-before-seal";
+        if(deadline_check(0))return fail("move-deadline-expired-or-clock-failed");
+    }
+    phase="root-open";
+    int rfd=open(root,O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(rfd<0)return fail("data-open-failed");
+    struct stat rs,ds,ss,peers[4];
+    if(fstat(rfd,&rs)||!identity(&rs,dd,di)){errno=ESTALE;return fail("data-identity-mismatch");}
+    int exists[4]={0};
+    for(int i=0;i<4;i++) {
+        if(!fstatat(rfd,names[i],&ds,AT_SYMLINK_NOFOLLOW)) {
+            if(!S_ISDIR(ds.st_mode)||ds.st_dev!=rs.st_dev){errno=EPERM;return fail("peer-not-real-same-fs-directory");} exists[i]=1; peers[i]=ds;
+        } else if(errno!=ENOENT)return fail("peer-stat-failed");
+    }
+    if(!exists[from] || (!seal&&exists[to])){errno=EEXIST;return fail("source-missing-or-target-present");}
+    if(!seal) {
+        int valid=0;
+        if(from==0&&to==2)valid=exists[0]&&exists[1]&&!exists[2]&&!exists[3];
+        if(from==1&&to==0)valid=!exists[0]&&exists[1]&&exists[2]&&!exists[3];
+        if(from==0&&to==3)valid=exists[0]&&!exists[1]&&exists[2]&&!exists[3];
+        if(from==2&&to==0)valid=!exists[0]&&exists[2]&&(exists[1]!=exists[3]);
+        if(!valid){errno=EPERM;return fail("unknown-directory-state");}
+    }
+    phase="source-open";
+    int sfd=openat(rfd,names[from],O_RDONLY|O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC);
+    if(sfd<0)return fail("source-open-failed");
+    if(fstat(sfd,&ss)||!identity(&ss,sd,si)){errno=ESTALE;return fail("source-identity-mismatch");}
+    phase="seal-source";
+    if(sync_tree(sfd,rs.st_dev,0))return fail("source-fsync-or-tree-check-failed");
+    phase="parent-fsync-before";
+    if(checked_fsync(rfd,"parent-fsync-before"))return fail("parent-fsync-failed");
+    struct stat check;
+    if(fstatat(rfd,names[from],&check,AT_SYMLINK_NOFOLLOW)||!identity(&check,sd,si)||!S_ISDIR(check.st_mode)) {errno=ESTALE;return fail("source-changed-before-operation");}
+    /* Recheck all peer identities after the potentially slow flush. A caller
+     * still must guarantee no concurrent namespace/content writer. */
+    for(int i=0;i<4;i++) {
+        int found=!fstatat(rfd,names[i],&check,AT_SYMLINK_NOFOLLOW);
+        if((found && (!exists[i] || !S_ISDIR(check.st_mode) ||
+                       !identity(&check,(uintmax_t)peers[i].st_dev,(uintmax_t)peers[i].st_ino))) ||
+           (!found && (errno!=ENOENT || exists[i]))) {errno=ESTALE;return fail("peer-identity-changed-before-operation");}
+    }
+    if(!seal) {
+        phase="rename-no-replace";
+        if(noreplace(rfd,names[from],names[to]))return fail("rename-no-replace-failed");
+        renamed=1;
+        phase="rename-readback";
+        if(fstatat(rfd,names[to],&check,AT_SYMLINK_NOFOLLOW)||!identity(&check,sd,si)||!S_ISDIR(check.st_mode)) {errno=ESTALE;return fail("destination-identity-mismatch-after-rename");}
+        errno=0;
+        if(!fstatat(rfd,names[from],&check,AT_SYMLINK_NOFOLLOW)||errno!=ENOENT) {errno=ESTALE;return fail("source-name-not-absent-after-rename");}
+        phase="source-fsync-after";
+        if(checked_fsync(sfd,"source-fsync-after"))return fail("source-directory-fsync-failed-after-rename");
+        phase="parent-fsync-after";
+        if(checked_fsync(rfd,"parent-fsync-after"))return fail("parent-fsync-failed-after-rename");
+    }
+    phase="close";
+    if(close(sfd)||close(rfd))return fail("close-failed");
+    printf("{\"ok\":true,\"action\":\"%s\",\"renamed\":%s,\"fsync_completed\":true,\"power_loss_safety_proven\":false,\"files_fsynced\":%u,\"directories_fsynced\":%u,\"source_dev\":%ju,\"source_ino\":%ju}\n",action,renamed?"true":"false",files_seen,dirs_seen+1,sd,si);
+    return 0;
+}

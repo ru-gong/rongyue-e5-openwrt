@@ -1,0 +1,123 @@
+"""Synthetic future-evidence tests only; real process/socket access forbidden."""
+import ast
+import contextlib
+import io
+import copy
+from datetime import datetime,timedelta,timezone
+import json
+from pathlib import Path
+import sys
+import struct
+import tempfile
+import unittest
+import zlib
+import plan as p
+
+def forbid(event,args):
+    if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.posix_spawnp'):
+        raise AssertionError('external operation forbidden: '+event)
+sys.addaudithook(forbid)
+
+class PlanTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.profile,cls.original_misc,cls.linux=p.inventory()
+        cls.gpt=(p.ROOT/'evidence/preflight-20261013/download-probe-02/pgpt').read_bytes()[:32768]
+        assert p.digest(cls.gpt)==cls.profile['gpt_prefix_sha256']
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(); self.folder=Path(self.tmp.name)
+        self.now=datetime(2026,10,14,10,11,tzinfo=timezone(timedelta(hours=8)))
+        self.boot='00000000-0000-4000-8000-000000000001'
+        self.obs=[]
+        for n in range(3):
+            self.obs.append({'captured_at':(self.now-timedelta(seconds=660-n*300)).isoformat(),
+                'boot_id':self.boot,'serial':p.SERIAL,'slot':'_a','root_uid':0,'model':'E5','platform':'ums9621',
+                'build':'TS305_V03_20241128_2301','kernel':p.EXPECTED_KERNEL,'boot_completed':True,
+                'verifiedbootstate':'orange','flash_locked':'0','sim_states':['ABSENT','ABSENT'],
+                'data':{'node':'/dev/block/mmcblk0p70','fstype':'f2fs','rw':True},
+                'new_panic_observed':False,'unexpected_reboot_observed':False,'read_io_error':False,
+                'boot_reason':'powerkey','uptime_seconds':20+n*300})
+        self.panic={'boot_id':self.boot,'new_since_cold_start':False,'pstore_collected':True,'boot_reason_collected':True}
+        self.protection={'boot_id':self.boot,'partitions':self.profile['partitions'],'protected_hashes':self.profile['protected_hashes']}
+        self.b=self.linux; self.m=self.original_misc
+        self.proof={'schema':'e5-future-resume-evidence-v1','serial':p.SERIAL,'collector_read_only':True,'synthetic':False,'collector':'fixture-collector','artifacts':{}}
+        self.review={'schema':'e5-future-resume-review-v1','boot_id':self.boot,'known_panic_review_sha256':p.KNOWN_PANIC_REVIEW_SHA,
+                     'reviewer':'fixture-independent-reviewer','reviewed_at':self.now.isoformat(),
+                     'recommendation':'original_B_BC32_plan_only',
+                     **{k:True for k in ('cold_boot_and_sim_removal_confirmed','new_panic_evidence_evaluated',
+                         'no_new_unassessed_panic','unresolved_android_panic_risk_acknowledged','read_only_evidence_complete')}}
+    def tearDown(self): self.tmp.cleanup()
+    def bind(self):
+        self.panic['raw_files']={}
+        for name in ('boot-reasons.txt','pstore-capture.txt','crash-buffer.txt'):
+            raw=b'SYNTHETIC UNIT TEST RECORD ONLY; no real device observation.\n'
+            (self.folder/name).write_bytes(raw)
+            self.panic['raw_files'][name]={'bytes':len(raw),'sha256':p.digest(raw)}
+        data={'observations.json':json.dumps(self.obs).encode(),'boot_b.current.bin':self.b,'misc.current.bin':self.m,
+              'gpt-prefix.bin':self.gpt,'protection.json':json.dumps(self.protection).encode(),'panic-evidence.json':json.dumps(self.panic).encode()}
+        for name,raw in data.items():
+            (self.folder/name).write_bytes(raw)
+            self.proof['artifacts'][name]={'bytes':len(raw),'sha256':p.digest(raw)}
+        raw=json.dumps(self.proof).encode(); (self.folder/'resume-evidence.json').write_bytes(raw)
+        sha=p.digest(raw); self.review['evidence_sha256']=sha
+        raw=json.dumps(self.review).encode(); (self.folder/'technical-review.json').write_bytes(raw)
+        return sha,p.digest(raw)
+    def run_plan(self): return p.validate_future(self.folder,*self.bind(),now=self.now)
+    def reject(self):
+        with self.assertRaises(ValueError): self.run_plan()
+    def test_valid_plan_still_cannot_execute(self):
+        result=self.run_plan()
+        self.assertFalse(result['approved_to_flash']);self.assertFalse(result['device_execution_allowed'])
+        self.assertEqual([x['bytes'] for x in result['restore_ranges']],[67108864,32])
+        self.assertEqual(result['restore_ranges'][1]['offset'],2048)
+        self.assertNotIn('adb_argv',result)
+    def test_old_boot_rejected(self):
+        for x in self.obs:x['boot_id']='00000000-0000-4000-8000-000000000001'
+        self.reject()
+    def test_boot_change_rejected(self): self.obs[-1]['boot_id']='00000000-0000-4000-8000-000000000001';self.reject()
+    def test_nonroot_or_b_rejected(self):
+        self.obs[-1]['root_uid']=2000;self.reject()
+        self.obs[-1]['root_uid']=0;self.obs[-1]['slot']='_b';self.reject()
+    def test_stale_capture(self): self.now+=timedelta(minutes=30);self.reject()
+    def test_new_panic_or_stall_rejected(self):
+        self.obs[-1]['new_panic_observed']=True;self.reject()
+        self.obs[-1]['new_panic_observed']=False;self.obs[-1]['read_io_error']=True;self.reject()
+    def test_unassessed_panic_rejected(self): self.review['new_panic_evidence_evaluated']=False;self.reject()
+    def test_risk_not_acknowledged_rejected(self): self.review['unresolved_android_panic_risk_acknowledged']=False;self.reject()
+    def test_same_reviewer_rejected(self): self.review['reviewer']=self.proof['collector'];self.reject()
+    def test_missing_collector_rejected(self): del self.proof['collector'];self.reject()
+    def test_whitespace_names_rejected(self):
+        self.proof['collector']='  ';self.reject()
+        self.proof['collector']='fixture-collector';self.review['reviewer']=' \t';self.reject()
+    def test_same_name_whitespace_rejected(self): self.review['reviewer']=' '+self.proof['collector']+' ';self.reject()
+    def test_unknown_b_rejected(self): self.b=b'!'+self.b[1:];self.reject()
+    def test_known_diagnostic_window_allowed(self):
+        self.b=self.b[:56<<20]+b'!'+self.b[(56<<20)+1:]
+        self.assertEqual(self.run_plan()['current_boot_b_sha256'],p.digest(self.b))
+    def test_original_b_and_misc_noop(self):
+        self.b=p.ORIGINAL_B.read_bytes()
+        result=self.run_plan();self.assertEqual(result['status'],'NO_WRITE_NEEDED');self.assertEqual(result['restore_ranges'],[])
+    def test_original_b_misc_drift_does_not_repeat_b(self):
+        self.b=p.ORIGINAL_B.read_bytes(); bc=bytearray(self.m[2048:2080]);bc[12]=0xcf
+        struct.pack_into('<I',bc,28,zlib.crc32(bc[:28]));self.m=self.m[:2048]+bc+self.m[2080:]
+        result=self.run_plan();self.assertEqual(result['status'],'MANUAL_REVIEW_BC32_ONLY_UNIMPLEMENTED');self.assertEqual(result['restore_ranges'],[])
+    def test_bootable_b_priority_tie_rejected(self):
+        bc=bytearray(self.m[2048:2080]);bc[14]=0x8f
+        struct.pack_into('<I',bc,28,zlib.crc32(bc[:28]));self.m=self.m[:2048]+bc+self.m[2080:];self.reject()
+    def test_misc_outside_rejected(self): self.m=b'!'+self.m[1:];self.reject()
+    def test_protection_change(self): self.protection['protected_hashes']=dict(self.protection['protected_hashes'],boot_a='0'*64);self.reject()
+    def test_sim_present(self): self.obs[-1]['sim_states']=['LOADED','ABSENT'];self.reject()
+    def test_synthetic_refusal(self): self.proof['synthetic']=True;self.reject()
+    def test_short_preimage(self): self.b=self.b[:-1];self.reject()
+    def test_mismatched_proof_hash(self):
+        _,review=self.bind()
+        with self.assertRaises(ValueError):p.validate_future(self.folder,'0'*64,review,now=self.now)
+    def test_source_has_no_transport_or_execution(self):
+        tree=ast.parse(Path(p.__file__).read_text())
+        imports={n.names[0].name.split('.')[0] for n in ast.walk(tree) if isinstance(n,ast.Import)}
+        imports|={n.module.split('.')[0] for n in ast.walk(tree) if isinstance(n,ast.ImportFrom)}
+        self.assertFalse(imports & {'subprocess','socket','importlib','ctypes'})
+        self.assertFalse(p.DEVICE_EXECUTION_ENABLED)
+        with contextlib.redirect_stderr(io.StringIO()),self.assertRaises(SystemExit):p.main(['execute'])
+
+if __name__=='__main__':unittest.main(verbosity=2)

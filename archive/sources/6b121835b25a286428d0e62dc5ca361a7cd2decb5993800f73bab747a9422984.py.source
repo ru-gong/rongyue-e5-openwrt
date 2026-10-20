@@ -1,0 +1,95 @@
+"""Host fake-only checks; block real transport, processes, fork and signals."""
+import ast
+import base64
+import hashlib
+import json
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+
+def deny(event,args):
+    if event.startswith(('socket.','subprocess.')) or event in ('os.fork','os.kill','os.exec','os.posix_spawn','os.system'):
+        raise AssertionError('real external effect blocked: '+event)
+sys.addaudithook(deny)
+import trial_logs as t
+
+
+class TestTrial(unittest.TestCase):
+    def test_observer_only_gate_and_bound_changed(self):
+        source=(Path(__file__).parent.parent/'e5_trial_passive_logs_20261013/observer.py').read_bytes()
+        actual=(Path(__file__).parent/'observer.py').read_bytes()
+        self.assertEqual(actual,source.replace(b'DEVICE_EXECUTION_ENABLED = True',b'DEVICE_EXECUTION_ENABLED = False').replace(b'duration <= 600',b'duration <= 1800').replace(b'<=600 seconds',b'<=1800 seconds'))
+        self.assertEqual(hashlib.sha256(actual).hexdigest(),t.OBSERVER_SHA)
+
+    def test_exact_passive_command_boundary(self):
+        self.assertEqual(t.ALLOWED,{('/bin/busybox','dmesg'),('/sbin/logread',),('/bin/ubus','-S','call','network.interface.wan','status'),('/usr/sbin/iw','dev'),('/usr/sbin/iw','dev','wlan0','station','dump')})
+        for bad in [('mmcli','-m','any'),('/sbin/logread','-f'),('/bin/ubus','call','e5','status'),('reboot',)]:
+            with self.assertRaises(ValueError):t.run_read(bad)
+        self.assertEqual(t.CP_COMMAND[0:2],('/usr/bin/python3','-B'))
+        self.assertEqual(t.CP_COMMAND[-6:],('--duration','1800','--max-raw-bytes','1048576','--max-output-bytes','2097152'))
+
+    def test_ring_retains_initial_and_bounded_two_files(self):
+        with tempfile.TemporaryDirectory() as name,patch.object(t,'ROOT',Path(name).resolve()):
+            t.write_new('system-initial.jsonl',b'initial')
+            for i in range(200):t.ring({'seq':i,'payload':'x'*60000})
+            self.assertEqual((t.ROOT/'system-initial.jsonl').read_bytes(),b'initial')
+            for leaf in ('system-current.jsonl','system-previous.jsonl'):
+                self.assertLessEqual((t.ROOT/leaf).stat().st_size,t.RING_BYTES)
+            self.assertEqual(json.loads((t.ROOT/'system-current.jsonl').read_text().splitlines()[-1])['seq'],199)
+            with self.assertRaises(ValueError):t.ring({'payload':'x'*(513<<10)})
+
+    def test_bounded_tail_preserves_raw_bytes(self):
+        with tempfile.TemporaryDirectory() as name:
+            p=Path(name)/'data';p.write_bytes(b'x'*100+b'\0\xffend')
+            r=t.read_bounded(p,10,tail=True)
+            self.assertTrue(r['truncated']);self.assertEqual(base64.b64decode(r['base64']),(b'x'*100+b'\0\xffend')[-10:])
+            self.assertIn('error',t.read_bounded(p/'missing'))
+
+    def test_host_start_refuses_before_process(self):
+        with self.assertRaises(ValueError):t.preflight()
+
+    def test_snapshot_fake_commands_only(self):
+        with patch.object(t,'stamp',return_value={'monotonic_ns':123,'boottime_ns':456}),patch.object(t,'read_bounded',return_value={'base64':'','truncated':False}),patch.object(t.Path,'glob',return_value=[]),patch.object(t,'run_read',side_effect=lambda a:{'argv':list(a),'exit':0}) as runner:
+            r=t.snapshot()
+            self.assertEqual(runner.call_count,5)
+            self.assertEqual({tuple(x['argv']) for x in r['commands']},t.ALLOWED)
+            self.assertIn('monotonic_ns',r);self.assertIn('boottime_ns',r)
+
+    def test_stop_writes_marker_not_kill(self):
+        with tempfile.TemporaryDirectory() as name,patch.object(t,'ROOT',Path(name).resolve()):
+            (t.ROOT/'identity.json').write_text(json.dumps({'boot_id':'fake'}))
+            original=t.Path.read_text
+            def read(p,*a,**k):return 'fake\n' if str(p)=='/proc/sys/kernel/random/boot_id' else original(p,*a,**k)
+            with patch.object(t,'DEVICE_EXECUTION_ENABLED',True),patch.object(t.Path,'read_text',read):self.assertEqual(t.main(['stop']),0)
+            self.assertEqual((t.ROOT/'STOP').read_bytes(),b'operator stop\n')
+
+    def test_preparation_cli_refuses_every_mode_before_io(self):
+        for mode in ('start','stop','status'):
+            with self.assertRaisesRegex(ValueError,'PREPARATION_HARD_DISABLED'):t.main([mode])
+
+    def test_duration_and_buffer_contract(self):
+        import observer
+        self.assertEqual(t.DURATION,1800)
+        self.assertFalse(t.DEVICE_EXECUTION_ENABLED)
+        self.assertFalse(observer.DEVICE_EXECUTION_ENABLED)
+        observer.validate_limits(1800,1048576,2097152)
+        for value in (0,1801,float('inf'),float('nan')):
+            with self.assertRaises(ValueError):observer.validate_limits(value,1048576,2097152)
+        self.assertEqual(observer.main(['observe','--duration','1800']),2)
+
+    def test_no_foreign_pid_signal_or_shell(self):
+        src=Path(t.__file__).read_text();tree=ast.parse(src)
+        attrs={n.func.attr for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute)}
+        self.assertFalse(attrs&{'system','killpg','connect','send','sendall'})
+        for n in ast.walk(tree):
+            if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr=='Popen':
+                self.assertFalse(any(k.arg=='shell' for k in n.keywords))
+        self.assertNotIn('os.kill(',src)
+        self.assertIn('os.setsid()',src);self.assertIn('RLIMIT_FSIZE',src)
+        self.assertLess((4*t.RING_BYTES)+(512<<10)+(2<<20)+(64<<10),16<<20)
+
+
+if __name__=='__main__':unittest.main(verbosity=2)

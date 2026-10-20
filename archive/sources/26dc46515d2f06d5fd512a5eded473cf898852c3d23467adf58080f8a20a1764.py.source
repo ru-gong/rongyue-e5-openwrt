@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Host-only negative tests. All external process/network creation is denied."""
+import ast
+import hashlib
+import io
+import json
+from pathlib import Path
+import struct
+import sys
+import tarfile
+import tempfile
+import unittest
+from unittest.mock import patch
+
+import candidate_manifest as c
+
+
+def deny_external(event, args):
+    if event in ("subprocess.Popen", "os.system", "os.exec", "os.posix_spawn",
+                 "socket.connect", "socket.bind", "socket.__new__"):
+        raise AssertionError("external execution/network forbidden: " + event)
+
+
+sys.addaudithook(deny_external)
+
+
+class FakeFS:
+    def __init__(self):
+        self.absents = set(c.ABSENT)
+        self.empty = {"opt/e5/android", "etc/e5linux"}
+        saved = c.ROOT / "materials/openwrt-build-20261013-569f13d4/runtime-audit/rootfs-ext4-files"
+        self.files = {name: (saved / name).read_bytes() for name in c.INNER_PINS}
+
+    def absent(self, p): return p in self.absents
+    def empty_dir(self, p): return p in self.empty
+    def file(self, p): return self.files[p]
+
+
+class CandidateTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="e5-candidate-mock-")
+        self.base = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def conf(self, default="android"):
+        p = self.base / "settings"
+        p.write_text("E5_APN=''\nE5_WIFI_SSID='synthetic'\nE5_WIFI_KEY='synthetic-secret'\n"
+                     "E5_WIFI_CHANNEL='1'\nE5_DEFAULT_BOOT='" + default + "'\n")
+        return p
+
+    def test_settings_android_and_no_secret_output(self):
+        result = c.settings(self.conf())
+        self.assertEqual(result["default_boot"], "android")
+        self.assertNotIn("synthetic-secret", json.dumps(result))
+
+    def test_linux_default_rejected(self):
+        with self.assertRaises(c.Reject): c.settings(self.conf("linux"))
+
+    def test_duplicate_setting_rejected(self):
+        p = self.conf(); p.write_text(p.read_text() + "E5_DEFAULT_BOOT='android'\n")
+        with self.assertRaises(c.Reject): c.settings(p)
+
+    def test_command_in_setting_rejected(self):
+        p = self.conf(); p.write_text(p.read_text() + "reboot\n")
+        with self.assertRaises(c.Reject): c.settings(p)
+
+    def test_pin_success(self):
+        p = self.base / "bytes"; p.write_bytes(b"synthetic")
+        self.assertEqual(c.verify_file(p, 9, c.sha(b"synthetic"))["bytes"], 9)
+
+    def test_pin_hash_mismatch(self):
+        p = self.base / "bytes"; p.write_bytes(b"synthetic")
+        with self.assertRaises(c.Reject): c.verify_file(p, 9, "0" * 64)
+
+    def test_pin_size_mismatch(self):
+        p = self.base / "bytes"; p.write_bytes(b"synthetic")
+        with self.assertRaises(c.Reject): c.verify_file(p, 8, c.sha(b"synthetic"))
+
+    def test_pin_symlink_rejected(self):
+        p = self.base / "bytes"; p.write_bytes(b"synthetic")
+        q = self.base / "link"; q.symlink_to(p)
+        with self.assertRaises(c.Reject): c.verify_file(q, 9, c.sha(b"synthetic"))
+
+    def test_clean_inner_passes_without_live_approval(self):
+        a = c.check_pristine(FakeFS())
+        self.assertTrue(a["no_private_nv"])
+        self.assertEqual(a["rootfs_checked_sha256"], c.RAW_SHA)
+        self.assertIn("does not attest current outer directory", a["scope"])
+
+    def test_each_pollution_target_fails(self):
+        for name in c.ABSENT:
+            with self.subTest(name=name):
+                f = FakeFS(); f.absents.remove(name)
+                with self.assertRaises(c.Reject): c.check_pristine(f)
+
+    def test_vendor_directory_pollution_fails(self):
+        f = FakeFS(); f.empty.remove("opt/e5/android")
+        with self.assertRaises(c.Reject): c.check_pristine(f)
+
+    def test_inner_default_or_NV_script_changed_fails(self):
+        for name in c.INNER_PINS:
+            with self.subTest(name=name):
+                f = FakeFS(); f.files[name] += b"\n# mutation\n"
+                with self.assertRaises(c.Reject): c.check_pristine(f)
+
+    def test_unknown_directory_does_not_pass_as_absent(self):
+        f = FakeFS()
+        with patch.object(f, "absent", side_effect=c.Reject("unknown parser state")):
+            with self.assertRaises(c.Reject): c.check_pristine(f)
+
+    def test_ext4_bad_magic(self):
+        with self.assertRaises(c.Reject): c.Ext4Reader(io.BytesIO(b"\0" * 4096), 4096)
+
+    def test_ext4_out_of_bounds(self):
+        reader = object.__new__(c.Ext4Reader)
+        reader.f, reader.size = io.BytesIO(b"abcd"), 4
+        for offset, length in ((-1, 2), (3, 2), (5, 0)):
+            with self.subTest(offset=offset):
+                with self.assertRaises(c.Reject): reader.read(offset, length)
+
+    def test_extent_depth_invalid(self):
+        reader = object.__new__(c.Ext4Reader)
+        data = bytearray(60); struct.pack_into("<HHHH", data, 0, 0xF30A, 0, 4, 6)
+        with self.assertRaises(c.Reject): reader.extents(data)
+
+    def tar(self, name, payload=b"synthetic", type_=tarfile.REGTYPE):
+        p = self.base / "files.tar"
+        with tarfile.open(p, "w") as t:
+            m = tarfile.TarInfo(name); m.type = type_; m.size = len(payload)
+            if type_ != tarfile.REGTYPE: m.size = 0
+            t.addfile(m, io.BytesIO(payload) if m.size else None)
+        return p
+
+    def provenance(self, name):
+        return {"outputs": [{"name": name, "bytes": 9, "sha256": c.sha(b"synthetic")}],
+                "source_commit": c.COMMIT, "nv_included": False}
+
+    def test_device_tar_fixed_runtime_pass(self):
+        name = "opt/e5/android/vendor/bin/modem_control"
+        self.assertEqual(c.verify_device_tar(self.tar(name), self.provenance(name))["members_verified"], 1)
+
+    def test_device_tar_NV_rejected(self):
+        name = "opt/e5/nv/nr_fixnv1_a"
+        with self.assertRaises(c.Reject): c.verify_device_tar(self.tar(name), self.provenance(name))
+
+    def test_device_tar_traversal_rejected(self):
+        name = "../outside"
+        with self.assertRaises(c.Reject): c.verify_device_tar(self.tar(name), self.provenance(name))
+
+    def test_device_tar_symlink_rejected(self):
+        name = "opt/e5/android/vendor/bin/modem_control"
+        with self.assertRaises(c.Reject): c.verify_device_tar(self.tar(name, type_=tarfile.SYMTYPE), self.provenance(name))
+
+    def test_fixed_candidate_keeps_all_live_gates_pending(self):
+        p = c.ROOT / "research/author-clean-reinstall-20261014/candidate.json"
+        j = json.loads(p.read_text())
+        self.assertFalse(j["approved_for_device_execution"])
+        self.assertFalse(j["device_io"])
+        self.assertEqual(len(j["outer_file_set"]), 8)
+        self.assertEqual(j["outer_file_set"]["boot-os"]["text"], "openwrt\n")
+        self.assertEqual(j["outer_file_set"]["openwrt-default-boot"]["text"], "android\n")
+        self.assertTrue(all(v == {"status": "pending", "observed": None} for v in j["pending_live_gates"].values()))
+
+    def test_no_transport_or_execute_imports(self):
+        tree = ast.parse(Path(c.__file__).read_text())
+        modules = {n.name.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.Import) for n in node.names}
+        modules |= {node.module.split(".")[0] for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
+        self.assertFalse(modules & {"subprocess", "socket", "ctypes", "importlib", "paramiko"})
+        funcs = {x.name for x in tree.body if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef))}
+        self.assertFalse(funcs & {"execute", "restore", "flash", "reboot", "ssh", "adb"})
+
+
+if __name__ == "__main__":
+    unittest.main()

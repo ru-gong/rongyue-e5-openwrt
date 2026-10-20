@@ -1,0 +1,25 @@
+"""Read-only host source/material/pin check. No runtime methods or state changes."""
+import sys
+def deny(event,args):
+ if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':raise AssertionError('external operation forbidden')
+sys.addaudithook(deny)
+import ast,hashlib,importlib.util,json
+from pathlib import Path
+HERE=Path(__file__).resolve().parent;ROOT=HERE.parents[1];result=json.loads((HERE/'RESULT.json').read_bytes());sha=lambda b:hashlib.sha256(b).hexdigest()
+for item in result['files'].values():
+ raw=Path(item['path']).read_bytes();assert len(raw)==item['bytes'] and sha(raw)==item['sha256']
+base=json.loads(Path(result['base_result']['path']).read_bytes());assert sha(Path(result['base_result']['path']).read_bytes())==result['base_result']['sha256']
+for item in base['files'].values():assert sha(Path(item['path']).read_bytes())==item['sha256']
+core=Path(result['directories']['core']);sys.path.insert(0,str(core));import workflow
+manifest=workflow.verify_materials();modules=workflow.load_modules(manifest)
+contract=modules['cold_bridge']._module();common=contract.c
+assert common.load_runtime()['bounded_boot_control'] is modules['bounded_boot_control']
+common.verify_manifest(sha(Path(result['directories']['recovery'],'MANIFEST.json').read_bytes()))
+assert workflow.WORKFLOW_IO_DISABLED is False
+assert modules['bounded_boot_control'].DEVICE_IO_DISABLED is False and modules['android_directory_adapter'].DEVICE_IO_DISABLED is False
+recipe=json.loads((ROOT/'tools/e5_nextphase_core_prepare_20261015/ACTIVATION_RECIPE.json').read_bytes());gates={}
+for key,rule in recipe['literal_gates'].items():
+ path=Path(result['files'][key]['path']);name=rule.split('=')[0].strip();tree=ast.parse(path.read_text());node=next(n for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets));value=ast.literal_eval(node.value);gates[key]=value
+ assert value is (True if key=='recovery/observe.py' else ast.literal_eval(rule.split(' -> ')[1].strip()))
+assert Path(result['files']['acceptance/collect.sh']['path']).read_bytes().count(Path(result['files']['acceptance/collect.py']['path']).read_bytes())==1
+print(json.dumps({'schema':'e5-budget-enabled-host-verification-v1','verified_files':len(result['files']),'base_verified_files':len(base['files']),'material_stage_inputs':len(manifest['stage_inputs']),'gates':gates,'runtime_source_imports_only':True,'no_device_methods':True,'policy':contract.directory_budget_policy(),'shared_state_not_read_or_written':True},ensure_ascii=False,sort_keys=True,indent=2))

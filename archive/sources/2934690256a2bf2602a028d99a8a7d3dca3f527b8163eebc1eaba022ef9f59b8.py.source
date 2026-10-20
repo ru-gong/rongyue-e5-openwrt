@@ -1,0 +1,169 @@
+"""Prepared fixed no-replace probe wrapper. No CLI or automatic device execution.
+
+The default gate is literal and cannot be enabled by an argument/environment.
+A separately reviewed enabled copy and exact binary binding are prerequisites.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import sys
+import uuid
+
+PROBE_IO_DISABLED = False
+ROOT = Path(__file__).resolve().parents[2]
+ADAPTER_PATH = ROOT/'tools/e5_clean_author_live_v3_20261014/android_directory_adapter.py'
+ADAPTER_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+TRANSPORT_SHA = '0000000000000000000000000000000000000000000000000000000000000000'
+SERIAL = 'DEVICE_SERIAL_REDACTED'
+BB = '/data/adb/magisk/busybox'
+MAX_HELPER = 4 << 20
+STAT = '%f|%d|%i|%s|%a|%u|%g|%h|%Y|%Z|%y|%z|%t|%T'
+PHASES = ['open-bindings','create-source','create-destination','existing-destination-test',
+          'missing-destination-test','cleanup-destination','cleanup-renamed']
+
+class Refusal(RuntimeError): pass
+def require(ok,why):
+ if not ok:raise Refusal(why)
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def valid_sha(s):return isinstance(s,str) and re.fullmatch('[a-f0-9]{64}',s) is not None
+def file_sha(path):
+ p=Path(path);require(p.is_absolute() and not p.is_symlink() and all(not x.is_symlink() for x in p.parents),'unsafe host source')
+ st=p.stat();require(stat.S_ISREG(st.st_mode) and st.st_nlink==1,'host source type/link');return sha(p.read_bytes())
+def parse_stat(raw):
+ fields=raw.decode('ascii').split('|');require(len(fields)==14,'stat framing')
+ return {'mode_bits':int(fields[0],16),'dev':int(fields[1]),'inode':int(fields[2]),'bytes':int(fields[3]),'mode':int(fields[4],8),
+  'uid':int(fields[5]),'gid':int(fields[6]),'nlink':int(fields[7]),'mtime':fields[8],'ctime':fields[9],
+  'mtime_ns_text':fields[10],'ctime_ns_text':fields[11],'rdev_major':int(fields[12],16),'rdev_minor':int(fields[13],16)}
+def identity(item):return {k:item[k] for k in ('mode_bits','dev','inode','mode','uid','gid')}
+def same_bindings(before,after):
+ require(set(before)==set(after)=={'data','local','tmp','lock','owner','owner_sha256'},'snapshot fields')
+ require(all(identity(before[k])==identity(after[k]) for k in ('data','local','tmp','lock')),'data/local/tmp/lock identity changed')
+ require(before['owner']==after['owner'] and before['owner_sha256']==after['owner_sha256'],'owner bytes or metadata changed')
+def durable_result(path,value):
+ fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'wb') as f:f.write(json.dumps(value,sort_keys=True,separators=(',',':')).encode()+b'\n');f.flush();os.fsync(f.fileno())
+ parent=os.open(path.parent,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try:os.fsync(parent)
+ finally:os.close(parent)
+
+class ProbeHost:
+ def __init__(self,adapter,artifact,*,approved_sha256,approved_bytes):
+  self.adapter=adapter;self.artifact=artifact;self.approved_sha=approved_sha256;self.approved_bytes=approved_bytes;self.used=False
+  require(valid_sha(approved_sha256) and type(approved_bytes) is int and 0<approved_bytes<=MAX_HELPER,'explicit exact helper approval binding required')
+  require(re.fullmatch('[0-9a-f]{16}',adapter.txid) is not None and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',adapter.boot_id) is not None,'adapter tx/boot')
+  self.remote='/data/local/tmp/e5-clean-noreplace-probe.'+adapter.txid
+  self.lock='/data/local/tmp/e5-clean-directory.lock'
+  self.probe_names=[self.lock+'/'+name+'.'+adapter.txid for name in ('probe-source','probe-destination','probe-renamed')]
+ def _production_contract(self):
+  require(file_sha(ADAPTER_PATH)==ADAPTER_SHA,'frozen live adapter source changed')
+  module=sys.modules.get(type(self.adapter).__module__)
+  require(module is not None and Path(module.__file__).resolve()==ADAPTER_PATH and type(self.adapter) is module.AndroidDirectoryAdapter,'exact live adapter class required')
+  require(type(self.artifact) is module.Artifact,'exact pinned Artifact class required')
+  require(file_sha(ADAPTER_PATH.with_name('bounded_transport.py'))==TRANSPORT_SHA,'frozen transport changed')
+  require(self.adapter.lock==self.lock and self.adapter._part is None,'fixed lock and no enclosing mutation required')
+  transport=self.adapter._ensure_transport()
+  require(transport.recovery_context is None and transport.reconciliation_only is False,'probe forbidden in recovery/reconciliation')
+  require(transport.serial==SERIAL and transport.txid==self.adapter.txid and transport.boot_id==self.adapter.boot_id,'transport binding')
+  require(transport.state==ROOT/('evidence/e5-clean-v3-device-state-'+SERIAL),'shared state path')
+  return transport
+ def _snapshot(self):
+  op=uuid.uuid4().hex;paths={'data':'/data','local':'/data/local','tmp':'/data/local/tmp','lock':self.lock,'owner':self.lock+'/owner'}
+  script=self.adapter._locked()+f"printf 'SNAP\\t{op}\\t{self.adapter.boot_id}\\n'\n"
+  for key,path in paths.items():
+   script+=f'test ! -L {path}; test "$(readlink -f {path})" = {path}; test -'+('f' if key=='owner' else 'd')+f' {path}\nprintf "{key}\\t"; stat -c \'{STAT}\' {path}\n'
+  script+=f"printf 'OWNER\\t'; {BB} sha256sum {self.lock}/owner\n"
+  for path in self.probe_names:script+=f'test ! -e {path}; test ! -L {path}\n'
+  script+=f"printf 'END\\t{op}\\t%s\\n' \"$(cat /proc/sys/kernel/random/boot_id)\"\n"
+  def parse(raw):
+   lines=raw.splitlines();expected=f'{op}\t{self.adapter.boot_id}'.encode()
+   require(len(lines)==8 and lines[0]==b'SNAP\t'+expected and lines[-1]==b'END\t'+expected,'snapshot envelope')
+   found={}
+   for line,key in zip(lines[1:6],paths):
+    name,sep,value=line.partition(b'\t');require(sep and name.decode()==key,'snapshot order');found[key]=parse_stat(value)
+   for key in ('data','local','tmp','lock'):
+    require(stat.S_ISDIR(found[key]['mode_bits']) and found[key]['inode']>0 and found[key]['dev']==found['data']['dev'],'directory type or filesystem')
+   require(found['lock']['mode']==0o700 and found['lock']['uid']==0,'lock mode/owner')
+   owner=found['owner'];require(stat.S_ISREG(owner['mode_bits']) and owner['nlink']==1 and owner['bytes']==17 and owner['uid']==0 and owner['mode']==0o600 and owner['dev']==found['data']['dev'],'owner stat')
+   want=sha((self.adapter.txid+'\n').encode());require(lines[6]==('OWNER\t'+want+'  '+self.lock+'/owner').encode(),'owner hash')
+   found['owner_sha256']=want;return found
+  return self.adapter._request('probe-fixed-state',script,limit=8192,validator=parse,op_id=op)
+ def _helper_read(self,*,hash_only=False):
+  op=uuid.uuid4().hex;size=self.approved_bytes;path=self.remote;bb='/data/adb/magisk/busybox'
+  script=f'''test ! -L {path}; test -f {path}; test "$(readlink -f {path})" = {path}
+printf 'META\\t{op}\\t{self.adapter.boot_id}\\t{path}\\t{size}\\t'; stat -c '{STAT}' {path}
+{bb} dd if={path} bs=4096 count={size} iflag=count_bytes status=none'''+(f' | {bb} sha256sum' if hash_only else '')+f'''
+printf '\\nEND\\t{op}\\t%s\\t{path}\\t{size}\\t' "$(cat /proc/sys/kernel/random/boot_id)"; stat -c '{STAT}' {path}
+'''
+  length=68 if hash_only else size
+  def parse(raw):
+   header,sep,body=raw.partition(b'\n');require(sep and len(body)>length,'helper short read')
+   payload,tail=body[:length],body[length:];require(tail.startswith(b'\nEND\t') and tail.endswith(b'\n') and tail.count(b'\n')==2,'helper end framing')
+   a=header.split(b'\t',5);b=tail[1:-1].split(b'\t',5)
+   require(len(a)==len(b)==6 and a[0]==b'META' and a[1:]==b[1:] and a[1:5]==[op.encode(),self.adapter.boot_id.encode(),path.encode(),str(size).encode()],'helper binding/stat changed')
+   meta=parse_stat(a[5]);require(stat.S_ISREG(meta['mode_bits']) and meta['bytes']==size and meta['nlink']==1 and meta['mode']==0o700 and meta['uid']==0,'helper type/size/mode')
+   return payload,meta
+  return self.adapter._request('probe-helper-hash' if hash_only else 'probe-helper-read',script,limit=length+4096,validator=parse,op_id=op)
+ def _verify_helper(self):
+  data,before=self._helper_read();line,after=self._helper_read(hash_only=True)
+  require(before==after and sha(data)==self.approved_sha and line==(self.approved_sha+'  -\n').encode(),'independent helper bytes/SHA/stat mismatch')
+  return before
+ def _native_parse(self,raw,op,deadline,before):
+  rows=[json.loads(line) for line in raw.splitlines()]
+  require(len(rows)==9 and [r.get('event') for r in rows]==['BEGIN']+['PHASE']*7+['RESULT'],'native exact event sequence')
+  require([r.get('phase') for r in rows[1:-1]]==PHASES and rows[-1].get('phase')=='complete','native phases')
+  pid=rows[0].get('self_pid');start=rows[0].get('self_starttime');require(type(pid) is int and pid>0 and type(start) is int and start>0,'native process identity')
+  lasttime=-1
+  for r in rows:
+   require(r.get('schema')=='e5-noreplace-probe-v1' and r.get('txid')==self.adapter.txid and r.get('boot_id')==self.adapter.boot_id and r.get('opid')==op and r.get('deadline_ms')==deadline,'native bindings')
+   require(r.get('self_pid')==pid and r.get('self_starttime')==start and r.get('cancel_signal')==0,'native process/cancel drift')
+   for role in ('data','lock'):
+    require(r.get(role+'_dev')==before[role]['dev'] and r.get(role+'_ino')==before[role]['inode'],'native filesystem identity')
+   tick=r.get('checked_boottime_ms');require(type(tick) is int and lasttime<=tick<deadline,'native clock/deadline');lasttime=tick
+  last=rows[-1]
+  require(last.get('complete') is True and last.get('outcome')=='COMPLETED' and last.get('errno')==0 and last.get('power_loss_safety_proven') is False,'native incomplete result')
+  for field in ('existing_dest_eexist','existing_inodes_unchanged','missing_dest_rename','cleanup_completed','mutation_attempted','f2fs_confirmed'):require(last.get(field) is True,'native proof missing: '+field)
+  require(type(last.get('source_inode')) is int and type(last.get('destination_inode')) is int and last['source_inode']>0 and last['destination_inode']>0 and last['source_inode']!=last['destination_inode'],'native source/destination identity')
+  return last
+ def run(self):
+  require(not PROBE_IO_DISABLED,'PROBE_IO_DISABLED: supplemental scope not enabled')
+  require(not self.used,'no replay on this wrapper');self.used=True;transport=None
+  try:
+   transport=self._production_contract()
+   require(transport.recovery_context is None and transport.reconciliation_only is False,'probe forbidden in recovery/reconciliation')
+   self.artifact.verify()
+   require(self.artifact.size==self.approved_bytes and self.artifact.sha256==self.approved_sha,'artifact not exact approved binding')
+   payload=self.artifact.path.read_bytes();require(len(payload)==self.approved_bytes and sha(payload)==self.approved_sha,'helper changed after validation')
+   before=self._snapshot();deadline=self.adapter._deadline()
+   body=self.adapter._locked()+f'''test ! -e {self.remote}; test ! -L {self.remote}
+awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime
+umask 077; set -C; cat > {self.remote}
+test "$(stat -c %s {self.remote})" = {self.approved_bytes}
+awk '{{exit !($1*1000 < {deadline})}}' /proc/uptime
+chmod 700 {self.remote}
+'''
+   script='/data/adb/magisk/busybox timeout -s TERM 6 /system/bin/sh -c '+shlex.quote('set -eu\nset -o pipefail\n'+body)
+   def upload_follow(ack):
+    helper=self._verify_helper();after=self._snapshot();same_bindings(before,after);require(helper['dev']==before['data']['dev'],'helper not same filesystem');return helper
+   helper=self.adapter._request('upload-noreplace-probe',script,payload=payload,limit=4096,mutating=True,validator=lambda raw:raw if raw==b'' else (_ for _ in ()).throw(Refusal('unexpected upload output')),followup=upload_follow)
+   before=self._snapshot();require(self._verify_helper()==helper,'helper replaced before invocation')
+   op=uuid.uuid4().hex;deadline=self.adapter._deadline()
+   args=['probe',self.adapter.txid,self.adapter.boot_id,op,str(deadline),str(before['data']['dev']),str(before['data']['inode']),str(before['lock']['dev']),str(before['lock']['inode'])]
+   def probe_follow(ack):
+    after=self._snapshot();same_bindings(before,after)
+    require(self._verify_helper()==helper,'helper changed during probe')
+    result={'schema':'e5-noreplace-probe-host-result-v1','serial':SERIAL,'txid':self.adapter.txid,'boot_id':self.adapter.boot_id,'native_result':ack,'after':after,'helper_sha256':self.approved_sha,'helper_bytes':self.approved_bytes,'three_probe_paths_absent':True,'native_intermediate_states_independently_observed_by_host':False,'device_rootfs_or_block_writes':False,'approved_to_activate':False,'power_loss_safety_proven':False,'automatic_retry_or_cleanup':False}
+    durable_result(transport.evidence/'NOREPLACE_HOST_RESULT.json',result)
+    return result
+   return self.adapter._request('noreplace-probe',self.adapter._locked()+self.remote+' '+' '.join(args)+'\n',limit=32768,mutating=True,
+    validator=lambda raw:self._native_parse(raw,op,deadline,before),followup=probe_follow,op_id=op)
+  except BaseException as exc:
+   if transport is not None:
+    try:transport.mark_uncertain('noreplace probe: '+type(exc).__name__+': '+str(exc))
+    except BaseException:pass
+   raise
+
+if __name__=='__main__':raise SystemExit('Preparation-only library; PROBE_IO_DISABLED, no device CLI.')

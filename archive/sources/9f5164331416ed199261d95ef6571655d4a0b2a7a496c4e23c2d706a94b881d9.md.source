@@ -1,0 +1,35 @@
+# 去加密后的普通文件与重启持久性验收
+
+**此 helper 是 LIVE 路径，只由主代理在独审通过后执行。** 它没有格式化、擦除、metadata/raw block 写入、删除、重试或重启操作。原冻结 backend 未改，按 SHA `0000000000000000000000000000000000000000000000000000000000000000` 校验后才导入；固定本机串号、ADB 实体路径及 SHA、设备 profile、静态 probe SHA。
+
+1. Stage2 完成并实际回 Android A 后，先由主代理恢复已核源 Magisk 管理器/必要授权，确认 root 可用。此工具的 `preflight()` 必须同时通过 A/orange/unlocked/root、原机 GPT/节点/几何、13 项保护 SHA，并且 `/data` 挂载为 **裸 `/dev/block/mmcblk0p70`、rw、F2FS**。属性值单独不作为去加密证明。
+2. 执行 before（主机目标目录和设备固定目录均须不存在）：
+
+```sh
+python3 -B /REDACTED_HOST_PATH before --evidence /REDACTED_HOST_PATH
+```
+
+before 只在 `/data/local/tmp/e5-plaintext-verify-20261013` 新建静态 probe 和随机 4096 B 的 `nonce.bin`。probe 的 SHA 固定为 `0000000000000000000000000000000000000000000000000000000000000000`；上传、大小、完整 SHA、nonce 二进制回读均检查。四个对象 `/data/`、`/data/local/tmp/`、专用目录、nonce 文件都必须由固定 ioctl probe 返回 **ENODATA / unencrypted**；不支持、加密或其它错误均停止。`/data/` 的末尾斜线不能省略，冻结 C probe 不接受 `/data`。
+
+主机持久保存 nonce、`before.json` 与 journal，返回 before manifest 完整 SHA。成功条件是退出 0、`BEFORE_PASSED_REBOOT_REQUIRED`、journal 末 `COMPLETE_BEFORE_NO_REBOOT` 三者一致。
+
+3. **主代理单独控制正常重启。** helper 不发 reboot、不改变 misc；等待 Android 完成启动和 root 授权后再做 after。只重启 ADB 或断开 USB不算设备重启。
+4. after 必须提供 before 实际输出的 SHA（下方 `<实际 before SHA>` 是占位，不能照抄）：
+
+```sh
+python3 -B /REDACTED_HOST_PATH after --before /REDACTED_HOST_PATH --before-sha256 '<实际 before SHA>' --evidence /REDACTED_HOST_PATH
+```
+
+after 对设备只读。完整 preflight 重做，kernel boot_id 必须与 before 不同，nonce 文件必须字节相同，probe hash、路径非 symlink、原四对象 ENODATA、裸 F2FS mount、13 项保护都再次成立。输出 `PLAINTEXT_AND_REBOOT_PERSISTENCE_VERIFIED`，退出 0 且 journal 末 `COMPLETE_AFTER_DEVICE_READ_ONLY` 才算通过。任何失败均保留证据和设备临时文件，不自动删除/重试/修复。
+
+5. 通过后主代理使用已经存在的只读 NV 工具读取全新双遍稳定基线，**本 helper 不自动调用**：
+
+```sh
+python3 -B /REDACTED_HOST_PATH /REDACTED_HOST_PATH
+```
+
+现有工具 SHA `0000000000000000000000000000000000000000000000000000000000000000`。检查退出 0、`NINE_NV_TWO_PASSES_STABLE`、JSON all_stable=true 且九项均双遍一致；保留与原 Android 基线的区别。Android 开机/关闭可能更新 NV；这个新基线不是 Linux 前后不变证明。
+
+此验收证明本机当前 data 根、指定目录及普通文件的策略和一次重启持久性。它不证明全部 Android app 目录无 fscrypt、不保证长期 F2FS 稳定，也不替代安装器对 `/data/e5linux-stage-20261013` 和实际镜像文件再次做 fscrypt 验收。不得因此跳过已有冻结安装器的独立门。
+
+本地 10 项 fake-only 测试入口：`python3 -B test_check.py`。测试进程 audit hook 拒绝全部外部进程，未访问设备，未执行 ARM64 probe。

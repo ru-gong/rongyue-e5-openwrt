@@ -1,0 +1,114 @@
+"""All enabled copies are temporary host fixtures; no runtime I/O is called."""
+import sys
+def sentinel(event,args):
+ if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':raise AssertionError('no external execution: '+event)
+sys.addaudithook(sentinel)
+import ast,contextlib,copy,hashlib,importlib.util,io,json,tempfile,unittest
+from pathlib import Path
+from datetime import datetime,timezone
+from unittest.mock import patch
+import activation as a
+REAL_ROOT=a.ROOT
+REAL_CAT=json.loads((a.HERE/'SOURCE_CATALOG.json').read_text())
+REAL_FILES={k:(REAL_ROOT/'tools'/a.GROUPS[k.split('/',1)[0]]/k.split('/',1)[1]).read_bytes() for k in REAL_CAT['files']}
+def load(name,path):
+ sp=importlib.util.spec_from_file_location(name,path);m=importlib.util.module_from_spec(sp);sys.modules[name]=m;sp.loader.exec_module(m);return m
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.temp=tempfile.TemporaryDirectory(prefix='e5-activation-fixture-');self.addCleanup(self.temp.cleanup);self.root=Path(self.temp.name).resolve();(self.root/'tools').mkdir();self.here=self.root/'tools/e5_activation_prepare_20261015';self.here.mkdir()
+  self.files=copy.deepcopy(REAL_FILES);self.external=[]
+  def replace_root(obj):
+   if isinstance(obj,str):return obj.replace(str(REAL_ROOT),str(self.root))
+   if isinstance(obj,list):return [replace_root(x) for x in obj]
+   if isinstance(obj,dict):return {k:replace_root(v) for k,v in obj.items()}
+   return obj
+  for key in ('scanner/ARTIFACT_MANIFEST.json','recovery/MANIFEST.json','acceptance/MANIFEST.json','core/SOURCE_MANIFEST.json'):
+   self.files[key]=a.encode(replace_root(json.loads(self.files[key])))
+  m=json.loads(self.files['core/SOURCE_MANIFEST.json'])
+  # Material contents are deliberately tiny SYNTHETIC values; no field approval.
+  cand={'schema':'e5-clean-author-candidate-v1','approved_for_device_execution':False,'outer_file_set':{}}
+  for kind,entries in [('artifact',m['artifacts']),('stage',m['stage_inputs'])]:
+   for name,item in entries.items():
+    if kind=='artifact' and name=='scanner':continue
+    p=self.root/'materials'/(kind+'-'+name);p.parent.mkdir(exist_ok=True);data=('SYNTHETIC-'+name).encode();p.write_bytes(data)
+    item.update(path=str(p),bytes=len(data),sha256=a.sha(data));self.external.append(copy.deepcopy(item))
+    if kind=='stage':cand['outer_file_set'][name]={'bytes':len(data),'sha256':a.sha(data)}
+  p=self.root/'materials/candidate.json';p.write_bytes(a.encode(cand));m['candidate']={'path':str(p),'sha256':a.sha(p.read_bytes())};self.external.append(m['candidate'])
+  p=self.root/'materials/candidate-review.json';p.write_bytes(a.encode({'schema':'e5-independent-candidate-delivery-v1','decision':'HOST_ARTIFACT_REVIEW_PASSED_ONLY','approved_to_flash':False,'candidate':m['candidate']}));m['independent_candidate_review']={'path':str(p),'sha256':a.sha(p.read_bytes())};self.external.append(m['independent_candidate_review'])
+  m['deployment_manifest']['sha256']=a.sha(self.files['scanner/ARTIFACT_MANIFEST.json']);m['recovery_manifest']['sha256']=a.sha(self.files['recovery/MANIFEST.json'])
+  self.files['core/SOURCE_MANIFEST.json']=a.encode(m)
+  b=a.Builder({'core/workflow.py':self.files['core/workflow.py']},{'core':self.root/'tools'/a.GROUPS['core']});old=a.assignment(b.files['core/workflow.py'],'MANIFEST_SHA')[0];b.set('core/workflow.py','MANIFEST_SHA',old,a.sha(self.files['core/SOURCE_MANIFEST.json']));self.files['core/workflow.py']=b.files['core/workflow.py']
+  for key,raw in self.files.items():
+   g,n=key.split('/',1);p=self.root/'tools'/a.GROUPS[g]/n;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(raw)
+  cat=copy.deepcopy(REAL_CAT);cat['files']={k:{'bytes':len(v),'sha256':a.sha(v)} for k,v in self.files.items()};cat['external_inputs']=self.external;cat['source_manifest_sha256']=a.sha(self.files['core/SOURCE_MANIFEST.json'])
+  self.cat=cat;(self.here/'SOURCE_CATALOG.json').write_bytes(a.encode(cat));self.catalog_sha=a.sha(a.encode(cat))
+  self.patches=[patch.object(a,'ROOT',self.root),patch.object(a,'HERE',self.here),patch.object(a,'CATALOG_SHA',self.catalog_sha)]
+  for p in self.patches:p.start();self.addCleanup(p.stop)
+  self.confirm={'schema':'e5-host-activation-copy-confirmation-v1','activation_id':'1234567890abcdef','action':'CREATE_STABLE_FOUR_PACKAGE_HOST_COPY_ONLY','source_catalog_sha256':self.catalog_sha,'source_manifest_sha256':cat['source_manifest_sha256'],'recipe_sha256':cat['recipe_sha256'],'confirmed_by':'SYNTHETIC HOST TEST ONLY','confirmed_at':datetime.now(timezone.utc).isoformat(),'phase_execution_authorized':False}
+ def cb(self):
+  p=self.root/'SYNTHETIC-copy-confirmation.json';p.write_bytes(a.encode(self.confirm));return p,a.sha(p.read_bytes())
+ def run_copy(self):return a.make_copy(*self.cb())
+ def test_plan_no_source_or_output(self):
+  with patch.object(sys,'argv',['activation.py']),patch.object(a,'load_sources',side_effect=AssertionError('plan must not read')),contextlib.redirect_stdout(io.StringIO()) as out:a.main()
+  self.assertFalse(json.loads(out.getvalue())['device_io']);self.assertFalse(list((self.root/'tools').glob('*live*')))
+ def test_full_copy_reseal_source_unchanged(self):
+  r=self.run_copy();self.assertFalse(r['copies_imported_or_executed']);self.assertEqual(len(r['files']),28)
+  for k,raw in self.files.items():g,n=k.split('/',1);self.assertEqual((self.root/'tools'/a.GROUPS[g]/n).read_bytes(),raw)
+  for k,v in r['files'].items():self.assertEqual(a.sha(Path(v['path']).read_bytes()),v['sha256']);self.assertEqual(Path(v['path']).stat().st_mode&0o777,0o600)
+  for key in ('scanner/build/lock_archive.aarch64.ENABLED','scanner/build/native_occupancy_scanner.aarch64.ENABLED'):self.assertEqual(Path(r['files'][key]['path']).read_bytes(),self.files[key])
+  self.assertFalse(any('test_' in k or 'DELIVERY' in k or k.endswith('.log') for k in r['files']))
+ def test_actual_temp_imports_and_pin_validation(self):
+  before=set(sys.modules);r=self.run_copy();d={g:Path(p) for g,p in r['directories'].items()};oldpath=sys.path[:];sys.path.insert(0,str(d['core']))
+  try:
+   w=load('_test_enabled_workflow',d['core']/'workflow.py');m=w.verify_materials();mods=w.load_modules(m)
+   self.assertFalse(w.WORKFLOW_IO_DISABLED);self.assertFalse(mods['bounded_boot_control'].DEVICE_IO_DISABLED)
+   contract=mods['cold_bridge']._module();self.assertEqual(Path(contract.c.LIVE),d['core']);self.assertTrue(contract.observer.DEVICE_IO_ENABLED)
+   self.assertEqual(contract.c.PINS,{k:a.sha((d['core']/(k+'.py')).read_bytes()) for k in contract.c.PINS})
+   self.assertEqual(set(contract.c.load_runtime()),{'bounded_transport','bounded_boot_control','uncertainty_recovery'})
+   rm=d['recovery']/'MANIFEST.json';contract.c.verify_manifest(a.sha(rm.read_bytes()))
+   runner=load('_test_enabled_scanner',d['scanner']/'runner.py');sm=d['scanner']/'ARTIFACT_MANIFEST.json';runner.material_manifest({'path':str(sm),'sha256':a.sha(sm.read_bytes())})
+   lib=load('_test_enabled_stage2',d['scanner']/'stage2_deploy.py');self.assertFalse(lib.DEVICE_IO_DISABLED);self.assertEqual(lib.CORE,d['core'])
+   collect=load('_test_enabled_acceptance',d['acceptance']/'collect.py');self.assertFalse(collect.DEVICE_IO_DISABLED)
+   # Only imports, pure host checks, no Observe/Backend/execute constructors/calls.
+   self.assertFalse((self.root/'evidence').exists())
+  finally:
+   sys.path[:]=oldpath
+   for name in list(set(sys.modules)-before):sys.modules.pop(name,None)
+ def test_existing_destination_refused(self):
+  self.run_copy()
+  with self.assertRaisesRegex(a.Refusal,'fresh'):self.run_copy()
+ def test_confirmation_scope_not_execution_permission(self):
+  self.confirm['phase_execution_authorized']=True
+  with self.assertRaisesRegex(a.Refusal,'copy only'):self.run_copy()
+ def test_wrong_confirmation_source_refused(self):
+  self.confirm['source_catalog_sha256']='0'*64
+  with self.assertRaisesRegex(a.Refusal,'confirmation sources'):self.run_copy()
+ def test_path_escape_id_refused(self):
+  self.confirm['activation_id']='../../evidence'
+  with self.assertRaises(a.Refusal):self.run_copy()
+ def test_source_drift_prevents_any_copy(self):
+  p=self.root/'tools'/a.GROUPS['core']/'nv_baseline.py';p.write_bytes(p.read_bytes()+b'\n')
+  with self.assertRaisesRegex(a.Refusal,'digest/size'):self.run_copy()
+  self.assertFalse(list((self.root/'tools').glob('*live*')))
+ def test_duplicate_gate_assignment_refused(self):
+  f=copy.deepcopy(self.files);f['core/nv_baseline.py']+=b'\nNV_IO_DISABLED=True\n';dest={g:self.root/'tools'/(a.DEST_STEMS[g]+'1234567890abcdef') for g in a.GROUPS}
+  with self.assertRaisesRegex(a.Refusal,'exactly once'):a.reseal(f,dest,json.loads(f['core/ACTIVATION_RECIPE.json']))
+ def test_symlink_source_refused(self):
+  p=self.root/'tools'/a.GROUPS['core']/'nv_baseline.py';p.rename(p.with_suffix('.original'));p.symlink_to(p.with_suffix('.original'))
+  with self.assertRaisesRegex(a.Refusal,'unsafe'):self.run_copy()
+ def test_external_material_drift_refused(self):
+  Path(self.external[0]['path']).write_bytes(b'changed')
+  with self.assertRaisesRegex(a.Refusal,'external input'):self.run_copy()
+ def test_copy_interruption_retains_partial_and_stop(self):
+  real=a.write_new;count=[0]
+  def fail(p,b):
+   count[0]+=1
+   if count[0]==5:raise OSError('SYNTHETIC disk interruption')
+   return real(p,b)
+  with patch.object(a,'write_new',side_effect=fail),self.assertRaises(OSError):self.run_copy()
+  control=self.root/'tools/e5_activation_bundle_1234567890abcdef';self.assertTrue((control/'STOP.json').exists());self.assertFalse((control/'COMPLETE.json').exists());self.assertTrue(list((self.root/'tools').glob('*live*')))
+  with self.assertRaises(a.Refusal):self.run_copy()
+ def test_wrong_original_dependency_pin_refused(self):
+  f=copy.deepcopy(self.files);s=f['core/probe_host.py'].decode().replace("ADAPTER_SHA = '6c0108", "ADAPTER_SHA = '0c0108");f['core/probe_host.py']=s.encode();dest={g:self.root/'tools'/(a.DEST_STEMS[g]+'1234567890abcdef') for g in a.GROUPS}
+  with self.assertRaisesRegex(a.Refusal,'original adapter pin'):a.reseal(f,dest,json.loads(f['core/ACTIVATION_RECIPE.json']))
+if __name__=='__main__':unittest.main(verbosity=2)

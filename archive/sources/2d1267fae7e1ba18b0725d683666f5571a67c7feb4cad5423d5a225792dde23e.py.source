@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Bounded, receive-only @modemd observer. Preparation CLI cannot connect."""
+import argparse
+import base64
+import datetime
+import errno
+import json
+import socket
+import sys
+import time
+
+DEVICE_EXECUTION_ENABLED = False
+ADDRESS = b"\x00modemd"
+CONNECT_ATTEMPTS = 5
+RETRY_DELAY = 0.5
+IO_TIMEOUT = 1.0
+CHUNK_BYTES = 4096
+TERMINAL_RESERVE = 1024
+
+
+class OutputLimit(Exception):
+    pass
+
+
+def validate_limits(duration, max_raw, max_output):
+    if not 0 < duration <= 1800:
+        raise ValueError("duration must be >0 and <=1800 seconds")
+    if not 1 <= max_raw <= 1048576:
+        raise ValueError("max-raw-bytes must be 1..1048576")
+    if not 4096 <= max_output <= 2097152:
+        raise ValueError("max-output-bytes must be 4096..2097152")
+
+
+class Jsonl:
+    def __init__(self, output, clock, utc, limit):
+        self.output, self.clock, self.utc, self.limit = output, clock, utc, limit
+        self.used, self.seq = 0, 0
+
+    def emit(self, event, terminal=False, **fields):
+        record = {"schema": 1, "seq": self.seq, "time_utc": self.utc(),
+                  "monotonic_ns": self.clock(), "event": event, **fields}
+        line = (json.dumps(record, separators=(",", ":"), ensure_ascii=True) + "\n").encode("ascii")
+        ceiling = self.limit if terminal else self.limit - TERMINAL_RESERVE
+        if self.used + len(line) > ceiling:
+            raise OutputLimit()
+        written = self.output.write(line)
+        if written is not None and written != len(line):
+            raise OSError(errno.EIO, "short stdout write")
+        self.output.flush()
+        self.used += len(line)
+        self.seq += 1
+
+    def receive_capacity(self):
+        # Each recv event has <512 bytes of fixed metadata for production UTC,
+        # uint64 monotonic values, bounded counters, and <=4096 raw bytes.
+        available = self.limit - TERMINAL_RESERVE - self.used - 512
+        return max(0, min(CHUNK_BYTES, (available // 4) * 3))
+
+
+def utc_now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds")
+
+
+def observe(output, duration=180.0, max_raw=131072, max_output=262144,
+            socket_factory=socket.socket, clock=time.monotonic_ns,
+            utc=utc_now, sleep=time.sleep):
+    """Internal tested engine. Only constructor/connect/settimeout/recv/close.
+
+    Callers own stdout redirection; this engine opens no file. Production callers
+    must use main's hard gate. Test injection is local-only, not a CLI bypass.
+    """
+    validate_limits(duration, max_raw, max_output)
+    log = Jsonl(output, clock, utc, max_output)
+    deadline = clock() + int(duration * 1_000_000_000)
+    peer, received, chunks, attempts = None, 0, 0, 0
+    reason, code = "connection_failed", 3
+
+    def remaining():
+        return max(0.0, (deadline - clock()) / 1_000_000_000)
+
+    try:
+        log.emit("start", address="@modemd", receive_only=True,
+                 duration_seconds=duration, max_raw_bytes=max_raw,
+                 max_output_bytes=max_output, max_connect_attempts=CONNECT_ATTEMPTS)
+        for attempt in range(1, CONNECT_ATTEMPTS + 1):
+            if remaining() <= 0:
+                reason, code = "duration_limit", 0
+                break
+            attempts = attempt
+            log.emit("connect_attempt", attempt=attempt)
+            try:
+                peer = socket_factory(socket.AF_UNIX, socket.SOCK_STREAM)
+                peer.settimeout(min(IO_TIMEOUT, remaining()))
+                peer.connect(ADDRESS)
+                log.emit("connected", attempt=attempt)
+                break
+            except OSError as error:
+                if peer is not None:
+                    peer.close()
+                    peer = None
+                log.emit("connect_error", attempt=attempt,
+                         error_type=type(error).__name__, errno=error.errno)
+                if attempt < CONNECT_ATTEMPTS and remaining() > 0:
+                    sleep(min(RETRY_DELAY, remaining()))
+        if peer is not None:
+            while True:
+                if remaining() <= 0:
+                    reason, code = "duration_limit", 0
+                    break
+                if received >= max_raw:
+                    reason, code = "raw_limit", 0
+                    break
+                size = min(max_raw - received, log.receive_capacity())
+                if size <= 0:
+                    reason, code = "output_limit", 0
+                    break
+                peer.settimeout(min(IO_TIMEOUT, remaining()))
+                try:
+                    chunk = peer.recv(size)
+                except socket.timeout:
+                    continue
+                except OSError as error:
+                    log.emit("receive_error", error_type=type(error).__name__, errno=error.errno)
+                    reason, code = "receive_error", 4
+                    break
+                if not chunk:
+                    reason, code = "eof", 0
+                    break
+                # Treat recv chunks as bytes, never as complete messages/text.
+                received += len(chunk)
+                chunks += 1
+                log.emit("recv", bytes=len(chunk), total_raw_bytes=received,
+                         base64=base64.b64encode(chunk).decode("ascii"))
+    except OutputLimit:
+        reason, code = "output_limit", 0
+    except KeyboardInterrupt:
+        reason, code = "cancelled", 130
+    finally:
+        if peer is not None:
+            peer.close()
+    log.emit("end", terminal=True, reason=reason, raw_bytes=received,
+             chunks=chunks, connect_attempts=attempts, exit_code=code)
+    return code
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", default="contract", choices=("contract", "observe"))
+    parser.add_argument("--duration", type=float, default=180.0)
+    parser.add_argument("--max-raw-bytes", type=int, default=131072)
+    parser.add_argument("--max-output-bytes", type=int, default=262144)
+    args = parser.parse_args(argv)
+    try:
+        validate_limits(args.duration, args.max_raw_bytes, args.max_output_bytes)
+    except ValueError as error:
+        parser.error(str(error))
+    if args.mode == "contract":
+        print(json.dumps({"device_execution_enabled": DEVICE_EXECUTION_ENABLED,
+                          "address": "@modemd", "socket_payload_send_bytes": 0,
+                          "duration_seconds": args.duration, "max_raw_bytes": args.max_raw_bytes,
+                          "max_output_bytes": args.max_output_bytes,
+                          "max_connect_attempts": CONNECT_ATTEMPTS,
+                          "reconnect_after_connected": False, "device_file_writes": False}))
+        return 0
+    if not DEVICE_EXECUTION_ENABLED:
+        print(json.dumps({"event": "refused", "reason": "PREPARATION_HARD_DISABLED",
+                          "device_execution_enabled": False}))
+        return 2
+    try:
+        return observe(sys.stdout.buffer, args.duration, args.max_raw_bytes, args.max_output_bytes)
+    except (BrokenPipeError, OSError):
+        # A broken/blocked sink cannot be called a completed capture; no retry.
+        return 5
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,471 @@
+"""Host-temporary-directory model of a bounded e5linux directory transaction.
+
+No transport, device executor, mount, subprocess or image writer is provided.
+The public boundary accepts only sandboxes created under tempfile.gettempdir().
+Android adapters must independently establish quiescence, fresh device evidence,
+same-filesystem directory fsync semantics and the frozen image attestation. This
+model is not evidence that Android/F2FS rename durability has been tested.
+"""
+from __future__ import annotations
+
+import contextlib
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+import uuid
+
+
+PREFIX = "e5-clean-author-model-"
+TREE_SCHEMA = "e5-host-tree-v1"
+PLAN_SCHEMA = "e5-host-directory-transaction-v1"
+EVENTS = {"PREPARED", "ARCHIVE_BEGIN", "ARCHIVED", "ACTIVATE_BEGIN", "ACTIVATED",
+          "FAILED_CANDIDATE_BOUND", "PRESERVE_FAILED_BEGIN", "FAILED_PRESERVED",
+          "RESTORE_BEGIN", "ROLLED_BACK"}
+ANDROID_ADAPTER_CONTRACT = {
+    "implemented": False,
+    "device_io_allowed": False,
+    "image_selection": "openwrt",
+    "default_boot": "android",
+    "needs": ["fresh stable rooted Android A / assessed panic / bound boot ID",
+              "no mounts, loop backing or writers for the source image",
+              "fixed target directory identity, same filesystem and no symlinks",
+              "fresh full source snapshot, own vendor and physical NV baseline",
+              "file AND parent directory fsync on actual Android filesystem",
+              "independent candidate rootfs inspection and current space check",
+              "separate reviewed B/misc32 transaction and explicit execution approval"],
+    "not_guaranteed": "two renames are recoverable steps, not one atomic exchange",
+}
+
+
+class Refused(RuntimeError):
+    pass
+
+
+def require(value, message):
+    if not value:
+        raise Refused(message)
+
+
+def canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _txid(value):
+    require(isinstance(value, str) and re.fullmatch(r"[a-f0-9]{16}", value), "invalid transaction ID")
+    return value
+
+
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_new(path, data):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    _fsync_dir(path.parent)
+
+
+def _rename_noreplace(source, destination):
+    """Atomic no-replace on the host, never shell out or fall back to overwrite."""
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin" and hasattr(library, "renameatx_np"):
+        call = library.renameatx_np
+        call.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        result = call(-2, os.fsencode(source), -2, os.fsencode(destination), 0x4)  # RENAME_EXCL
+    elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
+        call = library.renameat2
+        call.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+        result = call(-100, os.fsencode(source), -100, os.fsencode(destination), 1)
+    else:
+        raise Refused("host atomic no-replace rename unavailable; no unsafe fallback")
+    if result:
+        number = ctypes.get_errno()
+        raise Refused("no-replace rename failed: " + os.strerror(number))
+
+
+def _regular_bytes(path, device):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_dev == device,
+                "nonregular, hard-linked or foreign-filesystem input")
+        data = stream.read()
+        after = os.fstat(stream.fileno())
+    require((before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+            (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns), "file changed while read")
+    require(path.lstat().st_ino == before.st_ino, "path changed while read")
+    return data
+
+
+class HostSandbox:
+    """Only host /tmp-like sandboxes; deliberately cannot represent real /data."""
+
+    @classmethod
+    def create(cls):
+        root = Path(tempfile.mkdtemp(prefix=PREFIX)).resolve()
+        os.chmod(root, 0o700)
+        (root / "data").mkdir(mode=0o700)
+        (root / "transactions").mkdir(mode=0o700)
+        marker = {"schema": "e5-host-sandbox-v1", "id": uuid.uuid4().hex,
+                  "path": str(root), "host_only": True}
+        _write_new(root / "sandbox.json", canonical(marker) + b"\n")
+        _write_new(root / "lock", b"")
+        _fsync_dir(root)
+        _fsync_dir(root.parent)
+        return cls.open(root)
+
+    @classmethod
+    def open(cls, path):
+        value = Path(path)
+        temp = Path(tempfile.gettempdir()).resolve()
+        require(value.is_absolute() and value.parent == temp and value.name.startswith(PREFIX),
+                "only a generated direct child of the host temporary directory is allowed")
+        require(value == value.resolve() and not value.is_symlink(), "sandbox path alias/symlink")
+        info = value.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and
+                stat.S_IMODE(info.st_mode) == 0o700 and not os.path.ismount(value), "unsafe sandbox")
+        marker = json.loads(_regular_bytes(value / "sandbox.json", info.st_dev))
+        require(marker.get("schema") == "e5-host-sandbox-v1" and marker.get("host_only") is True and
+                marker.get("path") == str(value) and re.fullmatch(r"[0-9a-f]{32}", marker.get("id", "")),
+                "invalid sandbox capability marker")
+        obj = cls.__new__(cls)
+        obj.root, obj.device, obj.identity, obj.inode = value, info.st_dev, marker["id"], info.st_ino
+        obj._check()
+        return obj
+
+    @property
+    def active(self):
+        return self.root / "data/e5linux"
+
+    def stage(self, txid):
+        return self.root / "data" / ("e5linux.stage." + _txid(txid))
+
+    def archive(self, txid):
+        return self.root / "data" / ("e5linux.archive." + _txid(txid))
+
+    def failed(self, txid):
+        return self.root / "data" / ("e5linux.failed." + _txid(txid))
+
+    def _check(self):
+        info = self.root.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_ino == self.inode and info.st_dev == self.device,
+                "sandbox replaced")
+        for path in (self.root / "data", self.root / "transactions"):
+            node = path.lstat()
+            require(stat.S_ISDIR(node.st_mode) and node.st_dev == self.device and not path.is_symlink()
+                    and not os.path.ismount(path), "unsafe sandbox subdirectory")
+
+    @contextlib.contextmanager
+    def locked(self):
+        self._check()
+        fd = os.open(self.root / "lock", os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and info.st_dev == self.device,
+                    "unsafe lock")
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._check()
+            yield
+        finally:
+            os.close(fd)
+
+    def snapshot(self, path):
+        """Hash ordinary files without loading multi-GiB images into memory."""
+        self._check()
+        path = Path(path)
+        require(path.parent == self.root / "data" and
+                re.fullmatch(r"e5linux(?:\.(?:stage|archive|failed)\.[0-9a-f]{16})?", path.name),
+                "tree path outside fixed simulated data names")
+        rows, total = [], 0
+
+        def walk(current, relative):
+            nonlocal total
+            before = current.lstat()
+            require(before.st_dev == self.device and not current.is_symlink(), "symlink/foreign filesystem")
+            if stat.S_ISDIR(before.st_mode):
+                require(not os.path.ismount(current), "mounted tree refused")
+                rows.append({"path": relative, "type": "directory", "mode": stat.S_IMODE(before.st_mode)})
+                for child in sorted(current.iterdir(), key=lambda p: p.name):
+                    walk(child, child.name if relative == "." else relative + "/" + child.name)
+                after = current.lstat()
+                require((before.st_ino, before.st_mtime_ns, before.st_ctime_ns) ==
+                        (after.st_ino, after.st_mtime_ns, after.st_ctime_ns), "directory changed during hash")
+            else:
+                require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1, "special/hard-linked file refused")
+                fd = os.open(current, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                h, count = hashlib.sha256(), 0
+                with os.fdopen(fd, "rb") as stream:
+                    opened = os.fstat(stream.fileno())
+                    require(opened.st_ino == before.st_ino and opened.st_dev == self.device,
+                            "file changed before open")
+                    while chunk := stream.read(1024 * 1024):
+                        h.update(chunk)
+                        count += len(chunk)
+                    after = os.fstat(stream.fileno())
+                require((before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                        (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) and
+                        current.lstat().st_ino == before.st_ino and count == before.st_size,
+                        "file changed during hash")
+                rows.append({"path": relative, "type": "file", "mode": stat.S_IMODE(before.st_mode),
+                             "bytes": count, "sha256": h.hexdigest()})
+                total += count
+        walk(path, ".")
+        body = {"schema": TREE_SCHEMA, "files": rows, "total_bytes": total}
+        return dict(body, tree_hash=digest(canonical(body)))
+
+
+def _manifest(value):
+    require(isinstance(value, dict) and set(value) == {"schema", "files", "total_bytes", "tree_hash"},
+            "invalid tree manifest fields")
+    body = {k: value[k] for k in ("schema", "files", "total_bytes")}
+    require(value["schema"] == TREE_SCHEMA and value["tree_hash"] == digest(canonical(body)),
+            "tree manifest identity mismatch")
+    return value
+
+
+def _candidate(sb, path, manifest, attestation):
+    files = {x["path"]: x for x in manifest["files"] if x["type"] == "file"}
+    allowed = {"openwrt.ext4", "boot-os", "openwrt-default-boot", "openwrt-install.conf",
+               "boot.img", "openwrt.ext4.gz", "device-files.tar", "fscrypt-probe"}
+    require(set(files) <= allowed and all(x["type"] == "file" or x["path"] == "."
+                                         for x in manifest["files"]), "unknown candidate file/directory or pending marker")
+    for name in ("openwrt.ext4", "boot-os", "openwrt-default-boot", "openwrt-install.conf"):
+        require(name in files, "missing candidate file: " + name)
+    require(_regular_bytes(path / "boot-os", sb.device) == b"openwrt\n", "image selection must be openwrt")
+    require(_regular_bytes(path / "openwrt-default-boot", sb.device) == b"android\n", "outer default must be Android")
+    conf = _regular_bytes(path / "openwrt-install.conf", sb.device).decode("utf-8")
+    values = {}
+    for line in conf.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        entry = re.fullmatch(r"(E5_APN|E5_WIFI_SSID|E5_WIFI_KEY|E5_WIFI_CHANNEL|E5_DEFAULT_BOOT)='([^'\n\r]*)'", line)
+        require(entry is not None and entry[1] not in values, "nonliteral/duplicate/unknown installation config")
+        values[entry[1]] = entry[2]
+    require(values.get("E5_DEFAULT_BOOT") == "android", "unique Android default declaration required")
+    require(isinstance(attestation, dict) and attestation.get("rootfs_checked_sha256") == files["openwrt.ext4"]["sha256"]
+            and attestation.get("image_selection") == "openwrt" and attestation.get("default_boot") == "android",
+            "rootfs attestation binding mismatch")
+    for key in ("inner_default_android", "no_private_nv", "no_previous_origin", "no_pending_update"):
+        require(attestation.get(key) is True, "offline candidate gate missing: " + key)
+    require(isinstance(attestation.get("reviewer"), str) and attestation["reviewer"].strip(), "named reviewer required")
+    # This is a host model's asserted input, not signature/identity authentication.
+
+
+class DirectoryTransaction:
+    @classmethod
+    def prepare(cls, sb, txid, original_manifest, candidate_manifest, attestation,
+                reserve_bytes=1024 * 1024, fault=None):
+        _txid(txid)
+        _manifest(original_manifest); _manifest(candidate_manifest)
+        require(type(reserve_bytes) is int and reserve_bytes >= 65536, "insufficient journal reserve policy")
+        with sb.locked():
+            names = {p.name for p in (sb.root / "data").iterdir()}
+            require(names == {sb.active.name, sb.stage(txid).name}, "unknown/mixed transaction data trees")
+            require(not any((sb.root / "transactions").iterdir()), "sandbox already has a transaction")
+            require(sb.snapshot(sb.active) == original_manifest, "original tree changed")
+            require(sb.snapshot(sb.stage(txid)) == candidate_manifest, "candidate tree changed")
+            require(original_manifest["tree_hash"] != candidate_manifest["tree_hash"], "identical trees: no switch needed")
+            _candidate(sb, sb.stage(txid), candidate_manifest, attestation)
+            fs = os.statvfs(sb.root)
+            require(fs.f_bavail * fs.f_frsize >= reserve_bytes, "insufficient host sandbox space")
+            plan = {"schema": PLAN_SCHEMA, "sandbox_id": sb.identity, "txid": txid,
+                    "original": original_manifest, "candidate": candidate_manifest,
+                    "attestation": attestation, "reserve_bytes": reserve_bytes,
+                    "device_execution_authorized": False, "host_model_only": True}
+            meta = sb.root / "transactions" / txid
+            meta.mkdir(mode=0o700); _fsync_dir(meta.parent)
+            _write_new(meta / "plan.json", canonical(plan) + b"\n")
+            _write_new(meta / "journal.jsonl", b"")
+        obj = cls.load(sb, txid, fault)
+        with sb.locked():
+            obj._event("PREPARED")
+        return obj
+
+    @classmethod
+    def load(cls, sb, txid, fault=None):
+        _txid(txid); sb._check()
+        meta = sb.root / "transactions" / txid
+        info = meta.lstat()
+        require(stat.S_ISDIR(info.st_mode) and info.st_dev == sb.device and not meta.is_symlink()
+                and not os.path.ismount(meta), "unsafe transaction metadata")
+        plan = json.loads(_regular_bytes(meta / "plan.json", sb.device))
+        require(plan.get("schema") == PLAN_SCHEMA and plan.get("txid") == txid and
+                plan.get("sandbox_id") == sb.identity and plan.get("host_model_only") is True and
+                plan.get("device_execution_authorized") is False, "mixed/invalid transaction plan")
+        _manifest(plan["original"]); _manifest(plan["candidate"])
+        obj = cls.__new__(cls)
+        obj.sb, obj.txid, obj.meta, obj.plan, obj.fault = sb, txid, meta, plan, fault
+        obj.meta_inode = info.st_ino
+        obj.plan_hash = digest(canonical(plan))
+        obj._records()
+        return obj
+
+    def _hit(self, label):
+        if self.fault:
+            self.fault(label)
+
+    def _records(self):
+        self.sb._check()
+        node = self.meta.lstat()
+        require(stat.S_ISDIR(node.st_mode) and node.st_ino == self.meta_inode and node.st_dev == self.sb.device
+                and not os.path.ismount(self.meta), "metadata directory replaced")
+        require(digest(canonical(json.loads(_regular_bytes(self.meta / "plan.json", self.sb.device)))) ==
+                self.plan_hash, "frozen plan changed")
+        data = _regular_bytes(self.meta / "journal.jsonl", self.sb.device)
+        require(not data or data.endswith(b"\n"), "torn journal: preserve evidence; manual review required")
+        records, previous = [], "0" * 64
+        for line in data.splitlines():
+            record = json.loads(line)
+            claimed = record.pop("record_hash")
+            require(record.get("seq") == len(records) + 1 and record.get("previous") == previous and
+                    record.get("plan_hash") == self.plan_hash and record.get("txid") == self.txid and
+                    record.get("event") in EVENTS and digest(canonical(record)) == claimed, "journal identity/chain mismatch")
+            record["record_hash"] = claimed
+            records.append(record); previous = claimed
+        return records
+
+    def _event(self, event, **values):
+        records = self._records()
+        record = {"seq": len(records) + 1, "previous": records[-1]["record_hash"] if records else "0" * 64,
+                  "txid": self.txid, "plan_hash": self.plan_hash, "event": event, **values}
+        record["record_hash"] = digest(canonical(record))
+        fd = os.open(self.meta / "journal.jsonl", os.O_WRONLY | os.O_APPEND | os.O_NOFOLLOW)
+        with os.fdopen(fd, "ab") as stream:
+            stream.write(canonical(record) + b"\n"); stream.flush(); os.fsync(stream.fileno())
+        self._hit("after_journal_" + event)
+
+    def _state(self):
+        self.sb._check(); records = self._records()
+        paths = {"active": self.sb.active, "stage": self.sb.stage(self.txid),
+                 "archive": self.sb.archive(self.txid), "failed": self.sb.failed(self.txid)}
+        allowed = {p.name for p in paths.values()}
+        require({p.name for p in (self.sb.root / "data").iterdir()} <= allowed, "foreign transaction tree")
+        trees = {k: self.sb.snapshot(p) if p.exists() or p.is_symlink() else None for k, p in paths.items()}
+        old, candidate = self.plan["original"], self.plan["candidate"]
+        bound = [x.get("manifest") for x in records if x["event"] == "FAILED_CANDIDATE_BOUND"]
+        require(len(bound) <= 1, "multiple failure bindings")
+        failed_expected = _manifest(bound[0]) if bound else candidate
+        a, s, o, f = (trees[k] for k in ("active", "stage", "archive", "failed"))
+        if a == old and s == candidate and o is None and f is None:
+            state = "PREPARED"
+        elif a is None and s == candidate and o == old and f is None:
+            state = "ARCHIVED"
+        elif a is not None and s is None and o == old and f is None:
+            state = "ACTIVE" if a == failed_expected else "ACTIVE_MODIFIED_REQUIRES_BINDING"
+        elif a is None and s is None and o == old and f == failed_expected:
+            state = "ROLLBACK_GAP"
+        elif a == old and s is None and o is None and f == failed_expected:
+            state = "ROLLED_BACK"
+        else:
+            raise Refused("unknown disk layout/tree identity; no automatic action")
+        events = [x["event"] for x in records]
+        require(not ("ROLLED_BACK" in events and state != "ROLLED_BACK"), "disk contradicts rollback journal")
+        require(not ("ACTIVATED" in events and state in ("PREPARED", "ARCHIVED")), "disk contradicts activation journal")
+        return state, trees, records
+
+    def inspect(self):
+        with self.sb.locked():
+            state, trees, records = self._state()
+            return {"state": state, "plan_hash": self.plan_hash, "txid": self.txid,
+                    "trees": {k: v["tree_hash"] if v else None for k, v in trees.items()},
+                    "journal_events": [r["event"] for r in records], "device_execution_authorized": False}
+
+    def _rename(self, source, destination, label):
+        require(source.parent == destination.parent == self.sb.root / "data", "rename must stay on simulated data")
+        require(not destination.exists() and not destination.is_symlink(), "rename destination occupied")
+        _rename_noreplace(source, destination)
+        self._hit("after_" + label + "_rename")
+        _fsync_dir(source.parent)
+        self._hit("after_" + label + "_dir_fsync")
+
+    def activate(self):
+        with self.sb.locked():
+            state, _, records = self._state()
+            require(state in ("PREPARED", "ARCHIVED", "ACTIVE"), "activation not safe in this state")
+            require(not any(r["event"] in ("FAILED_CANDIDATE_BOUND", "PRESERVE_FAILED_BEGIN", "RESTORE_BEGIN")
+                            for r in records), "rollback has begun; activation forbidden")
+            if state == "ACTIVE":
+                # A process may have died after rename but before its parent fsync.
+                _fsync_dir(self.sb.root / "data")
+                if not any(r["event"] == "ACTIVATED" for r in records): self._event("ACTIVATED")
+            else:
+                fs = os.statvfs(self.sb.root)
+                require(fs.f_bavail * fs.f_frsize >= self.plan["reserve_bytes"], "space changed before activation")
+                _candidate(self.sb, self.sb.stage(self.txid), self.plan["candidate"], self.plan["attestation"])
+                if state == "PREPARED":
+                    self._event("ARCHIVE_BEGIN")
+                    require(self.sb.snapshot(self.sb.active) == self.plan["original"], "original changed before rename")
+                    self._rename(self.sb.active, self.sb.archive(self.txid), "archive")
+                    self._event("ARCHIVED")
+                # Always reconcile actual content, including a crash after the first rename.
+                require(self._state()[0] == "ARCHIVED", "archive transition mismatch")
+                self._event("ACTIVATE_BEGIN")
+                require(self.sb.snapshot(self.sb.stage(self.txid)) == self.plan["candidate"], "candidate changed before rename")
+                self._rename(self.sb.stage(self.txid), self.sb.active, "activate")
+                require(self._state()[0] == "ACTIVE", "activated tree mismatch")
+                self._event("ACTIVATED")
+        return self.inspect()
+
+    def rollback(self, candidate_current_manifest=None):
+        with self.sb.locked():
+            state, trees, records = self._state()
+            if state == "PREPARED":
+                require(candidate_current_manifest is None, "no active candidate to bind")
+                return {"state": "NO_SWITCH_OCCURRED", "candidate_preserved_at": str(self.sb.stage(self.txid)),
+                        "device_execution_authorized": False}
+            if state in ("ACTIVE", "ACTIVE_MODIFIED_REQUIRES_BINDING"):
+                if state == "ACTIVE_MODIFIED_REQUIRES_BINDING":
+                    require(candidate_current_manifest is not None, "changed active candidate needs explicit fresh full manifest")
+                    _manifest(candidate_current_manifest)
+                    require(trees["active"] == candidate_current_manifest, "candidate failure binding mismatch")
+                    require(not any(x["event"] == "FAILED_CANDIDATE_BOUND" for x in records), "failure tree drifted after binding")
+                    self._event("FAILED_CANDIDATE_BOUND", manifest=candidate_current_manifest)
+                elif candidate_current_manifest is not None:
+                    require(trees["active"] == _manifest(candidate_current_manifest), "candidate binding mismatch")
+                self._event("PRESERVE_FAILED_BEGIN")
+                require(self._state()[0] == "ACTIVE", "candidate changed after failure binding")
+                self._rename(self.sb.active, self.sb.failed(self.txid), "preserve_failed")
+                self._event("FAILED_PRESERVED")
+                state = self._state()[0]
+            if state == "ARCHIVED":
+                # Candidate was never activated: keep it as the failed candidate too.
+                self._event("PRESERVE_FAILED_BEGIN")
+                self._rename(self.sb.stage(self.txid), self.sb.failed(self.txid), "preserve_failed")
+                self._event("FAILED_PRESERVED")
+                state = self._state()[0]
+            if state == "ROLLBACK_GAP":
+                _fsync_dir(self.sb.root / "data")
+                self._event("RESTORE_BEGIN")
+                require(self.sb.snapshot(self.sb.archive(self.txid)) == self.plan["original"], "archive changed")
+                self._rename(self.sb.archive(self.txid), self.sb.active, "restore")
+                require(self._state()[0] == "ROLLED_BACK", "restored tree mismatch")
+                self._event("ROLLED_BACK")
+            elif state == "ROLLED_BACK":
+                _fsync_dir(self.sb.root / "data")
+                if not any(x["event"] == "ROLLED_BACK" for x in self._records()): self._event("ROLLED_BACK")
+            else:
+                raise Refused("rollback state unrecognized")
+        return self.inspect()
+
+
+if __name__ == "__main__":
+    raise SystemExit("Host model library only; no CLI, transport or device execution entry point.")

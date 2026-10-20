@@ -1,0 +1,25 @@
+# Bounded stage creation — prepared only
+
+`bounded_stage.py` is an isolated, disabled wrapper around the frozen v3 Android directory adapter. `STAGE_IO_DISABLED=True` is literal, with no command-line or environment override. It has no device CLI. No enabled copy has been generated and no device operation was performed during this preparation.
+
+The current scanner calibration failed and the shared uncertainty barrier remains a separate stop condition. This wrapper cannot bypass occupancy, transport barriers, source pins, cancellation, or phase deadlines. It is not currently an executable continuation plan.
+
+The future library interface is `BoundedStage(exact_live_adapter).run(five_artifacts, raw_image)`. Both arguments must use the frozen adapter's exact `Artifact` type; the adapter must be its exact class, loaded from the fixed, hash-pinned source. The raw pristine 2 GiB image must already be decompressed and fully hash-checked on the Mac. The wrapper pins the same five uploaded inputs, raw image, eight final filenames, and Android default as the existing stage implementation. `boot-os=openwrt` selects the Linux image; `openwrt-default-boot=android` preserves the default return system.
+
+The change replaces only the old create-stage orchestration and repeats the existing stage file loop. It does not call `adapter.stage`, `acquire`, `upload_helper`, or `_short_mutation`; in particular it does not create the stage twice. The fixed path is `/data/e5linux.stage.<16-lowercase-hex-txid>`. Existing stage paths, including symlinks, are rejected. The original active tree, lock, and helper paths must already exist in their approved state.
+
+The complete create-stage shell body runs inside the fixed BusyBox `timeout -s TERM 6`, with a device boottime deadline immediately before and after the one `mkdir`. The existing host request limit is eight seconds. The adapter's root guard is still outside this inner wrapper; neither timeout proves that a kernel-blocked remote syscall has terminated. Any timeout, cancellation, failed readback, lost acknowledgement, or host persistence failure is uncertain and stops without retry or cleanup.
+
+The mutation remains ACTIVE until independent readonly requests confirm unchanged `/data`, active-directory, and lock device/inode identities, then confirm the new directory is canonical, not a symlink, empty, on the same device, has a positive inode, and has root:root ownership and mode 0700. Lock-owner content is checked using the frozen adapter's `_locked` guard. Only then can existing `_write_file_chunk` write the eight fixed ordinary stage files in at most 4 MiB chunks, preserving its native identity/deadline/fsync and same-ACTIVE independent readback checks. Per-file fscrypt probes and the final full stage inventory remain unchanged.
+
+No block partition, B-slot or misc write, active/archive/failed directory rename, reboot, restore, automatic retry, or cleanup is provided. The ordinary stage can remain partially created after an error; it is preserved for independent reconciliation. This wrapper does not demonstrate device/F2FS durability or resolve the current scanner failure.
+
+`BOUNDED_STAGE_RESULT.json` contains the final inventory and create operation ID, but is not sufficient by itself to authorize activation. A caller must verify the matching local and shared transport COMPLETE receipts for creation and all chunk operations, successful final inventory, and absence of ACTIVE/UNCERTAIN/UNKNOWN/recovery barriers. Receipt existence must not be used to override a later persistence failure or shared uncertainty marker.
+
+The 20 fixture tests use only temporary host files and a fake adapter. A process/socket audit hook is installed before importing the wrapper. Tests patch input sizes/hashes only inside the fake harness; the shipped production pins remain unchanged. Tests cover the disabled gate, exact-class rejection, eight-file mapping, same-ACTIVE readback, deadlines, existing-stage guard, wrong filesystem/inode/ownership/mode, source changes, bad stdout, failed COMPLETE persistence, chunk/readback failure, interruption, fscrypt failure, and no replay. They do not execute the real adapter, native helpers, shell, ADB, USB, or VM and do not validate hardware behavior.
+
+Run only the host tests:
+
+```sh
+python3 -B -m unittest -v test_bounded_stage.py
+```

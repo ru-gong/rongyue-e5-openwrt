@@ -1,0 +1,204 @@
+"""Host-only contract and simulated sequencing. Never imports any device backend."""
+import contextlib,copy,datetime as dt,importlib.util,json,os,sys,tempfile,threading,time,types,unittest
+from pathlib import Path
+from unittest.mock import patch
+
+def deny(event,args):
+    if event.startswith('socket.') or event in ('subprocess.Popen','os.system','os.exec','os.posix_spawn','os.posix_spawnp'):
+        raise AssertionError('all external processes/network forbidden')
+sys.addaudithook(deny)
+p=Path(__file__).with_name('stage2_deploy.py');spec=importlib.util.spec_from_file_location('stage2_under_test',p);m=importlib.util.module_from_spec(spec);sys.modules[spec.name]=m;spec.loader.exec_module(m)
+BOOT='00000000-0000-4000-8000-000000000001';TX='0123456789abcdef'
+
+def row(ino,kind='d',mode='700',uid=0,gid=0):
+    return dict(mode_bits=(0o40000 if kind=='d' else 0o100000)|int(mode,8),dev=66367,inode=ino,bytes=17 if kind=='f' else 4096,
+        mode=mode,uid=uid,gid=gid,nlink=1,mtime='100',ctime='100',mtime_text='t',ctime_text='t',rdev_major=0,rdev_minor=0,type=kind)
+def snapshot(new=False):
+    d={'data':row(1,mode='771',uid=1000,gid=1000),'local':row(2,mode='751'),'tmp':row(3,mode='771',gid=2000),
+       'old_lock':row(4),'old_owner':row(5,'f','600'),'old_owner_hex':(m.OLD_TX+'\n').encode().hex()}
+    if new:d.update(new_lock=row(6),new_owner=row(7,'f','600'))
+    return d
+
+class ContractTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='e5-stage2-contract-');self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve()
+        self.here=self.root/'tools/e5_scanner_deploy_next_prepare_20261015';self.here.mkdir(parents=True);self.core=self.root/'tools/e5_nextphase_core_prepare_20261015';self.core.mkdir()
+        self.state=self.root/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED';self.state.mkdir(parents=True)
+        self.save(self.state/'STATE_BINDING.json',{'schema':'e5-transport-state-v1','serial':m.SERIAL})
+        self.contract=self.root/'tools/e5_next_recovery_prepare_20261015/evidence_contract.py';self.contract.parent.mkdir();self.contract.write_text('# synthetic contract only\n')
+        self.mod=types.ModuleType('synthetic_stage2_cold');self.mod.__file__=str(self.contract)
+        self.mod.c=types.SimpleNamespace(__file__=str(self.contract.with_name('common.py')));self.mod.observer=types.SimpleNamespace(__file__=str(self.contract.with_name('observe.py')))
+        self.at=dt.datetime.now(dt.timezone.utc);self.exp=self.at+dt.timedelta(seconds=800)
+        self.sb=self.save(self.root/'synthetic-state-snapshot.json',{'used_txids':[m.OLD_TX]})
+        self.gate={'state_snapshot':self.sb,'schema':'e5-next-directory-ready-v1','status':'ORIGINALS_VERIFIED','boot_id':BOOT,'serial':m.SERIAL,'expires_at':self.exp.isoformat(),'checked_at':self.at.isoformat(),'evidence_sha256':'a'*64}
+        def validator(binding,boot,at):
+            if binding!={'path':str(self.root/'synthetic-cold.json'),'sha256':'b'*64} or boot!=BOOT:raise RuntimeError('wrong fixture input')
+            return {**self.gate,'checked_at':at.isoformat()}
+        validator.__module__=self.mod.__name__;self.mod.validate_directory_ready=validator;sys.modules[self.mod.__name__]=self.mod;self.addCleanup(sys.modules.pop,self.mod.__name__)
+        for n in ('common.py','observe.py'):self.contract.with_name(n).write_text('# synthetic dependency\n')
+        for n in ('android_directory_adapter.py','bounded_transport.py'):(self.core/n).write_text('# synthetic, no I/O\n')
+        arts={}
+        for key in ('archiver','scanner','io_helper','helper'):
+            q=self.here/(key+'.bin');q.write_bytes(key.encode());arts[key]={'path':str(q),'bytes':q.stat().st_size,'sha256':m.sha(q.read_bytes())}
+        self.manifest={'schema':'e5-next-scanner-artifact-manifest-v1','production_binaries_executed':False,'host_source_sha256':m.sha(p.read_bytes()),
+             'core':{n:m.bind(self.core/n) for n in ('android_directory_adapter.py','bounded_transport.py')},'cold_contract':m.bind(self.contract),
+             'cold_dependencies':{n:m.bind(self.contract.with_name(n)) for n in ('common.py','observe.py')},'artifacts':arts}
+        self.mb=self.save(self.root/'manifest.json',self.manifest)
+        self.request={'schema':'e5-next-scanner-deployment-v1','serial':m.SERIAL,'txid':TX,'boot_id':BOOT,'created_at':self.at.isoformat(),'expires_at':self.exp.isoformat(),
+             'total_seconds':600,'manifest':self.mb,'postcold':{'path':str(self.root/'synthetic-cold.json'),'sha256':'b'*64},'restoration':{'path':str(self.root/'synthetic-result.json'),'sha256':'c'*64}}
+        self.rb=self.save(self.root/'request.json',self.request);self.review=self.make_review();self.vb=self.save(self.root/'review.json',self.review)
+        for key,value in [('ROOT',self.root),('HERE',self.here),('CORE',self.core),('STATE',self.state)]:
+            q=patch.object(m,key,value);q.start();self.addCleanup(q.stop)
+    def save(self,path,value):path.write_bytes(m.canonical(value)+b'\n');return m.bind(path)
+    def make_review(self):return {'reviewer':'synthetic-reviewer','schema':'e5-next-scanner-deployment-review-v1','decision':'FIXED_OLD_LOCK_ARCHIVE_NEW_HELPERS_SCANNER_ONLY','request':self.rb,'manifest':self.mb,'cold_gate_sha256':m.gate_digest(self.gate),'restoration':self.request['restoration'],'scope_no_partition_or_rootfs_write':True}
+    def refresh(self):
+        self.rb=self.save(self.root/'request.json',self.request);self.review=self.make_review();self.vb=self.save(self.root/'review.json',self.review)
+    def run_contract(self):
+        # Only two real unchanged binary hashes are substituted; no device/real evidence is used.
+        real=m.safe_read
+        def synthetic(path,digest=None,size=None,limit=None):return real(path,digest,size,limit)
+        # Pin refusal tested independently; happy-path uses fixture artifacts carrying those expected hashes through a mocked sha reader.
+        original_sha=m.sha
+        def fixture_sha(raw):
+            if raw==b'io_helper':return '0000000000000000000000000000000000000000000000000000000000000000'
+            if raw==b'helper':return '0000000000000000000000000000000000000000000000000000000000000000'
+            return original_sha(raw)
+        self.manifest['artifacts']['io_helper']['sha256']=fixture_sha(b'io_helper');self.manifest['artifacts']['helper']['sha256']=fixture_sha(b'helper')
+        self.mb=self.save(self.root/'manifest.json',self.manifest);self.request['manifest']=self.mb;self.refresh()
+        with patch.object(m,'sha',fixture_sha),patch.object(m,'restoration_proof',return_value={'fixture':True}):
+            return m.validate_request(self.rb,self.mb,self.vb,self.mod.validate_directory_ready,at=self.at+dt.timedelta(seconds=1))
+    def test_valid_synthetic_contract(self):self.assertEqual(self.run_contract()[0]['txid'],TX)
+    def test_checked_at_is_not_evidence_identity(self):self.assertEqual(m.gate_digest(self.gate),m.gate_digest({**self.gate,'checked_at':'later'}))
+    def test_cold_other_change_changes_digest(self):self.assertNotEqual(m.gate_digest(self.gate),m.gate_digest({**self.gate,'evidence_sha256':'f'*64}))
+    def test_expired(self):self.request['expires_at']=(self.at-dt.timedelta(seconds=1)).isoformat();self.assertRaises(m.Refusal,self.run_contract)
+    def test_future_created(self):self.request['created_at']=(self.at+dt.timedelta(seconds=5)).isoformat();self.assertRaises(m.Refusal,self.run_contract)
+    def test_lease_too_wide(self):self.request['expires_at']=(self.at+dt.timedelta(seconds=901)).isoformat();self.assertRaises(m.Refusal,self.run_contract)
+    def test_budget_exceeds_lease(self):self.request['expires_at']=(self.at+dt.timedelta(seconds=603)).isoformat();self.assertRaises(m.Refusal,self.run_contract)
+    def test_old_boot(self):self.request['boot_id']=m.OLD_BOOT;self.assertRaises(m.Refusal,self.run_contract)
+    def test_old_tx(self):self.request['txid']=m.OLD_TX;self.assertRaises(m.Refusal,self.run_contract)
+    def test_extra_request_key(self):self.request['execute_anything']=True;self.assertRaises(m.Refusal,self.run_contract)
+    def test_wrong_contract_source(self):self.contract.write_text('changed');self.assertRaises(m.Refusal,self.run_contract)
+    def test_dependency_changed(self):self.contract.with_name('observe.py').write_text('changed');self.assertRaises(m.Refusal,self.run_contract)
+    def test_foreign_runtime_dependency(self):self.mod.c.__file__='/tmp/foreign.py';self.assertRaises(m.Refusal,self.run_contract)
+    def test_reused_tx_rejected(self):
+        self.gate['state_snapshot']=self.save(self.root/'synthetic-state-snapshot.json',{'used_txids':[TX]});self.assertRaises(m.Refusal,self.run_contract)
+    def test_new_barrier_rejected(self):
+        for name in ('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json','RECOVERY_PENDING.json'):
+            with self.subTest(name=name):
+                q=self.state/name;q.write_text('{}');self.assertRaises(m.Refusal,self.run_contract);q.unlink()
+    def test_artifact_digest_changed(self):Path(self.manifest['artifacts']['scanner']['path']).write_text('changed');self.assertRaises(m.Refusal,self.run_contract)
+    def test_symlink_host_file(self):q=self.root/'alias';q.symlink_to(self.root/'request.json');self.assertRaises(m.Refusal,m.safe_read,q)
+    def test_hardlink_host_file(self):q=self.root/'alias';os.link(self.root/'request.json',q);self.assertRaises(m.Refusal,m.safe_read,q)
+    def test_malformed_stat(self):self.assertRaises(m.Refusal,m.parse_stat,b'bad')
+
+class SequenceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory(prefix='e5-stage2-sequence-');self.addCleanup(self.tmp.cleanup);self.root=Path(self.tmp.name).resolve();(self.root/'evidence').mkdir()
+        self.calls=[];self.failure=None;self.cancel=threading.Event();self.a=types.SimpleNamespace(txid=TX,boot_id=BOOT,cancel_event=self.cancel,transaction_deadline=time.monotonic()+100,occupancy=lambda:self.event('scan',{'complete':True,'fixture':True}))
+        self.d=m.Stage2Deploy(self.a,{}, {}, {}, None,self.root/'evidence/result');self.d.t=types.SimpleNamespace(mark_uncertain=lambda why:self.calls.append('POISON'))
+        self.d.remote_archiver='/data/local/tmp/e5-clean-lock-archive.'+TX;self.d.archive=m.LOCK+'.archive.'+m.OLD_TX+'.'+TX
+        self.d.r={'expires_at':(m.now()+dt.timedelta(seconds=100)).isoformat()};self.d.m={'artifacts':{k:{} for k in ('archiver','scanner','io_helper','helper')}}
+        self.d._contract=lambda:self.event('contract',None)
+        self.d._baseline=lambda:self.event('baseline',{'fixed':'original'})
+        self.d._snapshot=lambda location,**kw:self.event('snapshot-'+location,snapshot(kw.get('new_locked',False)))
+        self.d._upload=lambda key,*a,**kw:self.event('upload-'+key,{'remote_metadata':row(9,'f')})
+        self.d._archive=lambda before:self.event('archive',snapshot())
+        self.d._create_new_lock=lambda before:self.event('new-lock',snapshot(True))
+        self.d._program_read=lambda *a:self.event('verify',row(9,'f'))
+        self.patches=[patch.object(m,'ROOT',self.root),patch.object(m,'host_lock',contextlib.nullcontext),patch.object(m,'check_shared_state',lambda:None)]
+        for x in self.patches:x.start();self.addCleanup(x.stop)
+    def event(self,label,value):
+        self.calls.append(label)
+        if self.failure==label:raise RuntimeError('synthetic failure '+label)
+        return value
+    def run_mock(self):
+        with patch.object(m,'DEVICE_IO_DISABLED',False):return self.d.run()
+    def test_disabled_before_contract(self):self.assertRaises(m.Refusal,self.d.run);self.assertEqual(self.calls,[])
+    def test_success_fixed_order_no_block_mutation(self):
+        r=self.run_mock();self.assertTrue(r['no_partition_or_rootfs_write']);self.assertFalse(r['approved_to_activate']);self.assertFalse(r['noreplace_probe_passed'])
+        main=[x for x in self.calls if x in ('archive','new-lock','scan') or x.startswith('upload-')]
+        self.assertEqual(main,['upload-archiver','archive','new-lock','upload-scanner','upload-io_helper','upload-helper','scan']);self.assertTrue((self.d.out/'COMPLETE.json').exists())
+    def test_each_failure_poison_no_later_mutation(self):
+        for failed in ('contract','baseline','snapshot-old','upload-archiver','archive','new-lock','upload-scanner','upload-io_helper','upload-helper','scan','verify'):
+            with self.subTest(failed=failed):
+                self.d.out=self.root/'evidence'/failed;self.d.used=False;self.calls.clear();self.failure=failed
+                self.assertRaises(RuntimeError,self.run_mock);self.assertEqual(self.calls[-1],'POISON');self.assertFalse((self.d.out/'COMPLETE.json').exists())
+                self.assertEqual(self.calls.count(failed),1)
+    def test_cancel_stops_before_scan(self):self.cancel.set();self.assertRaises(m.Refusal,self.run_mock);self.assertNotIn('scan',self.calls);self.assertIn('POISON',self.calls)
+    def test_repeat_run_rejected(self):self.run_mock();self.assertRaises(m.Refusal,self.run_mock)
+    def test_unknown_owner_or_ancestor_drift(self):
+        for key,field in [('old_owner','inode'),('old_owner','mtime_text'),('old_lock','inode'),('data','dev')]:
+            with self.subTest(key=key,field=field):
+                a=snapshot();b=copy.deepcopy(a);b[key][field]='changed';self.assertRaises(m.Refusal,m.Stage2Deploy._same,a,b)
+    def test_parent_mtime_expected_change_allowed(self):a=snapshot();b=copy.deepcopy(a);b['tmp']['mtime']='later';m.Stage2Deploy._same(a,b)
+
+class WireTests(unittest.TestCase):
+    def setUp(self):
+        self.d=m.Stage2Deploy(None,{}, {}, {}, None,Path('/not-used'));self.d.a=types.SimpleNamespace(txid=TX,boot_id=BOOT,_deadline=lambda:5000,_locked=lambda:'LOCKED\n')
+        self.d.archive=m.LOCK+'.archive.'+m.OLD_TX+'.'+TX;self.d.remote_archiver='/data/local/tmp/e5-clean-lock-archive.'+TX;self.d.m={'artifacts':{'archiver':{}}};self.d._time=lambda:None
+        self.d._program_read=lambda *a:None;self.mutate=None
+    def native(self,alter=None):
+        def request(label,script,**kw):
+            args=script.splitlines()[-1].split();op=args[4];deadline=int(args[5]);base={'schema':'e5-old-lock-archive-v1','old_txid':m.OLD_TX,'txid':TX,'boot_id':BOOT,'opid':op,'deadline_ms':deadline,'data_dev':66367,
+            'data_ino':1,'local_ino':2,'tmp_ino':3,'lock_ino':4,'owner_ino':5,'self_pid':123,'self_starttime':22,'checked_boottime_ms':100,'cancel_signal':0}
+            rows=[{**base,'event':'BEGIN'},{**base,'event':'RESULT','complete':True,'renamed':True,'fsync_completed':True,'f2fs_confirmed':True,'owner_unchanged':True,'outcome':'COMPLETED'}]
+            if alter:alter(rows)
+            self.assertTrue(kw['mutating']);self.assertIn(' archive ',script);self.assertNotIn('mv ',script);self.assertNotIn('rm ',script)
+            return kw['validator'](b'\n'.join(m.canonical(x) for x in rows))
+        self.d._request=request;return self.d._archive(snapshot())
+    def test_native_valid_ack(self):self.assertTrue(self.native()['complete'])
+    def test_native_wrong_boot(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(boot_id=m.OLD_BOOT))
+    def test_native_wrong_inode(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(lock_ino=99))
+    def test_native_changed_process(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(self_starttime=23))
+    def test_native_expired(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(checked_boottime_ms=5000))
+    def test_native_missing_result(self):self.assertRaises(m.Refusal,self.native,lambda r:r.pop())
+    def test_native_incomplete_fsync(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(fsync_completed=False))
+    def test_native_cancelled(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(cancel_signal=15))
+    def test_native_not_f2fs(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(f2fs_confirmed=False))
+    def test_native_zero_start(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(self_starttime=0))
+    def test_native_reverse_clock(self):self.assertRaises(m.Refusal,self.native,lambda r:r[-1].update(checked_boottime_ms=99))
+
+class ReadbackTests(unittest.TestCase):
+    def setUp(self):
+        self.d=m.Stage2Deploy(None,{}, {}, {}, None,Path('/not-used'));self.d.a=types.SimpleNamespace(txid=TX,boot_id=BOOT,_locked=lambda:'LOCKED\n')
+        self.d.archive=m.LOCK+'.archive.'+m.OLD_TX+'.'+TX;self.d.remote_archiver='/data/local/tmp/e5-clean-lock-archive.'+TX
+    def stat(self,r):
+        keys=('dev','inode','bytes','mode','uid','gid','nlink','mtime','ctime','mtime_text','ctime_text')
+        return ('|'.join([format(r['mode_bits'],'x')]+[str(r[k]) for k in keys]+['0','0'])).encode()
+    def snapshot(self,alter=None,new=False):
+        def request(label,script,**kw):
+            op=kw['op_id'];rows=snapshot(new);out=[f'STATE\t{op}\t{BOOT}'.encode()]
+            for key,value in rows.items():
+                if key!='old_owner_hex':out.append(key.encode()+b'\t'+self.stat(value))
+            out.append(('OLD_OWNER\t'+m.OLD_TX).encode())
+            if new:out.append(('NEW_OWNER\t'+TX).encode())
+            out.append(f'END\t{op}\t{BOOT}'.encode())
+            if alter:alter(out)
+            return kw['validator'](b'\n'.join(out)+b'\n')
+        self.d._request=request;return self.d._snapshot('archive' if new else 'old',new_locked=new,programs_absent=not new)
+    def test_snapshot_old_exact_owner(self):self.assertEqual(self.snapshot()['old_owner_hex'],(m.OLD_TX+'\n').encode().hex())
+    def test_snapshot_new_preserves_old(self):self.assertEqual(self.snapshot(new=True)['new_owner']['inode'],7)
+    def test_snapshot_other_owner_rejected(self):self.assertRaises(m.Refusal,self.snapshot,lambda r:r.__setitem__(-2,b'OLD_OWNER\t0123456789abcdef'))
+    def test_snapshot_extra_line_rejected(self):self.assertRaises(m.Refusal,self.snapshot,lambda r:r.insert(1,b'extra'))
+    def test_snapshot_boot_changed(self):self.assertRaises(m.Refusal,self.snapshot,lambda r:r.__setitem__(-1,b'END\twrong\tboot'))
+    def program(self,alter=None,hash_alter=None):
+        payload=b'synthetic-ELF';item={'bytes':len(payload),'sha256':m.sha(payload)};path=self.d.remote_archiver;meta=row(99,'f');meta['bytes']=len(payload)
+        def request(label,script,**kw):
+            if label=='stage2-program-readback':
+                # Extract the fixed op id from printf's literal protocol header.
+                import re
+                op=re.search(r'PROGRAM\\t([a-f0-9]{32})',script).group(1)
+                raw=f'PROGRAM\t{op}\t{path}\t{len(payload)}\t'.encode()+self.stat(meta)+b'\n'+payload+f'\nEND\t{op}\t'.encode()+self.stat(meta)+b'\n'
+                if alter:raw=alter(raw)
+            else:
+                raw=self.stat(meta)+b'\n'+(item['sha256']+'  '+path).encode()+b'\n'+self.stat(meta)+b'\n'
+                if hash_alter:raw=hash_alter(raw)
+            return kw['validator'](raw)
+        self.d._request=request;return self.d._program_read(path,item,66367)
+    def test_program_two_reads(self):self.assertEqual(self.program()['inode'],99)
+    def test_program_content_changed(self):self.assertRaises(m.Refusal,self.program,lambda r:r.replace(b'synthetic-ELF',b'synthetic-BAD'))
+    def test_program_extra_payload(self):self.assertRaises((m.Refusal,ValueError),self.program,lambda r:r.replace(b'synthetic-ELF',b'synthetic-ELFx'))
+    def test_program_independent_hash_differs(self):self.assertRaises(m.Refusal,self.program,None,lambda r:r.replace(m.sha(b'synthetic-ELF').encode(),b'f'*64))
+    def test_program_metadata_differs(self):self.assertRaises(m.Refusal,self.program,None,lambda r:r.replace(b'|99|',b'|98|',1))
+
+if __name__=='__main__':unittest.main(verbosity=2)

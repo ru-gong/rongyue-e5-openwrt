@@ -1,0 +1,11 @@
+# 部分部署后旧锁归档器（主机准备）
+
+默认 `native/lock_archive.c` gate0 禁用；以已审 tmp-metadata 修复为唯一基底，仅将固定 OLD_TX `fad8a60f84aa4268` 改为 `7d125fa2bd1c4e63`。严格 `/data/local/tmp` uid/gid=2000:2000、mode0771 保留，锁 owner0:0、inode/type/device/no-symlink/nlink/no-replace/短期限/取消检查不变。
+
+未来固定范围为当前锁到 `archive.7d125fa2bd1c4e63.NEW_TX`；原先 fad8 归档目录不删除、不覆盖、不移动。本包没有实际归档或结案行为，不修改真实 marker/ledger。旧 owner fad8 不能再冒充当前锁。
+
+`build/archive.DISABLED.aarch64` 与 `archive.ENABLED.aarch64` 是此次明确授权仅主机构建的独立材料，后者相对前者源码只 gate0→1。两件0644、静态 ELF64LE/AArch64、无 PT_INTERP/DT_NEEDED，未运行或上传。完整 CLI/身份约束继承源代码；不得将 HOST_TEST 通过当作 Android F2FS或物理掉电保证。
+
+Mac 与 Linux 各32归档测试＋6生产数值谓词测试通过。新增两例证明已存在 fad8 归档保持及当前 fad8 owner 拒绝。测试命令 `python3 -B test_lock_archive.py` 和 `python3 -B test_native_metadata.py`。HOST_TEST 跳过生产 UID 环境要求，另外6项直接测完整生产元数据谓词，两个证据不可混称。
+
+构建使用项目现成 Colima `e5-openwrt-prep`，没有安装依赖、没有网络下载、没有手机连接。VM 已恢复 Stopped，配置 SHA不变。build目录包含两源码、单门patch、编译器/命令/ELF解析/日志；`SOURCE_CHANGES.patch` 只有固定旧 tx 字面值变化。未来只可在新的完整消费包中重绑 source/ELF/pins，不能覆写任何旧冻结包；closure/恢复授权由根线程单独完成，本包不是续跑许可。

@@ -1,0 +1,179 @@
+"""Synthetic host fixtures only; no source or real state mutation."""
+import copy,hashlib,json,os,shlex,sys,tempfile,unittest
+from pathlib import Path
+from unittest.mock import patch
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.fork','pty.spawn'):raise AssertionError(event)
+sys.addaudithook(audit)
+import closure as c
+
+class Fixture:
+ def __init__(self):
+  self.tmp=tempfile.TemporaryDirectory(prefix='e5-closure-test-');self.root=Path(self.tmp.name).resolve();self.state=self.root/'state';self.state.mkdir();(self.state/'completed').mkdir();self.execution=self.root/'execution';(self.execution/'transport').mkdir(parents=True)
+  self.case={'schema':'e5-fixed-partial-deployment-case-v1','serial':'TEST123','txid':'7d125fa2bd1c4e63','boot_id':'00000000-0000-4000-8000-000000000001','state':'state','global_lock':'GLOBAL.lock','ledger':'ledger.jsonl','execution':'execution','archive_rel':'partial-deployment-closures/7d125fa2bd1c4e63','files':{},'operations':[],'mutations':[],'retained_device_state':{'programs':'synthetic'},'expected_error':'TransportError: transport failed/uncertain'}
+  self.save('state/STATE_BINDING.json',{'schema':'e5-transport-state-v1','serial':'TEST123'})
+  row={'seq':0,'previous':'0'*64,'event':'COMPLETE','txid':'a'*16};row['chain_sha256']=c.sha(c.canonical(row));self.save('ledger.jsonl',row);raw=(self.root/'ledger.jsonl').read_bytes();self.case.update(ledger_bytes=len(raw),ledger_sha256=c.sha(raw),ledger_rows=1,ledger_head=row['chain_sha256'])
+  prior={'schema':'e5-readonly-closure-view-v1','serial':'TEST123','retired_txid':'46d941e4703744fa','excluded_boot_id':'00000000-0000-4000-8000-000000000001','fixture_barrier':{'prior':'exact'},'case_sha256':'f'*64}
+  self.save('state/RECOVERY_PENDING.json',prior['fixture_barrier']);prior['barrier']={'path':str(self.state/'RECOVERY_PENDING.json'),'sha256':self.pin(self.state/'RECOVERY_PENDING.json')['sha256']}
+  labels={63:'stage2-upload-archiver',67:'stage2-archive-old-lock',69:'stage2-new-lock',72:'stage2-upload-scanner',75:'stage2-upload-io_helper',78:'stage2-upload-helper'}
+  counts={63:3,67:1,69:1,72:3,75:3,78:3}
+  for i in range(83):
+   label=labels.get(i,'occupancy' if i==82 else 'read-chunk');opid=f'{i+1:032x}';folder=f'execution/transport/{i+1:06d}-{label}-{opid}'
+   mutation=i in labels;payload=(16 if 'upload' in label else 0);out=b'fixed-output'
+   if i==82:out=c.encoded({'schema':'e5-native-occupancy-v1','event':'RESULT','complete':False,'txid':self.case['txid'],'boot_id':self.case['boot_id'],'opid':opid,'errno':7,'fds':131073,'subphase':'pid-fds','detail':'fd-link-check','cancel_signal':0,'unknown':['scan-not-complete']})
+   b,op=self.request(folder,label,opid,mutation,payload,out,rc=70 if i==82 else 0)
+   op.update(completed=i<82,parts=[])
+   if i<82:
+    done=dict(b,status='COMPLETE',validated=True,stdout_sha256=c.sha(out));self.save(folder+'/COMPLETE.json',done);self.save('state/completed/'+opid+'.json',done)
+   else:
+    u=dict(b,status='UNCERTAIN',reason=self.case['expected_error'],remote_completion_proven=False);self.save(folder+'/UNCERTAIN.json',u);self.save('state/ACTIVE.json',b);self.save('state/UNCERTAIN.json',u)
+   for j in range(1,counts.get(i,0)+1):
+    sub=folder+f'/part-{j:03d}-read';bb,subop=self.request(sub,'fixed-read-followup',opid,True,0,b'readback',part=j)
+    self.save(sub+'/PART_VERIFIED.json',{'op_id':opid,'part_index':j,'validated':True});op['parts'].append(subop)
+   self.case['operations'].append(op)
+   if mutation:self.case['mutations'].append({k:b[k] for k in ('label','op_id','payload_bytes','payload_sha256')})
+  self.save('execution/REVIEW.json',{'status':'STOP_PARTIAL_DEPLOYMENT_NOT_READY','actual_mutation_count':6,'completed_top_level_operations':82,'completed_followups':14,'postwrite_protected_baseline_executed':False,'no_partition_or_rootfs_write_command_dispatched':True})
+  self.case['review']={'path':'execution/REVIEW.json','sha256':self.pin(self.execution/'REVIEW.json')['sha256']}
+  self.case['markers']={n:self.pin(self.state/n) for n in c.MARKERS};self.reindex()
+  self.e=c._Case(self.root,self.case,c.sha(c.encoded(self.case)),fixture=True);self.e.parent_view=prior
+ def pin(self,p):return {'bytes':p.stat().st_size,'sha256':c.sha(p.read_bytes())}
+ def save(self,rel,val):
+  p=self.root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(val if isinstance(val,bytes) else c.encoded(val))
+ def reindex(self):
+  self.case['files']={str(p.relative_to(self.root)):self.pin(p) for p in self.execution.rglob('*') if p.is_file()};self.case['completed_baseline']={p.name:self.pin(p) for p in (self.state/'completed').iterdir()}
+ def request(self,folder,label,opid,mutation,payload,out,rc=0,part=None):
+  script='printf synthetic-'+folder;argv=['/fixed/adb','-s','TEST123','shell','-T','/debug_ramdisk/su -c '+shlex.quote(script)]
+  b={'schema':'e5-bounded-transport-v1','status':'IN_FLIGHT','serial':'TEST123','txid':self.case['txid'],'boot_id':self.case['boot_id'],'op_id':opid,'label':label,'mutating':mutation,'payload_bytes':payload,'payload_sha256':c.sha(b'x'*payload),'reconciliation_only':False,'recovery_context':None,'automatic_retry':False,'deadline_seconds':8.0,'argv':argv,'argv_sha256':c.sha(c.canonical(argv)),'output_limit':16384}
+  if part is not None:b['part_index']=part
+  self.save(folder+'/IN_FLIGHT.json',b);self.save(folder+'/stdout.bin',out);self.save(folder+'/stderr.bin',b'')
+  self.save(folder+'/transport-result.json',{'returncode':rc,'failure':None,'host_child_reaped':True,'elapsed_seconds':.01,'stdin_bytes_sent':payload,'stdout_bytes':len(out),'stdout_sha256':c.sha(out),'stderr_bytes':0})
+  return b,{'folder':folder,'script_sha256':c.sha(script.encode()),**{k:b[k] for k in ('op_id','label','argv_sha256','mutating','payload_bytes','payload_sha256')}}
+ def grow(self,event):
+  p=self.root/'ledger.jsonl';rows=[json.loads(x) for x in p.read_bytes().splitlines()];r={'seq':len(rows),'previous':rows[-1]['chain_sha256'],'event':event,'txid':'b'*16};r['chain_sha256']=c.sha(c.canonical(r));p.write_bytes(p.read_bytes()+c.encoded(r))
+ def snapshot(self,v):return {'serial':'TEST123','markers':{c.PENDING:v['barrier'],'RECOVERY_PENDING.json':v['prior_closure']['barrier'],c.TRANSITION:'ABSENT','ACTIVE.json':'ABSENT','UNCERTAIN.json':'ABSENT','RECOVERY_ONLY.json':'ABSENT'},'ledger_head':v['current_ledger_head'],'ledger_last_event':v['current_ledger_last_event'],'previous_boots':[],'used_txids':[]}
+
+class Tests(unittest.TestCase):
+ def setUp(self):self.f=Fixture();self.addCleanup(self.f.tmp.cleanup);self.e=self.f.e
+ def test_fixed83_6mutation_14followup(self):self.assertEqual(self.e.verify()['device_mutations_dispatched'],6)
+ def test_disabled_before_lock(self):
+  self.e.fixture=False
+  with self.assertRaisesRegex(c.Refusal,'disabled'):self.e.close()
+  self.assertFalse((self.f.root/'GLOBAL.lock').exists())
+ def test_fixture_realroot_refused(self):
+  with self.assertRaises(c.Refusal):c._Case(c.ROOT,self.f.case,'0'*64,fixture=True)
+ def test_close_preserves_all_bytes_and_old_barrier(self):
+  files={p:p.read_bytes() for p in self.f.execution.rglob('*') if p.is_file()};old=(self.f.state/'RECOVERY_PENDING.json').read_bytes();ledger=self.e.ledger.read_bytes();markers={n:(self.f.state/n).read_bytes() for n in c.MARKERS}
+  v=self.e.close();self.assertFalse(v['deployment_completed']);self.assertEqual((self.f.state/'RECOVERY_PENDING.json').read_bytes(),old);self.assertEqual(self.e.ledger.read_bytes(),ledger)
+  for p,raw in files.items():self.assertEqual(p.read_bytes(),raw)
+  for n,raw in markers.items():self.assertEqual((self.e.archive/n).read_bytes(),raw);self.assertFalse((self.f.state/n).exists())
+  receipt=json.loads((self.e.archive/c.RECEIPT).read_bytes());self.assertEqual(receipt['device_mutations_dispatched'],6);self.assertFalse(receipt['postwrite_partition_verification_executed']);self.assertFalse((self.e.archive/'COMPLETE.json').exists())
+ def test_repeat_only_exact_case(self):self.assertEqual(self.e.close(),self.e.close())
+ def test_raw_drift(self):
+  (self.f.execution/'transport'/Path(self.f.case['operations'][0]['folder']).name/'stdout.bin').write_bytes(b'drift')
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_prior_pending_drift(self):
+  (self.f.state/'RECOVERY_PENDING.json').write_bytes(b'foreign')
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_failed_scan_cannot_be_complete(self):
+  p=self.f.root/self.f.case['operations'][-1]['folder'];self.f.save(str(p.relative_to(self.f.root))+'/COMPLETE.json',{})
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_new_operation_refused(self):
+  (self.f.execution/'transport/000084-extra').mkdir()
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_missing_followup(self):
+  p=self.f.root/self.f.case['operations'][63]['parts'][0]['folder']/'PART_VERIFIED.json';p.unlink()
+  with self.assertRaises((c.Refusal,FileNotFoundError)):self.e.verify()
+ def test_mutation_counter_cannot_zero(self):
+  self.f.case['mutations']=[]
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_active_wrong(self):
+  (self.f.state/'ACTIVE.json').write_text('{}')
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_ledger_growth_before_close_refused(self):
+  self.f.grow('START')
+  with self.assertRaises(c.Refusal):self.e.close()
+ def test_future_ledger_chain_and_new_unknown(self):
+  self.e.close();self.f.grow('START');v=self.e.closed()
+  with patch.object(c,'validate_closed',return_value=v):
+   with self.assertRaises(c.Refusal):c.normal_gate(self.f.state,self.e.ledger)
+  for event in ('WRITE','COMPLETE'):self.f.grow(event)
+  v=self.e.closed()
+  with patch.object(c,'validate_closed',return_value=v):c.normal_gate(self.f.state,self.e.ledger)
+  (self.f.state/'UNCERTAIN.json').write_text('{}')
+  with patch.object(c,'validate_closed',return_value=v):
+   with self.assertRaises(c.Refusal):c.normal_gate(self.f.state,self.e.ledger)
+  with self.assertRaises(c.Refusal):self.e.close()
+ def test_future_repair_transition_blocks(self):
+  v=self.e.close();(self.f.state/c.TRANSITION).write_text('{}')
+  with patch.object(c,'validate_closed',return_value=v):
+   with self.assertRaises(c.Refusal):c.transport_gate(self.f.state,self.e.ledger,'TEST123','00000000-0000-4000-8000-000000000001','b'*16)
+ def test_both_retired_pairs_rejected(self):
+  v=self.e.close()
+  for boot in v['excluded_boot_ids']:
+   with self.assertRaises(c.Refusal):c.assert_new_identity(v,boot,'b'*16)
+  for tx in v['retired_txids']:
+   with self.assertRaises(c.Refusal):c.assert_new_identity(v,'00000000-0000-4000-8000-000000000001',tx)
+ def test_new_identity_and_snapshot(self):
+  v=self.e.close();c.assert_new_identity(v,'00000000-0000-4000-8000-000000000001','b'*16)
+  with patch.object(c,'validate_closed',return_value=v):
+   s=c.augment_snapshot(self.f.snapshot(v),self.f.state,self.e.ledger);c.snapshot_gate(s,self.f.state,self.e.ledger,normal=True)
+   self.assertEqual(set(s['previous_boots']),set(v['excluded_boot_ids']));self.assertEqual(set(s['used_txids']),set(v['retired_txids']))
+ def test_snapshot_must_keep_old_pending(self):
+  v=self.e.close();s=self.f.snapshot(v);s['markers']['RECOVERY_PENDING.json']='ABSENT'
+  with patch.object(c,'validate_closed',return_value=v):
+   with self.assertRaises(c.Refusal):c.augment_snapshot(s,self.f.state,self.e.ledger)
+ def test_interruption_matrix(self):
+  for point in ('verified','barrier_durable','prefix_durable','before_ACTIVE.json','after_ACTIVE.json','before_UNCERTAIN.json','after_UNCERTAIN.json','before_receipt','receipt_durable','final_verified'):
+   with self.subTest(point=point):
+    f=Fixture()
+    try:
+     def fail(p):
+      if p==point:raise c.Refusal('fault')
+     f.e.fault=fail
+     with self.assertRaises(c.Refusal):f.e.close()
+     self.assertTrue(any(c.exists(f.state/n) for n in ('ACTIVE.json','UNCERTAIN.json',c.PENDING)))
+     if point not in ('receipt_durable','final_verified'):
+      with self.assertRaises((c.Refusal,FileNotFoundError)):f.e.closed()
+     f.e.fault=None;f.e.close();f.e.closed()
+    finally:f.tmp.cleanup()
+ def test_fsync_retry_all_three_levels(self):
+  for location in ('state','archive','parent'):
+   with self.subTest(location=location):
+    f=Fixture();original=c.sync;hit=[]
+    try:
+     def bad(p):
+      target={'state':f.state,'archive':f.e.archive,'parent':f.e.archive.parent}[location]
+      if Path(p)==target and not hit:hit.append(True);raise OSError('fsync failed')
+      return original(p)
+     with patch.object(c,'sync',side_effect=bad):
+      with self.assertRaises(OSError):f.e.close()
+     synced=[]
+     def good(p):synced.append(Path(p));return original(p)
+     with patch.object(c,'sync',side_effect=good):f.e.close()
+     for p in (f.state,f.e.archive,f.e.archive.parent):self.assertIn(p,synced)
+    finally:f.tmp.cleanup()
+ def test_partial_preparing_preserves_markers(self):
+  (self.f.state/(c.PENDING+'.preparing')).write_bytes(b'{')
+  with self.assertRaises(c.Refusal):self.e.close()
+  self.assertTrue((self.f.state/'ACTIVE.json').exists())
+ def test_foreign_barrier_no_overwrite(self):
+  (self.f.state/c.PENDING).write_text('foreign')
+  with self.assertRaises(c.Refusal):self.e.close()
+  self.assertEqual((self.f.state/c.PENDING).read_text(),'foreign')
+ def test_noreplace_existing_dest(self):
+  a=self.f.root/'a';b=self.f.root/'b';a.write_bytes(b'a');b.write_bytes(b'b')
+  with self.assertRaises(OSError):c.noreplace(a,b)
+  self.assertEqual((a.read_bytes(),b.read_bytes()),(b'a',b'b'))
+ def test_missing_receipt_blocked(self):
+  c.durable(self.f.state/c.PENDING,c.encoded(self.e.barrier()))
+  with self.assertRaises((c.Refusal,FileNotFoundError)):self.e.closed()
+ def test_symlink_marker(self):
+  p=self.f.state/'ACTIVE.json';p.unlink();p.symlink_to(self.f.state/'UNCERTAIN.json')
+  with self.assertRaises(c.Refusal):self.e.close()
+ def test_duplicate_marker(self):
+  self.e.archive.mkdir(parents=True);(self.e.archive/'ACTIVE.json').write_bytes((self.f.state/'ACTIVE.json').read_bytes())
+  with self.assertRaises(c.Refusal):self.e.close()
+ def test_future_completed_prevents_reclose(self):
+  self.e.close();(self.f.state/'completed/new.json').write_text('{}')
+  with self.assertRaises(c.Refusal):self.e.close()
+if __name__=='__main__':unittest.main(verbosity=2)

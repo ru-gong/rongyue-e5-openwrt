@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""HOST ONLY: verify frozen capture evidence, make and reread a new tar.
+
+No process, socket, device backend, mount, extraction or restore API. The
+session-compatible receipt is evidence, not fresh-device or execution consent.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import tarfile
+
+ROOT = Path(__file__).resolve().parents[2]
+CAPTURE = Path(__file__).with_name("capture.py")
+CAPTURE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+PLAN_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+PROFILE = ROOT / "tools/e5_android_install_live_20261013/device-profile.json"
+PROFILE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+BOOT = "00000000-0000-4000-8000-000000000001"
+SERIAL = "DEVICE_SERIAL_REDACTED"
+DIRECTORY = "/data/e5linux"
+READ_CONSISTENCY = {'mount_namespaces_checked': ['self', 'init_pid1'], 'global_loop_backing_checked': True, 'maximum_loop_devices': 128, 'all_process_fd_scan': False, 'atomic_snapshot': False, 'satisfies_directory_mutation_gate': False}
+MAX_RAW = (16 << 20) + 4096
+BLOCK_ORDER = ("gpt-prefix","boot_b","misc","trustos_a","trustos_b","uboot_a","uboot_b","vbmeta_a","vbmeta_b",
+               "init_boot_a","init_boot_b","sml_a","sml_b","teecfg_a","teecfg_b","boot_a")
+
+
+class Reject(RuntimeError): pass
+def require(value, why):
+    if not value: raise Reject(why)
+def sha(data): return hashlib.sha256(data).hexdigest()
+def canonical(x): return json.dumps(x,sort_keys=True,separators=(",",":")).encode()
+def is_sha(x): return isinstance(x,str) and re.fullmatch(r"[0-9a-f]{64}",x) is not None
+
+
+def regular(path):
+    path=Path(path)
+    require(path.is_absolute() and not path.is_symlink() and all(not p.is_symlink() for p in path.parents),"unsafe host path")
+    s=path.stat();require(stat.S_ISREG(s.st_mode) and s.st_nlink==1,"host source must be regular single-link")
+    return path
+
+
+def identity(path):
+    s=regular(path).stat()
+    return (s.st_dev,s.st_ino,s.st_size,s.st_mode,s.st_mtime_ns,s.st_ctime_ns)
+
+
+def read(path,limit=4<<20):
+    path=regular(path);before=identity(path);require(before[2]<=limit,"oversized evidence")
+    with path.open("rb") as f:data=f.read(limit+1)
+    require(len(data)<=limit and identity(path)==before,"host source changed while reading")
+    return data
+
+
+def hash_file(path):
+    path=regular(path);before=identity(path);h=hashlib.sha256()
+    with path.open("rb") as f:
+        for b in iter(lambda:f.read(1<<20),b""):h.update(b)
+    require(identity(path)==before,"host source changed during hash")
+    return h.hexdigest()
+
+
+def load(path):return json.loads(read(path))
+def fsync_dir(path):
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+def new_json(path,obj):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,"wb") as f:f.write(canonical(obj)+b"\n");f.flush();os.fsync(f.fileno())
+    fsync_dir(path.parent)
+
+
+def name_safe(name):
+    require(isinstance(name,str) and (name=="." or re.fullmatch(r"\./[A-Za-z0-9_./-]+",name)),"unsafe member path")
+    if name!=".":require(name=="./"+"/".join(PurePosixPath(name).parts) and ".." not in PurePosixPath(name).parts,"noncanonical member path")
+    return name
+
+
+def parse_stat(raw):
+    p=raw.decode("ascii").split("|");require(len(p)==14,"stat fields")
+    bits=int(p[0],16)
+    row={"mode_bits":bits,"dev":int(p[1]),"inode":int(p[2]),"bytes":int(p[3]),"mode":p[4],"uid":int(p[5]),
+         "gid":int(p[6]),"nlink":int(p[7]),"mtime":p[8],"ctime":p[9],"mtime_text":p[10],"ctime_text":p[11],
+         "rdev_major":int(p[12],16),"rdev_minor":int(p[13],16)}
+    row["type"]="f" if stat.S_ISREG(bits) else "d" if stat.S_ISDIR(bits) else "b" if stat.S_ISBLK(bits) else "unknown"
+    require(all(row[k]>=0 for k in ("dev","inode","bytes","uid","gid","nlink")) and
+            re.fullmatch(r"[0-7]{3,4}",row["mode"]) and bits & 0o7777 == int(row["mode"],8),"invalid metadata")
+    return row
+
+
+def parse_inventory(raw):
+    p=raw.split(b"\0");require(p[:2]==[b"BOOT",BOOT.encode()] and p[-3:]==[b"END",BOOT.encode(),b""],"inventory envelope")
+    p=p[2:-3];require(len(p)%2==0 and 0<len(p)<=8192,"inventory size")
+    rows=[{"path":name_safe(p[i].decode("ascii")),**parse_stat(p[i+1])} for i in range(0,len(p),2)]
+    require(rows[0]["path"]=="." and rows[0]["type"]=="d","root directory missing")
+    byname={r["path"]:r for r in rows}
+    require(len(byname)==len(rows) and len({r["dev"] for r in rows})==1,"duplicate/cross-filesystem inventory")
+    for r in rows:
+        require(r["type"] in ("f","d") and (r["type"]!="f" or r["nlink"]==1),"unsupported inode")
+        if r["path"]!=".":
+            parent=str(PurePosixPath(r["path"]).parent);parent="." if parent=="." else "./"+parent
+            require(parent in byname and byname[parent]["type"]=="d","missing/non-directory parent")
+    return rows
+
+
+def decode(raw,source,offset,length,payload_size):
+    header,sep,body=raw.partition(b"\n");require(sep and len(body)>=payload_size+1,"short frame")
+    data,tail=body[:payload_size],body[payload_size:]
+    require(tail.startswith(b"\nEND\t") and tail.endswith(b"\n") and tail.count(b"\n")==2,"invalid binary frame")
+    a=header.split(b"\t",5);b=tail[1:-1].split(b"\t",5)
+    require(len(a)==len(b)==6 and a[0]==b"META" and b[0]==b"END" and a[1:]==b[1:] and
+            a[1:5]==[BOOT.encode(),source.encode(),str(offset).encode(),str(length).encode()],"frame identity/range differs")
+    return data,parse_stat(a[5])
+
+
+class Evidence:
+    def __init__(self,folder):
+        self.folder=Path(folder);require(self.folder.is_absolute() and self.folder.is_dir() and not self.folder.is_symlink() and
+            all(not p.is_symlink() for p in self.folder.parents),"unsafe capture folder")
+        self.source_hashes={};self.source_ids={}
+        require(not (self.folder/"STOP.json").exists() and not (self.folder/"STOP.json").is_symlink(),"stopped capture cannot be archived as complete")
+        require(sha(read(CAPTURE,1<<20))==CAPTURE_SHA and sha(read(PROFILE))==PROFILE_SHA,"frozen producer/profile changed")
+        self.plan=self.document("plan.json");require(self.source_hashes["plan.json"]==PLAN_SHA,"capture plan differs")
+        self.profile=load(PROFILE);self.complete=self.document("COMPLETE.json")
+        c=self.complete
+        require(c.get("schema")=="e5-readonly-capture-v2" and c.get("read_consistency")==READ_CONSISTENCY and c.get("phase") in ("directory","all") and
+                c.get("serial")==SERIAL and c.get("boot_id")==BOOT and c.get("full_directory") is True and
+                c.get("device_writes") is False and c.get("chunk_bytes") in (4<<20,16<<20),"capture not complete directory")
+        self.chunk=c["chunk_bytes"];self.records=[]
+        paths=sorted(self.folder.glob("[0-9][0-9][0-9][0-9][0-9]-*.json"))
+        require(len(paths)==c["requests"] and 0<len(paths)<20000,"request count mismatch")
+        for index,p in enumerate(paths,1):
+            m=self.document(p.name);label=m.get("label");require(p.name==f"{index:05d}-{label}.json","request sequence")
+            require(isinstance(label,str) and re.fullmatch(r"[a-zA-Z0-9_-]+",label),"request label")
+            base=p.with_suffix("");script=self.bound_bytes(base.name+".sh.txt",1<<20)
+            raw=self.bound_bytes(base.name+".stdout",MAX_RAW);err=self.bound_bytes(base.name+".stderr",16384)
+            require(m.get("failure") is None and m.get("device_write_commands") is False and m.get("automatic_retry") is False and
+                    m.get("deadline")==8 and isinstance(m.get("elapsed_seconds"),(int,float)) and 0<=m["elapsed_seconds"]<=8 and
+                    m.get("stdout_bytes")==len(raw) and m.get("stderr_bytes")==len(err) and
+                    m.get("stdout_sha256")==sha(raw) and m.get("script_sha256")==sha(script) and
+                    len(raw)<=m["limit"]<=MAX_RAW,"request evidence failed/changed")
+            special=label=="transport-status-probe"
+            require(m["returncode"]==(37 if special else 0) and err==(b"E5_STDERR_PROBE\n" if special else b"") and
+                    (not special or raw==b"E5_STDOUT_PROBE\n"),"request status/stream calibration")
+            self.records.append({"label":label,"path":Path(str(base)+".stdout")})
+        self.cursor=0
+
+    def bound_bytes(self,name,limit=4<<20):
+        p=self.folder/name;raw=read(p,limit);h=sha(raw)
+        require(name not in self.source_hashes or self.source_hashes[name]==h,"evidence changed")
+        self.source_hashes[name]=h;self.source_ids[name]=identity(p);return raw
+
+    def document(self,name):return json.loads(self.bound_bytes(name))
+
+    def take(self,label):
+        require(self.cursor<len(self.records) and self.records[self.cursor]["label"]==label,"unexpected request order: "+label)
+        r=self.records[self.cursor];self.cursor+=1
+        raw=read(r["path"],MAX_RAW);require(sha(raw)==self.source_hashes[r["path"].name],"raw evidence changed")
+        return raw
+
+    def geometry(self):
+        expected=[]
+        for _,p in sorted(self.profile["partitions"].items()):
+            expected += [p["node"],p["dev"],str(p["start_lba"]),str(p["bytes"]//512)]
+        require(self.take("geometry").decode().splitlines()==expected,"geometry mismatch")
+
+    def verify_object(self,item,kind,source,size,destination,expected_stat=None):
+        require(item.get("kind")==kind and item.get("source")==source and item.get("bytes")==size and
+                item.get("host_file")==destination and is_sha(item.get("sha256")) and
+                item.get("independent_remote_chunk_hashes_verified") is True,"object manifest differs")
+        path=regular(self.folder/destination);before=identity(path);require(before[2]==size,"object size")
+        h=hashlib.sha256();seen=None
+        with path.open("rb") as assembled:
+            for offset in range(0,size,self.chunk):
+                amount=min(self.chunk,size-offset)
+                data,meta=decode(self.take("read-"+kind),source,offset,amount,amount)
+                line,again=decode(self.take("verify-"+kind),source,offset,amount,68)
+                require(again==meta and (seen is None or seen==meta) and (expected_stat is None or meta==expected_stat),"metadata drift")
+                require(re.fullmatch(rb"[a-f0-9]{64}  -\n",line) and line[:64].decode()==sha(data),"independent chunk hash differs")
+                require(assembled.read(amount)==data,"reassembled bytes differ from raw chunks")
+                h.update(data);seen=meta
+        require(identity(path)==before and h.hexdigest()==item["sha256"] and item["stat"]==(seen or expected_stat),"complete object/hash/stat differs")
+        return path,before
+
+    def validate(self):
+        self.geometry();self.take("transport-status-probe")
+        a,_=decode(self.take("read-misc"),"/dev/block/mmcblk0p3",0,4096,4096)
+        b,_=decode(self.take("read-misc"),"/dev/block/mmcblk0p3",0,4096,4096)
+        remote=self.take("binary-transport-proof")
+        require(a==b and re.fullmatch(rb"[a-f0-9]{64}  -\n",remote) and remote[:64].decode()==sha(a),"transport proof")
+        proof=self.document("transport-proof.json")
+        require(proof=={"bytes":4096,"sha256":sha(a),"double_read_equal":True,"remote_hash_equal":True},"proof receipt differs")
+        objects=self.complete["files"];index=0;captured={};files={}
+        for kind in (BLOCK_ORDER if self.complete["phase"]=="all" else ("gpt-prefix",)):
+            source,size=self.plan["block_reads"][kind];item=objects[index];index+=1
+            self.verify_object(item,kind,source,size,kind+".bin")
+            expected=self.profile["gpt_prefix_sha256"] if kind=="gpt-prefix" else self.profile["protected_hashes"].get(kind)
+            if expected:require(item["sha256"]==expected,"protected block hash differs")
+        require(self.take("scope-check")==b"SCOPE_BEGIN\nSELF_MOUNTS_OK\nINIT_MOUNTS_OK\nGLOBAL_LOOPS_OK\nSCOPE_END\n", "scope markers differ")
+        before=parse_inventory(self.take("inventory-before"))
+        require(self.document("inventory-before.json")==before,"inventory JSON differs from raw")
+        for n,row in enumerate(before):
+            if row["type"]=="f":
+                require(index<len(objects),"file missing in COMPLETE")
+                item=objects[index];index+=1;expected={k:v for k,v in row.items() if k!="path"}
+                path,ident=self.verify_object(item,"file",DIRECTORY+"/"+row["path"][2:],row["bytes"],f"directory-file-{n:04d}.bin",expected)
+                files[row["path"]]={"path":path,"identity":ident,"sha256":item["sha256"]}
+        require(index==len(objects),"extra object in COMPLETE")
+        after=parse_inventory(self.take("inventory-after"));require(before==after and self.document("inventory-after.json")==after,"end inventory drift")
+        self.geometry();require(self.cursor==len(self.records),"trailing request evidence")
+        self.check_unchanged()
+        return before,files
+
+    def check_unchanged(self):
+        require(all(identity(self.folder/name)==ident for name,ident in self.source_ids.items()),"source evidence changed during archive")
+
+
+def session_inventory(rows,files,txid):
+    require(re.fullmatch(r"[0-9a-f]{16}",txid),"txid must be 16 lowercase hex")
+    translated=[]
+    for row in rows:
+        item={k:row[k] for k in ("path","type","dev","inode","bytes","mode","uid","gid")}
+        item["sha256"]=files[row["path"]]["sha256"] if row["type"]=="f" else "-";translated.append(item)
+    return {"schema":"e5-device-directory-inventory-v1","role":"active","txid":txid,"boot_id":BOOT,
+            "rows":translated,"tree_sha256":sha(canonical(translated))}
+
+
+def verify_tar(path,snapshot):
+    expected={r["path"]:r for r in snapshot["rows"]};seen=set()
+    with tarfile.open(regular(path),"r:") as archive:
+        for m in archive:
+            name=m.name.rstrip("/") or ".";name_safe(name)
+            require(name in expected and name not in seen,"unknown/duplicate tar member");seen.add(name);row=expected[name]
+            require((m.isdir() and row["type"]=="d") or (m.isfile() and row["type"]=="f"),"tar member type differs")
+            require(m.uid==row["uid"] and m.gid==row["gid"] and m.mode==int(row["mode"],8),"tar metadata differs")
+            if m.isfile():
+                require(m.size==row["bytes"],"tar file length differs");h=hashlib.sha256()
+                with archive.extractfile(m) as f:
+                    for b in iter(lambda:f.read(1<<20),b""):h.update(b)
+                require(h.hexdigest()==row["sha256"],"tar file bytes differ")
+    require(seen==set(expected),"tar missing member (including empty directory)")
+    return {"bytes":path.stat().st_size,"sha256":hash_file(path),"tree_sha256":snapshot["tree_sha256"],"complete":True}
+
+
+class HashingInput:
+    def __init__(self,stream):self.stream=stream;self.hash=hashlib.sha256()
+    def read(self,n):
+        b=self.stream.read(n);self.hash.update(b);return b
+
+
+def make_tar(path,rows,files,snapshot):
+    fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,"wb") as output:
+        with tarfile.open(fileobj=output,mode="w",format=tarfile.PAX_FORMAT) as archive:
+            for row in rows:
+                m=tarfile.TarInfo(row["path"]);m.uid=row["uid"];m.gid=row["gid"];m.mode=int(row["mode"],8);m.mtime=int(row["mtime"])
+                if row["type"]=="d":m.type=tarfile.DIRTYPE;archive.addfile(m);continue
+                info=files[row["path"]];require(identity(info["path"])==info["identity"],"source changed before tar")
+                m.size=row["bytes"]
+                read_fd=os.open(info["path"],os.O_RDONLY|os.O_NOFOLLOW)
+                with os.fdopen(read_fd,"rb") as src:
+                    stream=HashingInput(src);archive.addfile(m,stream)
+                    require(stream.hash.hexdigest()==info["sha256"] and src.read(1)==b"","tar input changed")
+                require(identity(info["path"])==info["identity"],"source changed during tar")
+        output.flush();os.fsync(output.fileno())
+    fsync_dir(path.parent)
+    return verify_tar(path,snapshot)
+
+
+def build(capture_directory,output,txid):
+    evidence=Evidence(capture_directory);rows,files=evidence.validate()
+    output=Path(output);require(output.is_absolute() and not output.is_symlink() and
+        all(not p.is_symlink() for p in output.parents),"unsafe output folder")
+    require(output!=evidence.folder and evidence.folder not in output.parents,"output must be outside source capture")
+    snapshot=session_inventory(rows,files,txid)
+    require(os.statvfs(output.parent).f_bavail*os.statvfs(output.parent).f_frsize > sum(r["bytes"] for r in rows if r["type"]=="f")+(64<<20),"insufficient host archive space")
+    output.mkdir(mode=0o700,exist_ok=False);fsync_dir(output.parent)
+    try:
+        path=output/"directory-backup.tar";verified=make_tar(path,rows,files,snapshot);evidence.check_unchanged()
+        new_json(output/"inventory.json",snapshot)
+        receipt={"schema":"e5-full-directory-backup-v1","txid":txid,"boot_id":BOOT,"role":"active","path":str(path),**verified}
+        new_json(output/"directory-backup.tar.verified.json",receipt)
+        result={"schema":"e5-host-directory-archive-v1","status":"HOST_ARCHIVE_VERIFIED","device_io":False,"device_execution_authorized":False,
+                "read_consistency":READ_CONSISTENCY,"capture_directory":str(evidence.folder),"capture_source_sha256":CAPTURE_SHA,"source_evidence_hashes":evidence.source_hashes,
+                "inventory":{"path":str(output/"inventory.json"),"sha256":hash_file(output/"inventory.json")},
+                "backup":{"path":str(path),"bytes":verified["bytes"],"sha256":verified["sha256"],"receipt_path":str(output/"directory-backup.tar.verified.json"),"receipt_sha256":hash_file(output/"directory-backup.tar.verified.json")},
+                "exterior_xattr_acl_selinux_atime_restoration_claimed":False,
+                "limits":["session schema adaptation only; does not replace fresh inspect/cold evidence/approval","device state was not revisited by this host-only tool","not an atomic filesystem snapshot","mtime seconds in tar; original detailed metadata remains in bound capture inventory"]}
+        new_json(output/"ARCHIVE_COMPLETE.json",result);return result
+    except Exception as exc:
+        new_json(output/"FAILED_NOT_USABLE.json",{"reason":str(exc),"complete":False});raise
+
+
+def main(argv=None):
+    parser=argparse.ArgumentParser(description=__doc__);parser.add_argument("--capture",type=Path,required=True)
+    parser.add_argument("--output",type=Path,required=True);parser.add_argument("--txid",required=True)
+    args=parser.parse_args(argv);result=build(args.capture,args.output,args.txid)
+    print(json.dumps({"status":result["status"],"archive":result["backup"],"device_execution_authorized":False},indent=2))
+
+
+if __name__=="__main__":main()

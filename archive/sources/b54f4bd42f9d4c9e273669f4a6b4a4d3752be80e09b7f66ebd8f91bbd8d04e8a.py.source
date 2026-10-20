@@ -1,0 +1,7 @@
+import importlib.util,sys,unittest
+from pathlib import Path
+H=Path(__file__).resolve().parent;R=H.parents[1]
+sp=importlib.util.spec_from_file_location('host_inputs',R/'tools/e5_nextphase_core_new_slot_prepare_20261019/bounded_stage.py');reader=importlib.util.module_from_spec(sp);sys.modules['host_inputs']=reader;sp.loader.exec_module(reader)
+sp=importlib.util.spec_from_file_location('_reader_regressions',R/'tools/e5_host_input_prepare_20261019/test_host_inputs.py');m=importlib.util.module_from_spec(sp);sp.loader.exec_module(m)
+if __name__=='__main__':
+ result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(m.Tests));raise SystemExit(not result.wasSuccessful())

@@ -1,0 +1,78 @@
+"""No device calls: protocol, nested followup, source and old-evidence tests."""
+import ast,copy,importlib.util,json,sys,types,unittest
+from pathlib import Path
+ROOT=Path(__file__).resolve().parents[2];HERE=Path(__file__).resolve().parent;CORE=ROOT/'tools/e5_core_scan_reply_runtime_disabled_20261020';OLD=ROOT/'tools/e5_nextphase_core_live_265962d3c1cdbde8';sys.path.insert(0,str(CORE))
+import android_directory_adapter as a
+sp=importlib.util.spec_from_file_location('_new_phase',CORE/'phase_evidence.py');p=importlib.util.module_from_spec(sp);sys.modules[sp.name]=p;sp.loader.exec_module(p)
+BOOT='00000000-0000-4000-8000-000000000001';TX='314ff262fa18c842'
+def scanner(op,failure_detail=None,**changes):
+ common={'schema':'e5-native-occupancy-v1','opid':op,'boot_id':BOOT,'txid':TX,'deadline_ms':10000}
+ last={**common,'event':'RESULT','complete':True,'unknown':[],'processes':2,'fds':4,'namespaces':1,'loops':0,'tree_entries':17,'read_bytes':100}
+ code=0
+ if failure_detail:last.update(complete=False,unknown=['scan-not-complete'],reason='fd-table-scan-unknown',errno=116,cancel_signal=0,detail=failure_detail);code=70
+ last.update(changes)
+ raw=json.dumps(dict(common,event='PHASE')).encode()+b'\n'+json.dumps(last).encode()+f'\nE5_SCAN_EXIT\t{op}\t{code}\t{BOOT}\n'.encode();return raw
+class Tests(unittest.TestCase):
+ def adapter(self):
+  d=a.AndroidDirectoryAdapter.__new__(a.AndroidDirectoryAdapter);d.txid=TX;d.boot_id=BOOT;d.lock='/data/local/tmp/e5-clean-directory.lock';d._part=None;d._enabled=lambda:None;d.verify_file=lambda *x:None;d._deadline=lambda:10000;d.remote_scanner='/data/local/tmp/e5-clean-scanner.'+TX;d.scanner=types.SimpleNamespace(size=713024,sha256='7'*64);return d
+ def test_positive_complete_only(self):
+  d=self.adapter();v=d._occupancy_response(scanner('a'*32),'a'*32,10000);self.assertTrue(v['ready'])
+ def test_all_known_negative_details_remain_negative(self):
+  d=self.adapter()
+  for detail in ('fd-table-not-converged','closed-fd-reappeared','fd-final-coverage-new-slot'):
+   v=d._occupancy_response(scanner('a'*32,detail),'a'*32,10000);self.assertFalse(v['ready']);self.assertFalse(v['scanner']['complete'])
+ def test_unknown_or_busy_never_eligible(self):
+  d=self.adapter()
+  for kwargs in ({'errno':16},{'detail':'fd-object-identity-drift'},{'cancel_signal':15},{'unknown':['unsafe']},{'reason':'occupied'}):
+   with self.subTest(kwargs=kwargs),self.assertRaises(a.Refusal):d._occupancy_response(scanner('a'*32,'closed-fd-reappeared',**kwargs),'a'*32,10000)
+ def test_footer_missing_or_wrong_refused(self):
+  d=self.adapter();raw=scanner('a'*32)
+  for changed in (raw[:-10],raw.replace(b'E5_SCAN_EXIT',b'BAD'),raw.replace((BOOT+'\n').encode(),b'other\n'),raw.replace(b'\t0\t',b'\t124\t')):
+   with self.assertRaises(a.Refusal):d._occupancy_response(changed,'a'*32,10000)
+ def test_nonce_or_deadline_refused(self):
+  d=self.adapter()
+  with self.assertRaises(a.Refusal):d._occupancy_response(scanner('a'*32),'b'*32,10000)
+  with self.assertRaises(a.Refusal):d._occupancy_response(scanner('a'*32),'a'*32,10001)
+ def test_incomplete_zero_exit_never_ready(self):
+  d=self.adapter()
+  with self.assertRaises(a.Refusal):d._occupancy_response(scanner('a'*32,complete=False),'a'*32,10000)
+ def test_fresh_ops_until_positive(self):
+  d=self.adapter();seen=[]
+  def request(label,script,**kw):
+   seen.append(kw['op_id']);self.assertEqual(label,'occupancy');self.assertIn('|| scan_status=$?',script);self.assertEqual(kw['limit'],262144)
+   return kw['validator'](scanner(kw['op_id'],'closed-fd-reappeared' if len(seen)<3 else None))
+  d._request=request;v=d.occupancy();self.assertTrue(v['complete']);self.assertEqual(len(set(seen)),3)
+ def test_three_refusals_stop(self):
+  d=self.adapter();seen=[]
+  def request(label,script,**kw):seen.append(1);return kw['validator'](scanner(kw['op_id'],'closed-fd-reappeared'))
+  d._request=request
+  with self.assertRaises(a.Refusal):d.occupancy()
+  self.assertEqual(len(seen),3)
+ def test_timeout_or_lost_ack_not_repeated(self):
+  d=self.adapter();seen=[]
+  def request(*x,**kw):seen.append(1);raise RuntimeError('transport timeout/lost ACK')
+  d._request=request
+  with self.assertRaises(RuntimeError):d.occupancy()
+  self.assertEqual(len(seen),1)
+ def test_nested_followup_uses_same_readonly_path(self):
+  d=self.adapter();seen=[];d._ensure_transport=lambda:None
+  def part(label,argv,**kw):
+   seen.append(kw['metadata']['op_id']);self.assertNotIn('payload',kw) if False else None;self.assertEqual(kw['payload'],b'')
+   return kw['validator'](scanner(seen[-1],'closed-fd-reappeared' if len(seen)==1 else None))
+  d.adb=types.SimpleNamespace(path='/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb');d._part=part;v=d.occupancy();self.assertTrue(v['complete']);self.assertEqual(len(set(seen)),2)
+ def test_all_existing_adapter_methods_except_occupancy_unchanged(self):
+  def methods(path):
+   tree=ast.parse(path.read_bytes());cl=next(x for x in tree.body if isinstance(x,ast.ClassDef) and x.name=='AndroidDirectoryAdapter');return {x.name:ast.dump(x,include_attributes=False) for x in cl.body if isinstance(x,ast.FunctionDef)}
+  old,new=methods(OLD/'android_directory_adapter.py'),methods(CORE/'android_directory_adapter.py')
+  self.assertEqual(set(new)-set(old),{'_occupancy_response'})
+  for key in old:
+   if key!='occupancy':self.assertEqual(old[key],new[key],key)
+ def test_real_failed_followup_fixture_stays_declined(self):
+  folder=ROOT/'evidence/author-fd-convergence-continuation-20261020/activate-execution/transport';last=sorted(folder.glob('*directory-helper*'))[-1]/'part-004-occupancy';q=json.loads((last/'IN_FLIGHT.json').read_bytes());op=q['metadata']['op_id'];raw=(last/'stdout.bin').read_bytes();result=json.loads(raw.splitlines()[-1]);raw+=f'E5_SCAN_EXIT\t{op}\t70\t{BOOT}\n'.encode();self.assertFalse(self.adapter()._occupancy_response(raw,op,result['deadline_ms'])['ready'])
+ def test_historical_proof_pins_and_same_native_scope(self):
+  manifest=json.loads((CORE/'SOURCE_MANIFEST.json').read_bytes());old,_=p.historical_prerequisites(manifest);self.assertEqual(old['artifacts'],manifest['artifacts'])
+  wrong=copy.deepcopy(manifest);wrong['artifacts']['scanner']['sha256']='0'*64
+  with self.assertRaises(p.Refusal):p.historical_prerequisites(wrong)
+ def test_real_completed_deployment_and_probe_replayed_with_old_source(self):
+  manifest=json.loads((CORE/'SOURCE_MANIFEST.json').read_bytes());manifest['_bound_manifest_sha256']=p.sha((CORE/'SOURCE_MANIFEST.json').read_bytes());h=ROOT/'evidence/author-lock-lineage-install-20261020';refs={'deployment':p.bind(h/'scanner-execution/result/COMPLETE.json'),'probe':p.bind(h/'probe-execution/COMPLETE.json')};v=p.validate_requirements(refs,manifest,'activate',TX);self.assertTrue(v['current_readback_required']);self.assertEqual(v['deployment']['state'],v['probe']['state'])
+if __name__=='__main__':unittest.main(verbosity=2)

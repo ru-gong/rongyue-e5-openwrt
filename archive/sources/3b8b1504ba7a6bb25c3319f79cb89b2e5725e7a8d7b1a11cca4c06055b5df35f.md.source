@@ -1,0 +1,44 @@
+# E5 clean reinstall v3 — offline prepared, production disabled
+
+Only this v3 directory is the current prepared implementation. v1/v2, original backups, the first installer and earlier evidence remain unchanged. This library has no CLI/env activation. Do not import or run the old first installer to bypass its existing-directory refusal.
+
+The current user approved offline preparation only. The Chinese scope document at the workspace root is the proposed execution/recovery boundary, not a live authorization.
+
+## Fixed sequence after separate user confirmation
+
+1. Produce separately reviewed enabled execution copies/builds with a new source/binary manifest. Do not modify these frozen preparation files. Pin all Python modules, adb and native artifacts. The available ARM64 `.DISABLED` binaries intentionally return refusal and cannot flash.
+2. Start the existing read-only attachment/cold-health workflow. Verify new Android A/root/boot identity, no SIMs, absence of new crash evidence, exact partition geometry and hashes, fresh current directory inventory and complete Mac backup. Retain old evidence. A past read-only backup is not a current-state lease.
+3. Provision only the three fixed helper filenames and the fixed transaction owner lock using `AndroidDirectoryAdapter.acquire/upload_helper`. Their permissions, length/hash and bootstrap uncertainty must be checked. Validate native scanner coverage and short operations on hardware before partition writes. Check no-replace support without modifying the current active/archived directory. No full-device or A-slot operation is provided here.
+4. Use `bounded_boot_control.execute` with mode `restore-original` for the exact original B/misc32 preimage-bound request. A 4 MiB chunk is COMPLETE only after native ACK plus independent bounded readback. Full B is verified before BC32. Reboot is not part of execute.
+5. Set a finite monotonic phase deadline (max 3,600 s) and explicit cancellation event on the directory adapter. Reuse the host-prepared pristine ext4 Artifact. `stage` creates a new stage and writes the exact eight files in chunks; readback, fscrypt and full inventory must pass. A partial stage is retained, never automatically resumed or overwritten.
+6. Refresh the original-B/misc cold proof and technical review within their 15-minute lease. `DirectorySession.open/activate` binds candidate, current inventory, full backup and exact request. It emits an activation receipt binding current sources and active inventory. All directory operations share the fixed device-wide host lock with boot operations.
+7. Release the directory session host lock before invoking the separate boot transaction (do not nest the same flock). Give the real directory adapter the boot transaction's cancellation event and a deadline no later than its budget. `install-linux` requires the activation receipt and fresh exact active tree both before B write and before BC32. The default remains Android. Only after COMPLETE and all readbacks may the caller perform the separately approved normal reboot.
+8. Validate first boot read-only, then arrange physical SIM insertion and mobile/hotspot acceptance separately with the user. Runtime changes to the fresh rootfs are expected and must be re-inventoried.
+
+## Interruption and bounded recovery
+
+`bounded_transport` persists operation input/argv hashes and ACTIVE before dispatch. Native processes have short absolute deadlines and cooperative cancellation; host pipes have 8-second bounds and bounded buffers. Success requires protocol plus independent readback in the same ACTIVE operation. Any incomplete result persists UNKNOWN. No automatic retry, resume, rollback, reboot, or deletion follows.
+
+Directory MOVE and SESSION_UNCERTAIN records also prevent replay after a Python restart. A new folder does not bypass the global transport barrier. A kernel-blocked I/O may outlive host termination. The scanner is not an atomic exclusion lock; fresh full coverage and independent source/target checks remain mandatory.
+
+After uncertainty, normal mode is blocked. Only the explicit reconciliation transport mode can collect fresh read-only evidence without altering old global markers. It accepts no mutation, payload or followup. A new observed Android boot is required for a restoration grant; same-boot termination is deliberately not inferred from ADB exit or PID absence.
+
+`reconcile_readonly` captures full raw B/misc/GPT/13 protected artifacts and does not release any barrier. `uncertainty_recovery.stage` verifies these bytes, current marker hashes (including explicit ABSENT), boot ledger, new exact restore-original request and two independently bound technical reviews. It writes RECOVERY_PENDING first, archives old evidence, then publishes RECOVERY_ONLY. A torn host transition remains blocked for manual evidence reconciliation. None of these review files are user consent.
+
+The recovery-only transport is bound to the exact request SHA, boot and transaction. Only original B/misc32 writes can pass; installation/directory changes cannot. The existing immutable IO helper from the prior transaction may be reused after full hash/type validation, so recovery needs no new helper upload. If it is absent or changed, stop; do not expand the grant.
+
+`finish` releases recovery-only state only after complete original B/misc raw readback and the matching COMPLETE ledger. It archives the grant rather than deleting evidence. Then a separately reviewed directory rollback session uses the original directory transaction ID/owner lock and a fresh boot/cold proof; it may inventory and back up an already-preserved `failed` role. It does not reacquire or replace an existing different owner lock. Runtime trial changes require a new complete inventory and backup. If Android A/root/data are unavailable, these tools stop and do not enter FDL or clear data.
+
+## Modules and evidence
+
+- `native_io.c`: one bounded chunk, no partial-write retry; fixed stage file set or B/misc32 only.
+- `native_occupancy_scanner.c`: task/namespace/FD/cwd/root/loop/inode coverage; incomplete observations fail.
+- `device_directory_helper.c`: seal and four fixed no-replace renames; cancellation admission and post-commit UNKNOWN.
+- `bounded_transport.py`: bounded real host pipes, shared durable barrier, readback followup, restricted reconciliation/recovery modes.
+- `android_directory_adapter.py`: pinned ordinary files, bounded reads/staging, host tar backup and native integration.
+- `directory_session.py`: fresh evidence/review binding, original baseline, durable no-replay moves, activation receipt and explicit rollback.
+- `bounded_boot_control.py`: 4 MiB B writer, exact BC32, protected checks, append-only ledger and read-only reconciliation.
+- `uncertainty_recovery.py`: host-only reviewed transition; never calls a device or offers an override.
+- `directory_transaction.py`: older local sandbox model retained for regression; its local replay tests are not permission to resume a device transaction.
+
+See `../../research/author-clean-reinstall-20261014/v3-final-validation/VALIDATION.json` for exact tested source hashes, independent review bindings and counts. Run each suite in a separate Python process: their external-call audit policies differ. Native tests use only explicitly named local temporary fixture paths. The local Colima ARM Linux VM was used for disabled static builds and fixture tests, then stopped; no USB/device attachment occurred.

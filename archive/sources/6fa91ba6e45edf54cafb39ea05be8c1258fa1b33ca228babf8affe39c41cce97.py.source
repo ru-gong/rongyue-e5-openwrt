@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""Host-only future-evidence reviewer. No transport import or device execution API."""
+from __future__ import annotations
+import argparse
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+from pathlib import Path
+import re
+import struct
+import uuid
+import zlib
+
+DEVICE_EXECUTION_ENABLED = False
+ROOT = Path(__file__).resolve().parents[2]
+CORE = ROOT / "tools/e5_android_install_live_20261013/e5_install.py"
+CORE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+PROFILE = CORE.parent / "device-profile.json"
+PROFILE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+SOURCES = ROOT / "evidence/stage2-execution-20261013/android-install-01"
+ORIGINAL_B = SOURCES / "boot_b.before.bin"
+ORIGINAL_MISC = SOURCES / "misc.before.bin"
+LINUX_B = ROOT / "evidence/stage2-execution-20261013/final-install-bundle/boot.img"
+B_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+M_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+LINUX_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+KNOWN_PANIC_REVIEW = ROOT / "research/audit/cellular-d0-android-native-hang-independent-20261013.json"
+KNOWN_PANIC_REVIEW_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+OLD_BOOT_IDS = {"00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001",
+                "00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000001"}
+NOT_BEFORE = datetime(2026,10,14,tzinfo=timezone(timedelta(hours=8)))
+SERIAL = "DEVICE_SERIAL_REDACTED"
+EXPECTED_KERNEL = "5.15.119-android13-8-00018-ga78ea39db117-ab10710420"
+BOOT_BYTES, MISC_BYTES = 64 << 20, 1 << 20
+ARTIFACTS = {"observations.json", "boot_b.current.bin", "misc.current.bin", "gpt-prefix.bin",
+             "protection.json", "panic-evidence.json"}
+
+def require(value, message):
+    if not value: raise ValueError(message)
+
+def digest(data): return hashlib.sha256(data).hexdigest()
+
+def file_bytes(path, limit):
+    p = Path(path)
+    require(p.is_file() and not p.is_symlink() and p.stat().st_size <= limit, "unsafe/oversize local input")
+    data = p.read_bytes()
+    require(len(data) <= limit, "input grew while reading")
+    return data
+
+def pinned(path, sha, limit):
+    require(re.fullmatch(r"[a-f0-9]{64}",sha), "invalid SHA")
+    data=file_bytes(path,limit)
+    require(digest(data)==sha,"local input hash mismatch: "+str(path))
+    return data
+
+def stamp(text):
+    value=datetime.fromisoformat(text)
+    require(value.tzinfo is not None,"timestamps require timezone")
+    return value
+
+def bc_valid(data, require_a=False):
+    require(len(data)==32 and data[4:8]==b"BCAB" and data[8]==1 and data[9]&7==2,"unknown BC format")
+    require(data[:4] in (b"_a\0\0",b"_b\0\0") and struct.unpack_from('<I',data,28)[0]==zlib.crc32(data[:28]),"bad BC suffix/CRC")
+    require(not(data[13]&1 or data[15]&1),"BC verity error")
+    if require_a:
+        require(data[:4]==b"_a\0\0" and data[12]&0x80 and data[12]&15,"A is not confirmed successful")
+        b_bootable=bool(data[14]&15) and bool(data[14]&0xf0)
+        require(not b_bootable or data[12]&15 > data[14]&15,"B may win priority tie or higher priority")
+
+def inventory():
+    pinned(CORE,CORE_SHA,100000)
+    profile=json.loads(pinned(PROFILE,PROFILE_SHA,20000))
+    pinned(KNOWN_PANIC_REVIEW,KNOWN_PANIC_REVIEW_SHA,20000)
+    original_b=pinned(ORIGINAL_B,B_SHA,BOOT_BYTES)
+    original_misc=pinned(ORIGINAL_MISC,M_SHA,MISC_BYTES)
+    linux=pinned(LINUX_B,LINUX_SHA,BOOT_BYTES)
+    require(len(original_b)==len(linux)==BOOT_BYTES and len(original_misc)==MISC_BYTES,"original sizes")
+    require(profile["original_boot_b_sha256"]==B_SHA and profile["original_misc_sha256"]==M_SHA,"wrong device originals")
+    bc_valid(original_misc[2048:2080],True)
+    return profile,original_misc,linux
+
+def validate_future(evidence, expected_sha, review_sha, now=None):
+    """Validate supplied host evidence only; it cannot attest that a collector told the truth."""
+    now=now or datetime.now(timezone.utc)
+    profile,original_misc,linux=inventory()
+    folder=Path(evidence)
+    require(folder.is_dir() and not folder.is_symlink(),"evidence must be a real directory")
+    proof=json.loads(pinned(folder/"resume-evidence.json",expected_sha,65536))
+    require(proof.get("schema")=="e5-future-resume-evidence-v1" and proof.get("serial")==SERIAL,"wrong evidence schema/device")
+    require(proof.get("collector_read_only") is True and proof.get("synthetic") is False,"real read-only evidence required")
+    collector=proof.get("collector")
+    require(isinstance(collector,str) and bool(collector.strip()),"nonempty named collector required")
+    require(set(proof["artifacts"])==ARTIFACTS,"unexpected/missing evidence artifact")
+    data={}
+    limits={"boot_b.current.bin":BOOT_BYTES,"misc.current.bin":MISC_BYTES,"gpt-prefix.bin":32768}
+    for name, item in proof["artifacts"].items():
+        require(set(item)=={"bytes","sha256"},"artifact only accepts size and hash, no alternate paths")
+        raw=pinned(folder/name,item["sha256"],limits.get(name,1<<20))
+        require(len(raw)==item["bytes"],"artifact length mismatch")
+        data[name]=raw
+    obs=json.loads(data["observations.json"])
+    require(isinstance(obs,list) and len(obs)>=3,"at least three observations required")
+    started,finished=stamp(obs[0]["captured_at"]),stamp(obs[-1]["captured_at"])
+    require(NOT_BEFORE<=started<=finished<=now and now-finished<=timedelta(minutes=15),"old/future/stale evidence")
+    require(finished-started>=timedelta(minutes=10),"less than ten-minute cold/no-SIM observation")
+    boot=obs[0]["boot_id"]
+    require(str(uuid.UUID(boot))==boot and boot not in OLD_BOOT_IDS,"old/invalid boot ID")
+    previous_time=None; previous_uptime=-1
+    for row in obs:
+        require(row["boot_id"]==boot,"boot changed during observation")
+        require(row["serial"]==SERIAL and row["slot"]=="_a" and type(row["root_uid"]) is int and row["root_uid"]==0,
+                "not this device rooted Android A")
+        require(row["model"]=="E5" and row["platform"]=="ums9621" and row["build"]=="TS305_V03_20241128_2301" and
+                row["kernel"]==EXPECTED_KERNEL and row["boot_completed"] is True,"Android identity not fixed")
+        require(row["verifiedbootstate"]=="orange" and row["flash_locked"]=="0","root startup state changed")
+        require(row["sim_states"]==["ABSENT","ABSENT"],"both SIM cards must be absent for this stability gate")
+        require(row["data"]=={"node":"/dev/block/mmcblk0p70","fstype":"f2fs","rw":True},"data mapping changed")
+        require(row["new_panic_observed"] is False and row["unexpected_reboot_observed"] is False and
+                row["read_io_error"] is False,"new panic/reboot/read fault requires a new review")
+        require(not re.search(r"panic|watchdog|hung|hardlockup",row["boot_reason"],re.I),"current boot reason not a clean cold start")
+        t=stamp(row["captured_at"]); u=row["uptime_seconds"]
+        require(type(u) in (int,float) and u>=0 and (previous_time is None or t>previous_time) and u>previous_uptime,"nonmonotonic observations")
+        previous_time,previous_uptime=t,u
+    elapsed=(finished-started).total_seconds()
+    require(abs(obs[-1]["uptime_seconds"]-obs[0]["uptime_seconds"]-elapsed)<=5,"wall/uptime mismatch")
+    require(obs[0]["uptime_seconds"]<=120,"first sample must cover early cold boot")
+    protection=json.loads(data["protection.json"])
+    require(protection=={"boot_id":boot,"partitions":profile["partitions"],"protected_hashes":profile["protected_hashes"]},"nodes/geometry/13 protection mismatch")
+    require(len(data["gpt-prefix.bin"])==32768 and digest(data["gpt-prefix.bin"])==profile["gpt_prefix_sha256"],"GPT prefix mismatch")
+    cb,cm=data["boot_b.current.bin"],data["misc.current.bin"]
+    require(len(cb)==BOOT_BYTES and len(cm)==MISC_BYTES,"short current preimage")
+    b_original=digest(cb)==B_SHA
+    require(b_original or (cb[:56<<20]==linux[:56<<20] and cb[60<<20:]==linux[60<<20:]),"unknown B outside diagnostic window")
+    require(cm[:2048]==original_misc[:2048] and cm[2080:]==original_misc[2080:],"misc outside BC32 changed; scope cannot expand")
+    bc_valid(cm[2048:2080],True)
+    panic=json.loads(data["panic-evidence.json"])
+    require(panic.get("boot_id")==boot and panic.get("new_since_cold_start") is False and
+            panic.get("pstore_collected") is True and panic.get("boot_reason_collected") is True,"incomplete fresh panic evidence")
+    require(set(panic.get("raw_files",{}))=={"boot-reasons.txt","pstore-capture.txt","crash-buffer.txt"},"raw panic records required")
+    for name,item in panic["raw_files"].items():
+        require(set(item)=={"bytes","sha256"} and type(item["bytes"]) is int and item["bytes"]>0,"invalid raw panic binding")
+        require(len(pinned(folder/name,item["sha256"],4<<20))==item["bytes"],"raw panic record length mismatch")
+    review=json.loads(pinned(folder/"technical-review.json",review_sha,65536))
+    require(review.get("schema")=="e5-future-resume-review-v1" and review.get("evidence_sha256")==expected_sha and
+            review.get("boot_id")==boot and review.get("known_panic_review_sha256")==KNOWN_PANIC_REVIEW_SHA,"review not bound to this evidence/panic")
+    reviewer=review.get("reviewer")
+    require(isinstance(reviewer,str) and bool(reviewer.strip()) and reviewer.strip()!=collector.strip(),"independent named review required")
+    for key in ("cold_boot_and_sim_removal_confirmed","new_panic_evidence_evaluated","no_new_unassessed_panic",
+                "unresolved_android_panic_risk_acknowledged","read_only_evidence_complete"):
+        require(review.get(key) is True,"pending human review gate: "+key)
+    require(review.get("recommendation")=="original_B_BC32_plan_only" and finished<=stamp(review["reviewed_at"])<=now,"unsupported/stale technical review")
+    result={"schema":"e5-offline-resume-plan-v1","status":"EVIDENCE_ACCEPTED_FOR_HUMAN_PLAN_REVIEW_ONLY",
+            "device_execution_allowed":False,"device_execution_implemented":False,"approved_to_flash":False,
+            "serial":SERIAL,"boot_id":boot,"evidence_sha256":expected_sha,"technical_review_sha256":review_sha,
+            "expires_at":(finished+timedelta(minutes=15)).isoformat(),"core_sha256":CORE_SHA,
+            "current_boot_b_sha256":digest(cb),"current_misc_sha256":digest(cm),
+            "restore_sources":{"boot_b":{"path":str(ORIGINAL_B),"bytes":BOOT_BYTES,"sha256":B_SHA},
+                               "misc":{"path":str(ORIGINAL_MISC),"bytes":MISC_BYTES,"sha256":M_SHA}},
+            "restore_ranges":[{"node":"/dev/block/mmcblk0p37","offset":0,"bytes":BOOT_BYTES,"full_readback_sha256":B_SHA},
+                              {"node":"/dev/block/mmcblk0p3","offset":2048,"bytes":32,"source_offset":2048,
+                               "full_readback_bytes":MISC_BYTES,"full_readback_sha256":M_SHA,"outside_window_equal":True}],
+            "pending_gates":["Root operator reviews current panic/stability and obtains any required next-action approval.",
+                             "Separate request binding and fresh transport preflight must recheck current preimages immediately before writing.",
+                             "Stop on any boot change, new panic, I/O error, unknown image or changed protected partition.",
+                             "This does not approve another Linux boot, RF changes, rootfs replacement, or expanded recovery."],
+            "automatic_reboot_retry_restore":False,"panic_root_cause_resolved":False,
+            "resume_steps":["Keep the device in Android A for reviewed no-SIM observation.",
+                            "If separately approved, use only original B then original BC32 with full readback and protected checks.",
+                            "Review successful COMPLETE_NO_REBOOT before a separately approved reboot and fresh Android acceptance."]}
+    if b_original:
+        result["restore_ranges"]=[]
+        result["current_B_classification"]="already_original"
+        result["status"]="NO_WRITE_NEEDED" if digest(cm)==M_SHA else "MANUAL_REVIEW_BC32_ONLY_UNIMPLEMENTED"
+        result["resume_steps"]=["Do not repeat the full-B restore; this device already has its original B.",
+                                "The frozen core always rewrites B; a BC32-only discrepancy needs separate review, not scope inference."]
+    else:
+        result["current_B_classification"]="known_linux_outside_diagnostic_window"
+    return result
+
+def main(argv=None):
+    p=argparse.ArgumentParser(description=__doc__)
+    p.add_argument("mode",choices=("inventory","plan"))
+    p.add_argument("--evidence",type=Path)
+    p.add_argument("--manifest-sha256")
+    p.add_argument("--review-sha256")
+    a=p.parse_args(argv)
+    if a.mode=="inventory":
+        require(a.evidence is None and a.manifest_sha256 is None and a.review_sha256 is None,"inventory takes no evidence")
+        inventory()
+        result={"status":"LOCAL_RESTORE_SOURCES_VERIFIED_ONLY","device_execution_allowed":False,
+                "last_recorded_B_restored":False,"live_device_state_unchecked":True,"fresh_future_evidence_required":True,
+                "original_B_sha256":B_SHA,"original_misc_sha256":M_SHA,"known_panic_unresolved":True}
+    else:
+        require(a.evidence is not None and a.manifest_sha256 and a.review_sha256,"future evidence plus two independent hashes required")
+        result=validate_future(a.evidence,a.manifest_sha256,a.review_sha256)
+    print(json.dumps(result,indent=2,ensure_ascii=False))
+    return 0
+
+if __name__=="__main__": raise SystemExit(main())

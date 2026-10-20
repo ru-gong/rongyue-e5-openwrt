@@ -1,0 +1,236 @@
+"""Host fixtures only. Never calls production close or device/network process APIs."""
+import collections
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import signal
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+def audit(event,args):
+    if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.fork','pty.spawn'):
+        raise AssertionError('external activity prohibited: '+event)
+sys.addaudithook(audit)
+import closure as c
+
+class Fixture:
+    def __init__(self):
+        self.temp=tempfile.TemporaryDirectory(prefix='e5-closure-test-');self.root=Path(self.temp.name).resolve()
+        self.state=self.root/'state';self.state.mkdir();(self.state/'completed').mkdir();self.execution=self.root/'execution';(self.execution/'transport').mkdir(parents=True)
+        self.case={'schema':'e5-fixed-readonly-abort-case-v1','serial':'TEST123','txid':'46d941e4703744fa','boot_id':'00000000-0000-4000-8000-000000000001',
+            'state':'state','global_lock':'GLOBAL.lock','ledger':'ledger.jsonl','execution':'execution','archive_rel':'readonly-closures/46d941e4703744fa',
+            'expected_error':'Refusal: snapshot metadata: tmp','files':{},'operations':[]}
+        self.save('state/STATE_BINDING.json',{'schema':'e5-transport-state-v1','serial':'TEST123'})
+        row={'seq':0,'previous':'0'*64,'event':'COMPLETE','txid':'a'*16};row['chain_sha256']=c.sha(c.canonical(row));self.save('ledger.jsonl',row)
+        ledger=(self.root/'ledger.jsonl').read_bytes();self.case.update(ledger_bytes=len(ledger),ledger_sha256=c.sha(ledger),ledger_head=row['chain_sha256'],ledger_rows=1)
+        classes=collections.Counter();review={'decision':'STOP_CONFIRMED_NO_DEVICE_MUTATION_DISPATCHED_NO_CONTINUATION_APPROVAL','all_scripts_reconstructed_from_frozen_literals_or_methods':True,'operations':[]}
+        for i in range(62):
+            label=('read-chunk' if i%2==0 else 'hash-chunk') if i<44 else ('stage2-geometry' if i<61 else 'stage2-state-old')
+            classes[label]+=1;op=f'{i+1:032x}';folder=f'execution/transport/{i+1:06d}-{label}-{op}';(self.root/folder).mkdir()
+            script='set -eu\nprintf '+shlex.quote('fixed read '+str(i))+'\n'
+            remote='/debug_ramdisk/su -c '+shlex.quote('/data/adb/magisk/busybox timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(script))
+            argv=['/fixed/adb','-s','TEST123','shell','-T',remote]
+            begin={'schema':'e5-bounded-transport-v1','status':'IN_FLIGHT','serial':'TEST123','boot_id':self.case['boot_id'],'txid':self.case['txid'],'op_id':op,'label':label,'mutating':False,
+                'payload_bytes':0,'payload_sha256':c.sha(b''),'reconciliation_only':False,'recovery_context':None,'automatic_retry':False,'argv':argv,'argv_sha256':c.sha(c.canonical(argv)),
+                'output_limit':16384,'deadline_seconds':8.0}
+            out=b'full state frame'+b' '*(850-len(b'full state frame')) if i==61 else ('read '+str(i)).encode()
+            result={'returncode':0,'failure':None,'host_child_reaped':True,'stdin_bytes_sent':0,'stderr_bytes':0,'stdout_bytes':len(out),'stdout_sha256':c.sha(out),'elapsed_seconds':.1,'remote_completion_proven':False}
+            self.save(folder+'/IN_FLIGHT.json',begin);self.save(folder+'/stdout.bin',out);self.save(folder+'/stderr.bin',b'');self.save(folder+'/transport-result.json',result)
+            if i<61:
+                comp=dict(begin,status='COMPLETE',validated=True,stdout_sha256=c.sha(out));self.save(folder+'/COMPLETE.json',comp);self.save('state/completed/'+op+'.json',comp)
+            else:
+                uncertain=dict(begin,status='UNCERTAIN',reason=self.case['expected_error'],remote_completion_proven=False)
+                self.save(folder+'/UNCERTAIN.json',uncertain);self.save('state/ACTIVE.json',begin);self.save('state/UNCERTAIN.json',uncertain)
+            self.case['operations'].append({'folder':folder,'label':label,'op_id':op,'argv_sha256':begin['argv_sha256'],'script_sha256':c.sha(script.encode()),'completed':i<61})
+            review['operations'].append({'operation':Path(folder).name,'script_sha256':c.sha(script.encode()),'stdout_sha256':c.sha(out)})
+        self.save('execution/REVIEW.json',review);self.case['review']={'path':'execution/REVIEW.json','sha256':c.sha((self.execution/'REVIEW.json').read_bytes())}
+        self.case['script_classes']=dict(classes);self.case['markers']={n:self.pin(self.state/n) for n in c.MARKERS}
+        for p in self.execution.rglob('*'):
+            if p.is_file():self.case['files'][str(p.relative_to(self.root))]=self.pin(p)
+        for p in (self.state/'completed').iterdir():self.case['files'][str(p.relative_to(self.root))]=self.pin(p)
+        self.case['completed_baseline']={p.name:self.pin(p) for p in (self.state/'completed').iterdir()}
+        self.case['files']['state/STATE_BINDING.json']=self.pin(self.state/'STATE_BINDING.json')
+        self.engine=c._Case(self.root,self.case,c.sha(c.encoded(self.case)),fixture=True)
+    def save(self,rel,value):
+        p=self.root/rel;p.parent.mkdir(parents=True,exist_ok=True);p.write_bytes(value if isinstance(value,bytes) else c.encoded(value))
+    def pin(self,p):return {'bytes':p.stat().st_size,'sha256':c.sha(p.read_bytes())}
+    def append_ledger(self,event):
+        p=self.root/'ledger.jsonl';rows=[json.loads(x) for x in p.read_bytes().splitlines()];v={'seq':len(rows),'previous':rows[-1]['chain_sha256'],'event':event,'txid':'b'*16};v['chain_sha256']=c.sha(c.canonical(v))
+        with p.open('ab') as stream:stream.write(c.encoded(v))
+    def cleanup(self):self.temp.cleanup()
+
+class ClosureTests(unittest.TestCase):
+    def setUp(self):self.f=Fixture();self.addCleanup(self.f.cleanup);self.e=self.f.engine
+    def test_valid_readonly_proof(self):self.assertEqual(self.e.verify()['operation_count'],62)
+    def test_close_preserves_originals_ledger_and_pending(self):
+        old={n:(self.f.state/n).read_bytes() for n in c.MARKERS};ledger=(self.f.root/'ledger.jsonl').read_bytes();before={p:p.read_bytes() for p in self.f.execution.rglob('*') if p.is_file()}
+        v=self.e.close();self.assertFalse(v['deployment_completed']);self.assertTrue((self.f.state/c.PENDING).exists())
+        for n in c.MARKERS:self.assertEqual((self.e.archive/n).read_bytes(),old[n]);self.assertFalse((self.f.state/n).exists())
+        self.assertEqual((self.f.root/'ledger.jsonl').read_bytes(),ledger)
+        for p,raw in before.items():self.assertEqual(p.read_bytes(),raw)
+        self.assertFalse((self.e.archive/'COMPLETE.json').exists())
+    def test_close_repeated_only_same_complete_case(self):self.assertEqual(self.e.close(),self.e.close())
+    def test_production_gate_rejects_before_locks(self):
+        self.e.fixture=False
+        with self.assertRaisesRegex(c.Refusal,'disabled'):self.e.close()
+        self.assertFalse((self.f.root/'GLOBAL.lock').exists())
+    def test_fixture_cannot_point_to_real_workspace(self):
+        with self.assertRaises(c.Refusal):c._Case(c.ROOT,self.f.case,'0'*64,fixture=True)
+    def test_source_or_raw_drift_refused(self):
+        p=self.f.root/self.f.case['operations'][0]['folder']/'stdout.bin';p.write_bytes(b'changed')
+        with self.assertRaises(c.Refusal):self.e.verify()
+    def test_extra_operation_refused(self):
+        (self.f.execution/'transport'/'000063-unknown').mkdir()
+        with self.assertRaises(c.Refusal):self.e.verify()
+    def test_added_top_evidence_refused(self):
+        (self.f.execution/'NEW.json').write_text('{}')
+        with self.assertRaises(c.Refusal):self.e.verify()
+    def test_current_marker_wrong_bytes_refused(self):
+        (self.f.state/'ACTIVE.json').write_bytes(b'{}')
+        with self.assertRaises(c.Refusal):self.e.verify()
+    def test_ledger_preclosure_growth_refused(self):
+        self.f.append_ledger('START')
+        with self.assertRaises(c.Refusal):self.e.close()
+    def test_future_valid_chain_allowed_but_normal_rejects_start(self):
+        self.e.close();self.f.append_ledger('START');view=self.e.closed();self.assertEqual(view['current_ledger_last_event'],'START')
+        with patch.object(c,'validate_closed',return_value=view):
+            with self.assertRaises(c.Refusal):c.normal_gate(self.f.state,self.e.ledger)
+        for ev in ['WRITE','COMPLETE']:self.f.append_ledger(ev)
+        view=self.e.closed()
+        with patch.object(c,'validate_closed',return_value=view):self.assertEqual(c.normal_gate(self.f.state,self.e.ledger),view)
+        with self.assertRaises(c.Refusal):self.e.close()
+    def test_ledger_prefix_tamper_refused(self):
+        self.e.close();p=self.e.ledger;p.write_bytes(p.read_bytes().replace(b'COMPLETE',b'INVALID!'))
+        with self.assertRaises(c.Refusal):self.e.closed()
+    def test_ledger_appended_bad_chain_refused(self):
+        self.e.close()
+        with self.e.ledger.open('ab') as f:f.write(c.encoded({'seq':1,'previous':'f'*64,'event':'COMPLETE','chain_sha256':'0'*64}))
+        with self.assertRaises(c.Refusal):self.e.closed()
+    def test_new_active_not_hidden_by_closure(self):
+        v=self.e.close();(self.f.state/'ACTIVE.json').write_text('{}')
+        self.assertEqual(self.e.closed(),v)
+        with patch.object(c,'validate_closed',return_value=v):
+            with self.assertRaises(c.Refusal):c.normal_gate(self.f.state,self.e.ledger)
+        with self.assertRaises(c.Refusal):self.e.close()
+    def test_new_uncertainty_not_hidden(self):
+        v=self.e.close();(self.f.state/'UNCERTAIN.json').write_text('{}')
+        with patch.object(c,'validate_closed',return_value=v):
+            with self.assertRaises(c.Refusal):c.normal_gate(self.f.state,self.e.ledger)
+    def test_completed_growth_cannot_reclose(self):
+        self.e.close();(self.f.state/'completed'/'new.json').write_text('{}')
+        self.e.closed()
+        with self.assertRaises(c.Refusal):self.e.close()
+    def test_old_tx_and_boot_refused(self):
+        v=self.e.close()
+        for boot,tx in [(v['excluded_boot_id'],'b'*16),('a'*8+'-'+ 'a'*4+'-'+ 'a'*4+'-'+ 'a'*4+'-'+ 'a'*12,v['retired_txid'])]:
+            with self.subTest(boot=boot,tx=tx):
+                with self.assertRaises(c.Refusal):c.assert_new_identity(v,boot,tx)
+    def test_new_identity_allowed(self):
+        c.assert_new_identity(self.e.close(),'00000000-0000-4000-8000-000000000001','b'*16)
+    def test_snapshot_retains_binding_and_history(self):
+        v=self.e.close();s={'serial':v['serial'],'markers':{c.PENDING:v['barrier']},'previous_boots':[],'used_txids':[],
+            'ledger_head':v['current_ledger_head'],'ledger_last_event':v['current_ledger_last_event']}
+        with patch.object(c,'validate_closed',return_value=v):out=c.augment_snapshot(s,self.f.state,self.e.ledger)
+        self.assertEqual(out['markers'][c.PENDING],v['barrier']);self.assertIn(v['retired_txid'],out['used_txids']);self.assertIn(v['excluded_boot_id'],out['previous_boots'])
+    def test_snapshot_cannot_fake_pending_absent(self):
+        v=self.e.close()
+        with patch.object(c,'validate_closed',return_value=v):
+            with self.assertRaises(c.Refusal):c.augment_snapshot({'serial':v['serial'],'markers':{c.PENDING:'ABSENT'}},self.f.state,self.e.ledger)
+    def test_future_recovery_transition_blocks_transport(self):
+        v=self.e.close();(self.f.state/c.TRANSITION).write_text('{}')
+        with patch.object(c,'validate_closed',return_value=v):
+            with self.assertRaises(c.Refusal):c.transport_gate(self.f.state,self.e.ledger,'TEST123','00000000-0000-4000-8000-000000000001','b'*16)
+    def test_no_receipt_is_not_closed(self):
+        c.durable(self.f.state/c.PENDING,c.encoded(self.e.barrier()))
+        with self.assertRaises((c.Refusal,FileNotFoundError)):self.e.closed()
+    def test_missing_pending_cannot_be_normal(self):
+        self.e.close();(self.f.state/c.PENDING).unlink()
+        with self.assertRaises((c.Refusal,FileNotFoundError)):self.e.closed()
+    def test_foreign_pending_not_overwritten(self):
+        (self.f.state/c.PENDING).write_bytes(b'foreign')
+        with self.assertRaises(c.Refusal):self.e.close()
+        self.assertEqual((self.f.state/c.PENDING).read_bytes(),b'foreign')
+    def test_partial_pending_temp_stops_without_archive(self):
+        (self.f.state/(c.PENDING+'.preparing')).write_bytes(b'{')
+        with self.assertRaises(c.Refusal):self.e.close()
+        self.assertTrue((self.f.state/'ACTIVE.json').exists());self.assertTrue((self.f.state/'UNCERTAIN.json').exists())
+    def test_complete_pending_temp_resume(self):
+        (self.f.state/(c.PENDING+'.preparing')).write_bytes(c.encoded(self.e.barrier()));self.e.close();self.e.closed()
+    def test_duplicate_marker_destination_refused(self):
+        self.e.archive.mkdir(parents=True);(self.e.archive/'ACTIVE.json').write_bytes((self.f.state/'ACTIVE.json').read_bytes())
+        with self.assertRaises(c.Refusal):self.e.close()
+    def test_symlink_marker_refused(self):
+        p=self.f.state/'ACTIVE.json';raw=p.read_bytes();p.unlink();q=self.f.root/'other';q.write_bytes(raw);p.symlink_to(q)
+        with self.assertRaises(c.Refusal):self.e.close()
+    def test_hardlink_marker_refused(self):
+        os.link(self.f.state/'ACTIVE.json',self.f.root/'other')
+        with self.assertRaises(c.Refusal):self.e.close()
+    def test_foreign_archive_file_refused(self):
+        self.e.archive.mkdir(parents=True);(self.e.archive/'foreign').write_text('retain')
+        with self.assertRaises(c.Refusal):self.e.close()
+        self.assertTrue((self.e.archive/'foreign').exists())
+    def test_atomic_no_replace_does_not_overwrite(self):
+        a=self.f.root/'a';b=self.f.root/'b';a.write_bytes(b'a');b.write_bytes(b'b')
+        with self.assertRaises(OSError):c.noreplace(a,b)
+        self.assertEqual(a.read_bytes(),b'a');self.assertEqual(b.read_bytes(),b'b')
+    def test_interruption_matrix_resume(self):
+        for point in ('verified','barrier_durable','prefix_durable','before_ACTIVE.json','after_ACTIVE.json','before_UNCERTAIN.json','after_UNCERTAIN.json','before_receipt','receipt_durable','final_verified'):
+            with self.subTest(point=point):
+                f=Fixture()
+                try:
+                    def stop(name):
+                        if name==point:raise c.Refusal('injected '+name)
+                    f.engine.fault=stop
+                    with self.assertRaises(c.Refusal):f.engine.close()
+                    # Old normal_state's four-absence predicate must NEVER pass.
+                    self.assertTrue(any(c.exists(f.state/n) for n in ('ACTIVE.json','UNCERTAIN.json','RECOVERY_ONLY.json',c.PENDING)))
+                    if point not in ('receipt_durable','final_verified'):
+                        with self.assertRaises((c.Refusal,FileNotFoundError)):f.engine.closed()
+                    f.engine.fault=None;f.engine.close();f.engine.closed()
+                finally:f.cleanup()
+    def test_fsync_failure_after_pending_rename_blocks_and_resumes(self):
+        original=c.sync;once=[True]
+        def fail(path):
+            if Path(path)==self.f.state and (self.f.state/c.PENDING).exists() and once[0]:once[0]=False;raise OSError('injected fsync')
+            return original(path)
+        with patch.object(c,'sync',side_effect=fail):
+            with self.assertRaises(OSError):self.e.close()
+        self.assertTrue((self.f.state/c.PENDING).exists());self.assertTrue((self.f.state/'ACTIVE.json').exists());self.e.close()
+    def test_fsync_after_marker_rename_retains_unknown_and_resumes(self):
+        original=c.sync;once=[True]
+        def fail(path):
+            if (self.e.archive/'ACTIVE.json').exists() and once[0]:once[0]=False;raise OSError('injected fsync')
+            return original(path)
+        with patch.object(c,'sync',side_effect=fail):
+            with self.assertRaises(OSError):self.e.close()
+        self.assertTrue((self.f.state/c.PENDING).exists());self.e.close()
+    def test_postreceipt_large_raw_not_rehashed_per_request(self):
+        self.e.close();original=c.read;seen=[]
+        def spy(path,*args,**kwargs):seen.append(Path(path));return original(path,*args,**kwargs)
+        with patch.object(c,'read',side_effect=spy):self.e.closed()
+        self.assertFalse(any(p.is_relative_to(self.f.execution) for p in seen))
+    def test_second_marker_fsync_failure_resume_repeats_sync(self):
+        original=c.sync
+        def fail(path):
+            if (self.e.archive/'UNCERTAIN.json').exists():raise OSError('persistent injected directory fsync failure')
+            return original(path)
+        with patch.object(c,'sync',side_effect=fail):
+            with self.assertRaises(OSError):self.e.close()
+            with self.assertRaises(OSError):self.e.close()
+        self.assertTrue((self.f.state/c.PENDING).exists());self.e.close()
+    def test_receipt_fsync_failure_resume_must_sync_again(self):
+        original=c.sync
+        def fail(path):
+            if (self.e.archive/c.RECEIPT).exists():raise OSError('receipt directory fsync failure')
+            return original(path)
+        with patch.object(c,'sync',side_effect=fail):
+            with self.assertRaises(OSError):self.e.close()
+            with self.assertRaises(OSError):self.e.close()
+        self.assertTrue((self.f.state/c.PENDING).exists());self.e.close()
+
+if __name__=='__main__':unittest.main(verbosity=2)

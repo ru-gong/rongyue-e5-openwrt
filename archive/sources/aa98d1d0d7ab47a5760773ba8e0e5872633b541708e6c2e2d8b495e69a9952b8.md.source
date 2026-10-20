@@ -1,0 +1,41 @@
+# 已授权 LIVE 副本：由主任务单独操作设备
+
+**本目录 e5_install.py 已启用：LIVE_DISABLED=False。复制来的 README/module docstring/source-hashes 是原准备版的历史说明，不应据此认为本副本仍有硬禁。** 原准备目录保持 True，固件、runtime_audit 和已审功能均未修改。
+
+唯一源码差异：`LIVE_DISABLED = True` → `False`。原核心 SHA `0000000000000000000000000000000000000000000000000000000000000000`；LIVE 核心 SHA `0000000000000000000000000000000000000000000000000000000000000000`。`enable-live.diff`、`activation.json` 和 `offline-verification.json` 是补充启用证据。仅由主任务在独立审核通过后使用；此代理没有操作设备。
+
+## 当前原 Android 的只读 profile 前置检查
+
+在 LIVE 目录下，由主任务执行：
+
+```sh
+python3 -B -c 'from pathlib import Path; import e5_install as e; d=e.AdbBackend(Path("/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb"),"0000000000000000000000000000000000000000000000000000000000000000",e.load_profile()); d.preflight(require_data=False); print("READONLY_PROFILE_PREFLIGHT_PASS")'
+```
+
+此调用只检查当前串号/原构建号/A/orange/root、固定各节点/GPT与13个保护分区完整SHA，不进入 collector，也不要求 data 已去加密。不能在这一步调用默认 `preflight()`，因为当前原 Android 的加密 data 本应保留到本机原始 vendor 已采集、转换并完成最终包校验之后。该读取不证明后续写入/恢复已经验证。
+
+## 固定采集 CLI
+
+请求：`activation/collect-request.json`，SHA `0000000000000000000000000000000000000000000000000000000000000000`。ADB 使用解析后的真实普通文件路径，不能换成会被 regular() 拒绝的 `/opt/homebrew/bin/adb` 符号链接。
+
+下列 host 输出目录仅为建议，主任务可以替换 `--evidence` 为其本次运行目录；**父目录须已存在，目标目录须不存在**。
+
+```sh
+python3 -B e5_install.py live-collect \
+  --manifest activation/collect-request.json \
+  --manifest-sha256 0000000000000000000000000000000000000000000000000000000000000000 \
+  --adb /opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb \
+  --evidence /REDACTED_HOST_PATH
+```
+
+collector 先运行同一只读 profile 检查，再在设备 `/data/local/tmp/e5-collect-20261013` 新建采集临时文件和两个 tar，读出本机 `l_agdsp_a`，将原 tar 传到 host。**采集不是设备零写操作：会写临时普通文件；没有原始分区写命令，不采入 NV，不切槽，不重启。** 设备临时目录已存在时会停止，没有自动删除或重试。成功后重新核对13个保护分区，再生成真实 `collection.json`。
+
+输出原 tar：`android-subset.tar`、`firmware-raw.tar`；实际 `collection.json` 字段契约见 `collection.schema.json`。没有真实成功采集记录之前，不手工制造 collection/provenance 或填 final manifest。
+
+## runtime_audit 与启用 SHA
+
+冻结的 `runtime_audit.json` SHA `0000000000000000000000000000000000000000000000000000000000000000` 仍指向已审原核心 `0000000000000000000000000000000000000000000000000000000000000000`，该原件保持原样。LIVE 核心 SHA变化来自开关本身；需要由独立启用审核将「原核心/原运行审计 → 单行差异 → LIVE核心」串起来。
+
+核心 validate_bundle 并不会将当前 Python 文件 SHA 与 audit.installer_contract.sha256 自动比对，所以不能把这一补充审核省略，也不能悄悄改原运行审计来让数字相等。启用审核不是新固件审计；最终安装仍须使用真实本机材料生成最终 manifest 并通过完整校验，绑定相同 boot/rootfs/runtime_audit、default-Android设置与ADB哈希。
+
+`offline-verification.json` 是10项离线启用检查，所有真实子进程均被哨兵禁止；transport/collector及固定p37/p3命令只交给mock，不是一次设备采集或刷写成功记录。

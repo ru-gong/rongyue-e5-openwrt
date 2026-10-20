@@ -1,0 +1,364 @@
+#!/usr/bin/env python3
+"""Prepared cold observation plus bounded PID1 diagnostics. Default plan, I/O disabled.
+No block reads, uploads, AT, configuration writes, reboot or execution approval.
+"""
+import argparse
+import contextlib
+import fcntl
+import stat
+import datetime as dt
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import signal
+import time
+import uuid
+
+HERE = Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
+SERIAL = 'DEVICE_SERIAL_REDACTED'
+import importlib.util as _iu,sys as _sys
+_cp=Path(__file__).resolve().with_name('common.py');_key='_e5_sim_common'
+if _key not in _sys.modules:
+ _sp=_iu.spec_from_file_location(_key,_cp);_cm=_iu.module_from_spec(_sp);_sys.modules[_key]=_cm;_sp.loader.exec_module(_cm)
+c=_sys.modules[_key]
+if Path(c.__file__).resolve()!=_cp:raise RuntimeError('common module source conflict')
+OLD_BOOT = None
+DEVICE_IO_ENABLED = True
+OUT_PARENT = ROOT / 'evidence/next-recovery-observations-20261015'
+SHARED_STATE = ROOT / 'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED'
+HOST_LOCK = ROOT / 'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock'
+PINS = {
+ 'evidence/clean-reinstall-check-20261014/session-01/collect_light_v2.py':'0000000000000000000000000000000000000000000000000000000000000000',
+ 'tools/e5_android_triage_prepare_20261013/triage.py':'0000000000000000000000000000000000000000000000000000000000000000',
+ 'tools/e5_readonly_capture_v2_20261014/capture.py':'0000000000000000000000000000000000000000000000000000000000000000'}
+CAPTURE_SOURCE = list(PINS)[2]
+TRIAGE_SOURCE = list(PINS)[1]
+LISTEN_SECONDS = 1200
+SAMPLES = 21
+INTERVAL = 30.1
+
+class Stop(RuntimeError): pass
+def require(ok, why):
+ if not ok: raise Stop(why)
+def now(): return dt.datetime.now(dt.timezone.utc).isoformat()
+def sha(raw): return hashlib.sha256(raw).hexdigest()
+def canonical(obj): return json.dumps(obj,sort_keys=True,separators=(',',':')).encode()
+def sync(path):
+ fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+ try: os.fsync(fd)
+ finally: os.close(fd)
+def save(path,raw):
+ fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+ with os.fdopen(fd,'wb') as f: f.write(raw);f.flush();os.fsync(f.fileno())
+ sync(path.parent)
+def save_json(path,obj): save(path,canonical(obj)+b'\n')
+def load_sources():
+ modules={}
+ for rel,pin in PINS.items():
+  p=ROOT/rel;require(p.is_file() and not p.is_symlink() and all(not x.is_symlink() for x in p.parents),'unsafe source')
+  require(sha(p.read_bytes())==pin,'source hash changed: '+rel)
+  if rel in (CAPTURE_SOURCE,TRIAGE_SOURCE):
+   spec=importlib.util.spec_from_file_location('_observe_'+p.stem,p)
+   module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);modules[rel]=module
+ return modules[CAPTURE_SOURCE],modules[TRIAGE_SOURCE]
+def parse_devices(raw):
+ lines=raw.decode('ascii').splitlines();require(lines and lines[0]=='List of devices attached','unexpected adb devices header')
+ found=[]
+ for line in lines[1:]:
+  if not line: continue
+  parts=line.split();require(len(parts)>=2,'malformed device row')
+  if parts[0]==SERIAL: found.append(parts[1])
+ require(len(found)<=1,'duplicate target serial')
+ if not found:return 'absent'
+ require(found[0] in ('device','offline','unauthorized'),'unexpected target state')
+ return found[0]
+def parse_nonroot(raw):
+ pairs={}
+ for line in raw.decode('ascii').splitlines():
+  k,sep,v=line.partition('\t');require(sep and k not in pairs,'malformed nonroot probe');pairs[k]=v
+ require(set(pairs)=={'boot_id','uptime','boot_complete','serial','slot','boot_id_end'},'nonroot fields')
+ boot=pairs['boot_id'];require(re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',boot) is not None and pairs['boot_id_end']==boot,'nonroot boot changed')
+ require(pairs['serial']==SERIAL,'wrong serial')
+ up=pairs['uptime'].split();require(len(up)==2 and re.fullmatch(r'[0-9]+(?:\.[0-9]+)?',up[0]),'uptime malformed')
+ require(pairs['boot_complete'] in ('','0','1'),'boot completion value')
+ return {**pairs,'uptime_seconds':float(up[0])}
+def nonroot_script():
+ return '''set -eu
+emit() { /system/bin/printf '%s\\t%s\\n' "$1" "$2"; }
+emit boot_id "$(/system/bin/cat /proc/sys/kernel/random/boot_id)"
+emit uptime "$(/system/bin/cat /proc/uptime)"
+emit boot_complete "$(/system/bin/getprop sys.boot_completed)"
+emit serial "$(/system/bin/getprop ro.serialno)"
+emit slot "$(/system/bin/getprop ro.boot.slot_suffix)"
+emit boot_id_end "$(/system/bin/cat /proc/sys/kernel/random/boot_id)"
+'''
+def parse_health(raw,triage,boot,purpose="directory"):
+ extras={};normal=[]
+ for line in raw.decode('ascii').splitlines():
+  k,sep,v=line.partition('\t')
+  if k in ('data_device_resolved','data_rdev','data_sysdev'):
+   require(k not in extras,'duplicate data stat');extras[k]=v
+  else:normal.append(line)
+ require(extras=={'data_device_resolved':'/dev/block/mmcblk0p70','data_rdev':'103:3f','data_sysdev':'259:63'},'userdata alias/rdev changed')
+ normalized=[];mount=None
+ for line in normal:
+  if line.startswith('data_mount\t'):
+   _,value=line.split('\t',1);parts=value.split('|');require(len(parts)==3 and parts[0] in ('/dev/block/by-name/userdata','/dev/block/mmcblk0p70'),'data source')
+   require('ro' not in parts[2].split(','),'readonly data mount');mount=value
+   line='data_mount\t/dev/block/mmcblk0p70|'+parts[1]+'|'+parts[2]
+  normalized.append(line)
+ parsed=triage.parse_health('\n'.join(normalized)+'\n');f=parsed['raw_fields']
+ require(parsed['boot_id']==boot and boot!=OLD_BOOT,'root boot mismatch or old boot')
+ require({k:f[k] for k in ('serial','model','platform','build','verifiedbootstate','flash_locked')}==
+  {'serial':SERIAL,'model':'E5','platform':'ums9621','build':'TS305_V03_20241128_2301','verifiedbootstate':'orange','flash_locked':'0'},'root device/profile/noSIM changed')
+ require(not re.search(r'panic|watchdog|hung|hardlockup',f['ro_boot_reason']+' '+f['sys_boot_reason'],re.I),'abnormal current boot reason requires review')
+ require(sim_ready(f['sim_states']) if purpose=='rearm-with-sim' else f['sim_states']=='ABSENT,ABSENT','root SIM profile changed')
+ parsed['data_alias_evidence']={**extras,'raw_mount':mount};return parsed
+
+def eligible_new_boot(probe,excluded):
+ return probe['boot_id'] not in excluded and probe['boot_complete']=='1'
+
+def sim_ready(value):
+ return isinstance(value,str) and len(value.split(','))==2 and all(x in ('READY','LOADED') for x in value.split(','))
+def sim_guard():
+ return 'case "$(getprop gsm.sim.state)" in READY,READY|READY,LOADED|LOADED,READY|LOADED,LOADED) ;; *) exit 83;; esac\n'
+
+def sim_state(purpose):
+ require(purpose in ('directory','recovery','rearm-with-sim'),'unknown cold purpose')
+ return 'READY,READY' if purpose=='rearm-with-sim' else 'ABSENT,ABSENT'
+def validate_policy(r):
+ sim_state(r['purpose'])
+ if r['purpose']=='rearm-with-sim':
+  confirmation=c.obj(r['sim_confirmation'])
+  require(confirmation=={'schema':'e5-sim-placement-confirmation-v2','serial':SERIAL,'slot1':'China Mobile','slot2':'China Unicom','user_confirmed':True},'exact user SIM placement confirmation required')
+ else:require(r['sim_confirmation'] is None,'SIM confirmation not valid for no-card purpose')
+def root_guard(capture,boot,purpose):
+ value=capture.guard().replace(capture.BOOT_ID,boot)
+ require(value.count('= ABSENT,ABSENT')==1,'fixed noSIM guard changed')
+ return value.replace('test "$(getprop gsm.sim.state)" = ABSENT,ABSENT\n',sim_guard()) if purpose=='rearm-with-sim' else value
+
+def validate_request(b,check_state=True):
+ r=c.obj(b)
+ require(set(r)=={'schema','serial','previous_boot_id','previous_observation','state_snapshot','purpose','sim_confirmation'} and r['schema']=='e5-next-cold-request-v2' and r['serial']==SERIAL,'cold request fields')
+ validate_policy(r);c.validboot(r['previous_boot_id']);snapshot=c.obj(r['state_snapshot'])
+ if check_state:c.assert_state(snapshot)
+ c.excluded_boots(r,snapshot)  # observed history and unresolved state are independent
+ return r,snapshot
+
+def validate_refresh_request(binding,check_state=True):
+ r=c.obj(binding)
+ require(set(r)=={'schema','serial','boot_id','state_snapshot','prior_envelope','purpose','sim_confirmation'} and r['schema']=='e5-next-refresh-request-v1' and r['serial']==SERIAL,'refresh request fields')
+ validate_policy(r);c.validboot(r['boot_id']);snapshot=c.obj(r['state_snapshot']);c.normal_state(snapshot)
+ if check_state:c.assert_state(snapshot)
+ prior=c.obj(r['prior_envelope']);require(prior.get('cold_refresh') is None,'refresh must refer to original cold, not recursive renewal')
+ hist=c.sibling('evidence_contract').historical_cold(prior,c.now())
+ require(hist['boot_id']==r['boot_id'] and hist['purpose']==r['purpose'],'refresh original cold boot/purpose differs')
+ require(c.obj(prior['cold_request'])['sim_confirmation']==r['sim_confirmation'],'SIM placement binding changed')
+ return {**r,'previous_boot_id':r['boot_id']},snapshot
+
+@contextlib.contextmanager
+def host_lock():
+ require(not HOST_LOCK.is_symlink() and all(not p.is_symlink() for p in HOST_LOCK.parents),'unsafe host lock')
+ fd=os.open(HOST_LOCK,os.O_RDONLY|os.O_NOFOLLOW)
+ try:
+  st=os.fstat(fd);require(stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_uid==os.getuid(),'host lock identity')
+  fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  yield
+ finally:os.close(fd)
+
+def unsigned(value):
+ require(isinstance(value,str) and re.fullmatch('[0-9]{1,20}',value) is not None,'invalid unsigned field')
+ number=int(value);require(number<1<<64,'unsigned overflow');return number
+
+def parse_pid1_stat(raw):
+ require(0<len(raw)<=8192 and b'\x00' not in raw,'stat truncated/empty/NUL')
+ value=raw.decode('ascii');end=value.rfind(')')
+ require(value.startswith('1 (') and end>=3 and value[end:end+2]==') ','PID1 stat framing')
+ fields=value[end+2:].split();require(len(fields)>=20,'stat field22 missing')
+ state=fields[0];require(len(state)==1 and state in 'RSDTtXxZKWPI','invalid state')
+ require(state not in 'ZXx','PID1 dead or zombie')
+ flags=unsigned(fields[6]);start=unsigned(fields[19])
+ return {'pid':1,'comm':value[3:end],'state':state,'flags':flags,'starttime':start,'valid_zero':start==0,'synthetic':False}
+
+def parse_namespace(raw):
+ require(len(raw)<=80 and re.fullmatch(rb'mnt:\[[0-9]+\]\n',raw) is not None,'namespace framing')
+ unsigned(raw[5:-2].decode('ascii'));return raw[:-1].decode('ascii')
+
+def parse_mountinfo(raw):
+ require(0<len(raw)<=1048576 and raw.endswith(b'\n') and b'\x00' not in raw,'mountinfo truncated/empty')
+ lines=raw.decode('ascii').splitlines();require(len(lines)<=16384,'mountinfo count')
+ for line in lines:
+  fields=line.split(' ');require(len(fields)>=10 and '-' in fields[6:],'mountinfo structure')
+  sep=fields.index('-',6);require(sep>=6 and len(fields)-sep==4,'mountinfo separator/tail')
+  for i in (0,1):unsigned(fields[i])
+  require(re.fullmatch('[0-9]+:[0-9]+',fields[2]) is not None,'mountinfo device')
+  for field in (fields[3],fields[4]):
+   require(field.startswith('/') and re.search(r'\\(?!040|011|012|134)',field) is None,'mountinfo path/escape')
+ return {'lines':len(lines),'sha256':sha(raw),'full_occupancy_checked':False}
+
+class Observer:
+ def __init__(self,capture,triage,request_binding,refresh=False):
+  require(DEVICE_IO_ENABLED,"DEVICE_IO_DISABLED: no observer construction")
+  self.c,self.t=capture,triage;self.index=0;self.progress_index=0;self.boot=None
+  require(capture.SERIAL==SERIAL and capture.BOOT_ID=='00000000-0000-4000-8000-000000000001' and capture.DEADLINE==8.0,'capture contract changed')
+  require(capture.ADB.is_file() and not capture.ADB.is_symlink() and capture.hash_file(capture.ADB)==capture.ADB_SHA,'ADB hash changed')
+  self.request_binding=request_binding;self.request,self.state=(validate_refresh_request(request_binding) if refresh else validate_request(request_binding))
+  require(self.request['purpose']=='rearm-with-sim','this device observer is SIM rearm only')
+  self.refresh=refresh
+  self.excluded_boot_ids=set() if refresh else c.excluded_boots(self.request,self.state)
+  if refresh:self.boot=self.request['boot_id']
+  require(not OUT_PARENT.is_symlink() and all(not p.is_symlink() for p in OUT_PARENT.parents),'unsafe output parent')
+  OUT_PARENT.mkdir(mode=0o700,exist_ok=True)
+  self.out=OUT_PARENT/('cold-diagnostic-'+dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')+'-'+uuid.uuid4().hex[:8])
+  self.out.mkdir(mode=0o700);sync(OUT_PARENT);self.until=time.monotonic()+LISTEN_SECONDS
+  save_json(self.out/'SOURCE_BINDING.json',{'script_sha256':sha(Path(__file__).read_bytes()),'source_pins':PINS,'adb_sha256':capture.ADB_SHA,'serial':SERIAL,'old_boot_id':self.request['previous_boot_id'],'no_device_writes':True,'purpose':self.request['purpose'],'state_snapshot':self.request['state_snapshot'],'request':request_binding,'diagnostic_only':True})
+ def check(self):
+  c.assert_state(self.state)
+  require(not (OUT_PARENT/'STOP').exists() and not (self.out/'STOP').exists(),'operator STOP marker')
+  require(time.monotonic()<self.until,'20-minute listening/observation deadline')
+ def progress(self,state,**fields):
+  self.progress_index+=1;value={'at':now(),'state':state,'evidence_directory':str(self.out),'read_only':True,'device_writes':False,'approved_to_flash':False,**fields}
+  save_json(self.out/f'progress-{self.progress_index:04d}.json',value);print(json.dumps(value,ensure_ascii=False),flush=True)
+ def wait_until(self,target):
+  while time.monotonic()<target:self.check();time.sleep(min(.2,max(0,target-time.monotonic())))
+ def query(self,label,argv,limit,script=None,expected=0,allow_disconnect=False):
+  self.check();require(self.until-time.monotonic()>8,'insufficient observation deadline for new request')
+  self.index+=1;prefix=f'{self.index:05d}-{label}';began=now()
+  save_json(self.out/(prefix+'.request.json'),{'argv':argv,'started_at':began,'output_limit':limit,'host_deadline_seconds':8,'expected_returncode':expected,'script_sha256':sha(script.encode()) if script else None})
+  if script is not None:save(self.out/(prefix+'.sh.txt'),script.encode())
+  result=self.c.collect_process(argv,limit)
+  for stream in ('stdout','stderr'):save(self.out/(prefix+'.'+stream),result[stream])
+  meta={k:v for k,v in result.items() if k not in ('stdout','stderr')}
+  meta.update(started_at=began,finished_at=now(),stdout_bytes=len(result['stdout']),stderr_bytes=len(result['stderr']),stdout_sha256=sha(result['stdout']),stderr_sha256=sha(result['stderr']))
+  save_json(self.out/(prefix+'.result.json'),meta)
+  require(result['failure'] is None and result['elapsed_seconds']<=8.0,'transport failed/timeout; remote task outcome unknown; no retry')
+  disconnected=(result['returncode']==1 and result['stdout']==b'' and result['stderr'].strip() in
+   (f"error: device '{SERIAL}' not found".encode(),b'error: device offline',b'error: no devices/emulators found'))
+  if allow_disconnect and disconnected:return None,meta
+  require(result['returncode']==expected,'unexpected command exit; no retry')
+  if expected!=37:require(result['stderr']==b'','unexpected stderr; no retry')
+  return result['stdout'],meta
+ def shell(self,label,script,limit,*,root=False,expected=0,allow_disconnect=False):
+  if root:
+   script=root_guard(self.c,self.boot,self.request['purpose'])+script
+   wrapped=self.c.BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(script)
+   command=self.c.SU+' -c '+shlex.quote(wrapped)
+  else:command='/system/bin/toybox timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(script)
+  return self.query(label,[str(self.c.ADB),'-s',SERIAL,'shell','-T',command],limit,script,expected,allow_disconnect)
+ def crash_set(self,phase):
+  for name,path,cap in [('pstore-console','/sys/fs/pstore/console-ramoops-0',262144),('pstore-dmesg','/sys/fs/pstore/dmesg-ramoops-0',1048576)]:
+   script=f'''if test -e {path}; then
+ test -r {path}
+ printf 'PRESENT\\n'
+ {self.c.BB} head -c {cap+1} {path}
+else
+ test ! -L {path}
+ printf 'MISSING\\n'
+fi
+'''
+   raw,meta=self.shell(phase+'-'+name,script,cap+1024,root=True)
+   require(raw==b'MISSING\n' or (raw.startswith(b'PRESENT\n') and len(raw)-8<=cap),'pstore truncated or bad presence framing')
+   save_json(self.out/(phase+'-'+name+'.presence.json'),{'path':path,'present':raw.startswith(b'PRESENT\n'),'contents_bytes':max(0,len(raw)-8),'not_automatically_classified_as_new_panic':True})
+  self.shell(phase+'-crash',self.t.FIXED_REQUESTS[3]['script'],262144,root=True)
+ def pid1_diagnostics(self,phase):
+  values={};parsed={}
+  jobs=[('stat-before','/proc/1/stat',8192,parse_pid1_stat),
+        ('namespace-before','/proc/1/ns/mnt',80,parse_namespace),
+        ('mountinfo','/proc/1/mountinfo',1048576,parse_mountinfo),
+        ('namespace-after','/proc/1/ns/mnt',80,parse_namespace),
+        ('stat-after','/proc/1/stat',8192,parse_pid1_stat)]
+  for label,path,cap,parser in jobs:
+   body=(f'readlink {path}\n' if '/ns/' in path else f'{self.c.BB} head -c {cap+1} {path}\n')
+   body+=f'test "$(cat /proc/sys/kernel/random/boot_id)" = {self.boot}\n'
+   raw,meta=self.shell(phase+'-pid1-'+label,body,cap+1024,root=True)
+   require(len(raw)<=cap,'diagnostic cap exceeded')
+   values[label]={'sha256':sha(raw),'bytes':len(raw),'started_at':meta['started_at']}
+   try:parsed[label]=parser(raw)
+   except (Stop,ValueError,UnicodeError) as exc:
+    save_json(self.out/(phase+'-pid1-PARSE_FAILURE.json'),{'label':label,'reason':str(exc),'raw':values[label],'not_prior_failure_proof':True});raise
+  before,after=parsed['stat-before'],parsed['stat-after']
+  require((before['pid'],before['starttime'],before['flags'] & 0x00200000)==(after['pid'],after['starttime'],after['flags'] & 0x00200000),'PID1 identity changed during diagnostics')
+  require(parsed['namespace-before']==parsed['namespace-after'],'PID1 namespace changed')
+  save_json(self.out/(phase+'-pid1-diagnostic.json'),{'schema':'e5-pid1-diagnostic-v1','boot_id':self.boot,'raw':values,'parsed':parsed,'current_boot_zero_starttime_observed':before['starttime']==0,'proves_exact_prior_failure_cause':False,'full_occupancy_checked':False,'device_writes':False})
+ def run(self):
+  self.progress('WAIT_NEW_COMPLETE_BOOT')
+  while True:
+   due=time.monotonic()+2
+   raw,_=self.query('devices',[str(self.c.ADB),'devices'],16384)
+   state=parse_devices(raw)
+   if state=='device':
+    raw,_=self.shell('nonroot-startup',nonroot_script(),4096,allow_disconnect=True)
+    if raw is not None:
+     probe=parse_nonroot(raw)
+     if eligible_new_boot(probe,self.excluded_boot_ids):
+      require(probe['slot']=='_a','new completed boot is not Android A')
+      require(probe['uptime_seconds']<=120,'new boot first observation already exceeds120s')
+      self.boot=probe['boot_id'];save_json(self.out/'NEW_BOOT.json',probe);break
+   self.progress('WAIT_DEVICE_NOT_READY',adb_state=state)
+   self.wait_until(due)
+  raw,_=self.shell('root-exit-calibration',"printf 'E5_STDOUT_PROBE\\n'\nprintf 'E5_STDERR_PROBE\\n' >&2\nexit 37\n",128,root=True,expected=37)
+  # Both channels and exact exit code are checked from the retained raw evidence.
+  prefix=f'{self.index:05d}-root-exit-calibration'
+  require(raw==b'E5_STDOUT_PROBE\n' and (self.out/(prefix+'.stderr')).read_bytes()==b'E5_STDERR_PROBE\n','root exit/two-stream calibration differs')
+  script=self.t.HEALTH_SCRIPT.replace('emit boot_id_end',
+   'emit data_device_resolved "$(/system/bin/readlink -f /dev/block/by-name/userdata)"\n'
+   'emit data_rdev "$(/system/bin/stat -c %t:%T /dev/block/mmcblk0p70)"\n'
+   'emit data_sysdev "$(/system/bin/cat /sys/class/block/mmcblk0p70/dev)"\n'
+   'emit boot_id_end')
+  first=time.monotonic();rows=[]
+  for i in range(SAMPLES):
+   self.wait_until(first+i*INTERVAL)
+   raw,meta=self.shell(f'health-{i:02d}',script,16384,root=True);parsed=parse_health(raw,self.t,self.boot,self.request['purpose'])
+   if i==0:require(parsed['uptime_seconds']<=120,'first root health exceeds120s')
+   if rows:require(parsed['uptime_seconds']>rows[-1]['snapshot']['uptime_seconds'],'uptime did not advance')
+   row={'captured_at':meta['started_at'],'snapshot':parsed};rows.append(row);save_json(self.out/f'health-{i:02d}.parsed.json',row)
+   self.progress('OBSERVING_ANDROID_A',sample=i+1,total=SAMPLES,boot_id=self.boot,uptime_seconds=parsed['uptime_seconds'],monitor=parsed['monitor'])
+   if i==0:
+    self.crash_set('initial');self.pid1_diagnostics('initial')
+  self.crash_set('final');self.pid1_diagnostics('final')
+  c.assert_state(self.state)
+  span=(dt.datetime.fromisoformat(rows[-1]['captured_at'])-dt.datetime.fromisoformat(rows[0]['captured_at'])).total_seconds()
+  require(span>=600,'health observation span insufficient')
+  complete={'schema':'e5-next-cold-observation-v1','serial':SERIAL,'old_boot_id':self.request['previous_boot_id'],'boot_id':self.boot,'samples':SAMPLES,'span_seconds':span,'health_window_completed':True,'pstore_crash_require_independent_review':True,'physical_cold_power_removal_not_proven_by_boot_id':True,'ui_health_requires_user_confirmation':True,'block_reads':False,'device_writes':False,'approved_to_flash':False,'device_execution_authorized_by_result':False,'diagnostics_completed':True,'purpose':self.request['purpose'],'state_snapshot':self.request['state_snapshot'],'request':self.request_binding,'uncertainty_cleared':False,'full_occupancy_checked':False}
+  save_json(self.out/'COMPLETE.json',complete);self.progress('COMPLETE_REVIEW_REQUIRED',**complete)
+
+ def run_refresh(self):
+  self.progress('SAME_BOOT_REFRESH_NOT_NEW_COLD',boot_id=self.boot)
+  raw,_=self.shell('root-exit-calibration',"printf 'E5_STDOUT_PROBE\\n'\nprintf 'E5_STDERR_PROBE\\n' >&2\nexit 37\n",128,root=True,expected=37)
+  require(raw==b'E5_STDOUT_PROBE\n' and (self.out/f'{self.index:05d}-root-exit-calibration.stderr').read_bytes()==b'E5_STDERR_PROBE\n','refresh transport calibration')
+  script=self.t.HEALTH_SCRIPT.replace('emit boot_id_end','emit data_device_resolved "$(/system/bin/readlink -f /dev/block/by-name/userdata)"\nemit data_rdev "$(/system/bin/stat -c %t:%T /dev/block/mmcblk0p70)"\nemit data_sysdev "$(/system/bin/cat /sys/class/block/mmcblk0p70/dev)"\nemit boot_id_end')
+  rows=[];first=time.monotonic()
+  for i in range(2):
+   self.wait_until(first+i*2.1);raw,meta=self.shell(f'health-{i:02d}',script,16384,root=True);parsed=parse_health(raw,self.t,self.boot,self.request['purpose'])
+   if rows:require(parsed['uptime_seconds']>rows[-1]['snapshot']['uptime_seconds'],'refresh uptime did not advance')
+   row={'captured_at':meta['started_at'],'snapshot':parsed};rows.append(row);save_json(self.out/f'health-{i:02d}.parsed.json',row);phase='initial' if i==0 else 'final';self.crash_set(phase);self.pid1_diagnostics(phase)
+  self.check();span=(dt.datetime.fromisoformat(rows[-1]['captured_at'])-dt.datetime.fromisoformat(rows[0]['captured_at'])).total_seconds();require(span>=2,'refresh interval')
+  complete={'schema':'e5-next-sameboot-refresh-v1','serial':SERIAL,'old_boot_id':self.boot,'boot_id':self.boot,'samples':2,'span_seconds':span,'health_window_completed':True,'diagnostics_completed':True,'state_snapshot':self.request['state_snapshot'],'request':self.request_binding,'purpose':self.request['purpose'],'block_reads':False,'device_writes':False,'uncertainty_cleared':False,'approved_to_flash':False,'new_cold_observation':False,'historical_cold_envelope':self.request['prior_envelope']}
+  save_json(self.out/'COMPLETE.json',complete);self.progress('REFRESH_REQUIRES_INDEPENDENT_REVIEW',**complete)
+
+def main(argv=None):
+ parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('mode',choices=('plan','observe','refresh'),nargs='?',default='plan');parser.add_argument('--request');parser.add_argument('--sha256');parser.add_argument('--tool-manifest-sha');args=parser.parse_args(argv)
+ if args.mode=='plan':
+  print(json.dumps({'schema':'e5-next-cold-plan-v1','io_disabled':not DEVICE_IO_ENABLED,'samples':21,'minimum_span_seconds':600,'max_seconds':1200,'scope':'readonly health/PID1/logs; no blocks/helper execution; no approval'}));return 0
+ if not DEVICE_IO_ENABLED:raise Stop('DEVICE_IO_DISABLED: observation preparation only')
+ c.verify_manifest(args.tool_manifest_sha);c.dependencies()
+ obs=None;old={}
+ def interrupted(signum,frame):raise Stop('operator signal '+str(signum))
+ try:
+  with host_lock():
+   request={'path':args.request,'sha256':args.sha256};(validate_refresh_request(request) if args.mode=='refresh' else validate_request(request));capture,triage=load_sources()
+   for sig in (signal.SIGINT,signal.SIGTERM):old[sig]=signal.getsignal(sig);signal.signal(sig,interrupted)
+   obs=Observer(capture,triage,request,refresh=args.mode=='refresh');(obs.run_refresh() if args.mode=='refresh' else obs.run());return 0
+ except BaseException as exc:
+  if obs is not None:
+   try:save_json(obs.out/'STOP.json',{'reason':type(exc).__name__+': '+str(exc),'boot_id':obs.boot,'no_retry':True,'no_automatic_writes':True,'remote_exit_not_proven_after_timeout':True})
+   except BaseException:pass
+  raise
+ finally:
+  for sig,handler in old.items():signal.signal(sig,handler)
+if __name__=='__main__':main()

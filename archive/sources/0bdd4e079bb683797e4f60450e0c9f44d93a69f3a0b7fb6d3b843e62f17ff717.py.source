@@ -1,0 +1,111 @@
+"""Pure framing/scope regressions; no device call or native execution."""
+import copy,hashlib,importlib.util,json,sys,types,unittest
+from pathlib import Path
+from unittest.mock import patch
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.fork'):raise AssertionError(event)
+sys.addaudithook(audit)
+import combined as c
+sys.path.insert(0,str(c.CORE))
+s=importlib.util.spec_from_file_location('_combined_read_parser',c.CORE/'android_directory_adapter.py');api=importlib.util.module_from_spec(s);sys.modules[s.name]=api;s.loader.exec_module(api)
+OP='a'*32;TX='314ff262fa18c842';BOOT='00000000-0000-4000-8000-000000000001';DEV=66367
+def statline(size,inode=101,mode='700',uid=0):
+ bits=format(0o100000|int(mode,8),'x')
+ return f'{bits}|{DEV}|{inode}|{size}|{mode}|{uid}|0|1|1000|1000|2026-01-01 00:00:00.000000000 +0800|2026-01-01 00:00:00.000000000 +0800|0|0'.encode()
+def make():
+ w=c.CombinedAppend.__new__(c.CombinedAppend);w.identity=(DEV,19785);w.api=api
+ w.a=types.SimpleNamespace(boot_id=BOOT,txid=TX,remote_scanner='/data/local/tmp/e5-clean-scanner.'+TX,
+    remote_io='/data/local/tmp/e5-clean-io.'+TX,scanner=types.SimpleNamespace(size=3,sha256=c.sha(b'ELF')),
+    io_helper=types.SimpleNamespace(size=4,sha256=c.sha(b'TEST')))
+ w.a._native_records=lambda raw,op,deadline,schema=None:api.AndroidDirectoryAdapter._native_records(w.a,raw,op,deadline,schema)
+ return w
+def guard(w,**changes):
+ raw=b''
+ for key,path,item,payload in [('scanner',w.a.remote_scanner,w.a.scanner,b'ELF'),('io',w.a.remote_io,w.a.io_helper,b'TEST')]:
+  meta=statline(item.size)
+  raw+=f'CPROG\t{OP}\t{key}\t{item.size}\t'.encode()+meta+b'\n'+payload+b'\n'
+  raw+=f'CSHA\t{OP}\t{key}\t{item.sha256}  {path}\nCMETA\t{OP}\t{key}\t'.encode()+meta+b'\n'
+ common={'schema':'e5-native-occupancy-v1','opid':OP,'boot_id':BOOT,'txid':TX,'deadline_ms':6000}
+ result={**common,'event':'RESULT','complete':True,'unknown':[],
+         'processes':2,'fds':4,'namespaces':1,'loops':0,'tree_entries':9,'read_bytes':100}
+ result.update(changes)
+ return raw+f'CDEADLINE\t{OP}\t6000\n'.encode()+json.dumps(dict(common,event='BEGIN')).encode()+b'\n'+json.dumps(result).encode()+b'\n'+f'CNOW\t{OP}\t2.00\nCEND\t{OP}\t{BOOT}\n'.encode()
+def readback(data=b'12345678',inode=500,mode='600'):
+ meta=statline(len(data),inode,mode)
+ return f'CDATA\t{OP}\t'.encode()+meta+b'\n'+data+f'\nCMID\t{OP}\t'.encode()+meta+b'\n'+f'CDIGEST\t{OP}\t{c.sha(data)}  -\nCVERIFY\t{OP}\t{BOOT}\t'.encode()+meta+b'\n'
+
+class Tests(unittest.TestCase):
+ def test_default_gate_disabled(self):self.assertFalse(c.DEVICE_APPEND_ENABLED)
+ def test_exact_full_guard_accepted(self):self.assertEqual(make().parse_preflight(guard(make()),OP)['deadline_ms'],7000)
+ def test_binary_stream_hash_tamper(self):
+  w=make()
+  with self.assertRaises(RuntimeError):w.parse_preflight(guard(w).replace(b'ELF',b'ELX'),OP)
+ def test_independent_program_hash_tamper(self):
+  w=make()
+  with self.assertRaises(RuntimeError):w.parse_preflight(guard(w).replace(w.a.scanner.sha256.encode(),b'0'*64,1),OP)
+ def test_program_post_metadata_drift(self):
+  w=make();raw=guard(w);part=f'CMETA\t{OP}\tscanner\t'.encode();pos=raw.index(part)+len(part)
+  raw=raw[:pos]+raw[pos:].replace(b'|101|',b'|102|',1)
+  with self.assertRaises(RuntimeError):w.parse_preflight(raw,OP)
+ def test_incomplete_scan_unknown_and_coverage_rejected(self):
+  for change in ({'complete':False},{'unknown':['new-fd']},{'processes':0},{'namespaces':0},{'fds':-1}):
+   with self.subTest(change=change),self.assertRaises(RuntimeError):make().parse_preflight(guard(make(),**change),OP)
+ def test_scanner_nonce_and_boot_rejected(self):
+  for change in ({'opid':'b'*32},{'boot_id':'0'*36},{'txid':'0'*16}):
+   with self.subTest(change=change),self.assertRaises(RuntimeError):make().parse_preflight(guard(make(),**change),OP)
+ def test_final_boot_and_trailing_data_rejected(self):
+  w=make()
+  for raw in (guard(w)+b'extra',guard(w).replace(f'CEND\t{OP}\t{BOOT}'.encode(),f'CEND\t{OP}\twrong'.encode())):
+   with self.assertRaises(RuntimeError):w.parse_preflight(raw,OP)
+ def test_stale_remote_clock_rejected(self):
+  w=make()
+  with self.assertRaises(RuntimeError):w.parse_preflight(guard(w).replace(b'\t2.00\n',b'\t20.00\n'),OP)
+ def test_byte_and_second_read_sha_accepted(self):
+  w=make();ack={'inode':500,'size':8};self.assertEqual(w.parse_readback(readback(),OP,b'12345678',ack),ack)
+ def test_readback_bytes_tampered_rejected(self):
+  with self.assertRaises(RuntimeError):make().parse_readback(readback().replace(b'12345678',b'12345679'),OP,b'12345678',{'inode':500,'size':8})
+ def test_second_read_digest_tampered_rejected(self):
+  raw=readback().replace(c.sha(b'12345678').encode(),b'0'*64)
+  with self.assertRaises(RuntimeError):make().parse_readback(raw,OP,b'12345678',{'inode':500,'size':8})
+ def test_readback_inode_length_permissions_rejected(self):
+  for raw,ack in ((readback(inode=501),{'inode':500,'size':8}),(readback(),{'inode':500,'size':9}),(readback(mode='644'),{'inode':500,'size':8})):
+   with self.assertRaises(RuntimeError):make().parse_readback(raw,OP,b'12345678',ack)
+ def test_readback_middle_metadata_change_rejected(self):
+  raw=readback();part=f'CMID\t{OP}\t'.encode();pos=raw.index(part)+len(part);raw=raw[:pos]+raw[pos:].replace(b'|500|',b'|501|',1)
+  with self.assertRaises(RuntimeError):make().parse_readback(raw,OP,b'12345678',{'inode':500,'size':8})
+ def test_four_mib_bound_and_file_allowlist(self):
+  w=make()
+  with patch.object(c,'DEVICE_APPEND_ENABLED',True):
+   for name,offset,payload,inode in [('boot_a',0,b'a',0),('openwrt.ext4',1,b'a',0),('openwrt.ext4',0,b'a'*(c.CHUNK+1),0),('openwrt.ext4',c.CHUNK,b'a',0)]:
+    with self.subTest(name=name,offset=offset),self.assertRaises(RuntimeError):w.write(name,types.SimpleNamespace(size=2<<30),offset,payload,inode)
+ def test_mutation_body_keeps_original_native_writer(self):
+  # Read the source as a contract: no block-write entry, grouping or helper upload.
+  source=Path(c.__file__).read_text();self.assertNotIn('write-block',source);self.assertNotIn('chmod',source)
+  self.assertIn('write-file {self.a.txid}',source);self.assertIn('mutating=True,followup=follow',source)
+ def test_actual_append_orchestration_requires_fsync_and_complete_double_read(self):
+  for fsynced in (True,False):
+   with self.subTest(fsynced=fsynced):
+    w=make();payload=b'\0'*c.CHUNK;calls=[]
+    w.preflight=lambda:{'deadline_ms':7000}
+    w.a._locked=lambda:'LOCK_GUARD\n';w.a.path=lambda role:'/data/e5linux.stage.'+TX;w.a._check_path=lambda path:'f'
+    def request(label,script,**kw):
+     calls.append((label,kw));op=kw['op_id']
+     if kw.get('mutating'):
+      self.assertEqual(script,'LOCK_GUARD\n'+f'{w.a.remote_io} write-file {TX} {BOOT} {op} 7000 {DEV} 19785 0 0 {c.CHUNK} {2<<30} openwrt.ext4\n')
+      common={'op_id':op,'boot_id':BOOT,'txid':TX,'deadline_ms':7000,'action':'write-file'}
+      ack={**common,'event':'DONE','ok':True,'offset':0,'bytes':c.CHUNK,'total':2<<30,
+           'size':c.CHUNK,'dev':DEV,'inode':500,'fsync_completed':fsynced}
+      raw=json.dumps(dict(common,event='START')).encode()+b'\n'+json.dumps(ack).encode()+b'\n'
+      return kw['followup'](kw['validator'](raw))
+     self.assertEqual(label,'stage-combined-double-readback')
+     return kw['validator'](readback(payload).replace(OP.encode(),op.encode()))
+    w.a._request=request
+    with patch.object(c,'DEVICE_APPEND_ENABLED',True):
+     if fsynced:
+      result=w.write('openwrt.ext4',types.SimpleNamespace(size=2<<30),0,payload,0)
+      self.assertEqual(result['size'],c.CHUNK);self.assertEqual(len(calls),2)
+     else:
+      with self.assertRaises(RuntimeError):w.write('openwrt.ext4',types.SimpleNamespace(size=2<<30),0,payload,0)
+      self.assertEqual(len(calls),1)
+
+if __name__=='__main__':unittest.main(verbosity=2)

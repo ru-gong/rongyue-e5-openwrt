@@ -1,0 +1,48 @@
+# FD 对象观察候选：设计评审稿
+
+状态：只有本地主机设计、官方源码存证和纯算法模型；没有新的原生 scanner、生产 ELF、启用入口或设备操作。旧 scanner、停止记录和 marker 均保持。
+
+## 本次确定事实
+
+`probe-execution/transport/000065-occupancy-00000000000000000000000000000000` 的实际 RESULT 为 `fd-table-scan-unknown / fd-table-not-converged / ESTALE`，远端 rc70，主机 1.269810833 秒，累计 10,394,875 B、5,732 次 FD 观察。因此不是 6/8 秒超时或读取/FD 容量上限。固定源码 `07ef9c…10c18` 第 462–521 行要求所有 FD number、dev、inode、mode、link 的整表两次全等；最多三次仍不满足便停止。
+
+PID1294 是当时未收敛表的代表；FD242 是最后记录的遍历位置，**不是已定位的变化项**。目前原始数据没有逐轮集合或差异，也不能排除某轮因 ENOENT/ESRCH 重置快照。因此不能声称现场变化已证明属于 pipe/socket，更不能给出一定通过的承诺。旧测试明确把持续 pipe 字符串替换视为 STOP；不能只改那个期待值来冒充实质验证。
+
+## 固定对象的依据
+
+已从 Android 官方同版本 `a78ea39db117` 保存 8 份源码和逐文件 SHA 于 `primary-sources/SOURCES.json`。
+
+- [fs/proc/fd.c](https://android.googlesource.com/kernel/common/+/a78ea39db117/fs/proc/fd.c)：`proc_fd_link` 经 `fget_task` 取得目标，复制 `f_path` 并持有 path 引用；不是把显示字符串再当普通路径解析。
+- [fs/proc/base.c](https://android.googlesource.com/kernel/common/+/a78ea39db117/fs/proc/base.c)：`proc_pid_get_link` 仍经 `proc_fd_access_allowed`，然后跳至该 path；权限失败不得降级。
+- [fs/open.c](https://android.googlesource.com/kernel/common/+/a78ea39db117/fs/open.c)：`do_dentry_open` 对 O_PATH 保存 path/inode，使用空 fops 后返回；不调用目标文件、设备、FIFO 的常规 open。
+- [fs/statfs.c](https://android.googlesource.com/kernel/common/+/a78ea39db117/fs/statfs.c)：`fd_statfs` 经 `fdget_raw` 读取持有 path 的文件系统信息，支持 O_PATH。
+- [magic.h](https://android.googlesource.com/kernel/common/+/a78ea39db117/include/uapi/linux/magic.h)、[pipe.c](https://android.googlesource.com/kernel/common/+/a78ea39db117/fs/pipe.c)、[socket.c](https://android.googlesource.com/kernel/common/+/a78ea39db117/net/socket.c)：内核匿名管道和 socket 的 pseudo-filesystem magic 可区分路径上同类型对象。
+
+O_PATH 固定的是 path/inode，不是原进程的整个 file description；不能用它宣称 KCMP_FILE 等价、远端 FD 槽不再变化，或所有间接内核引用都可见。SELinux/权限是否允许运行仍需真实环境验证；任何获取失败不放行。
+
+## 最小拟实现合同
+
+1. 保持全部逐任务 identity/cwd/root/namespace、KCMP_FILES 共享关系、loop 和 protected tree/inode 检查；旧生命周期退出规则、3 轮、32 MiB/131072 FD/KCMP、6/8 秒上限不变。
+2. 对每个枚举到的 FD，先检查原 proc link 若观察到 protected 即永久 BUSY。通过已 pinned 的 task procdir 以 `openat(fd/N, O_PATH|O_CLOEXEC)` 获取目标 path；这里必须跟随 **proc magiclink**，不能误加 O_NOFOLLOW 而只拿到 proc symlink。父 procdir 与路径固定、FD名只允许十进制；不接受用户路径。
+3. 在本地持有的 O_PATH fd 上取得 fstat、fstatfs，再读自身 `/proc/self/fd/anchor` 得到同一 held path。对 path 与 dev/inode 都执行现有 protected 检查；初次/最终 task identity 不符、权限、读取、类型冲突、无法取得对象身份或未知消失均 STOP。
+4. 只有 **fstat 为 FIFO 且 fstatfs=PIPEFS_MAGIC**，或 **fstat 为 SOCK 且 fstatfs=SOCKFS_MAGIC** 的完整已核对象，允许在相邻完整扫描之间新增、消失或换号。不是按字符串或 S_IFSOCK/S_IFIFO 单独豁免；每次出现仍须完整读取与检查并计入预算。
+5. 其余 regular/dir/block/char、文件系统上的 named FIFO/socket、anon_inode（含 epoll/dmabuf）、memfd、未知文件系统类型均保留严格集合比较。pipe→普通文件、普通文件→pipe 也会改变严格集合；任何 protected 观察仍立即 BUSY。不把 unresolved ENOENT 当作已证明的普通关闭。
+6. 两个完整观察的非 stream 对象集合必须一致；允许的 stream 差异只影响相等性，不免除当前枚举覆盖。这样去除“已认证无关内核对象也必须静止”的要求，不把任意未收敛表改成通过。若实际变化属于其它类别或无法 pin，继续 STOP。
+7. 新增 bounded FD 差异诊断：每表最多一个摘要与有限最多 8 个差异记录，记录 pass、两侧计数、class、FD number、inode身份以及 acquisition errno；受原 256 KiB 输出总 cap。不打印无限路径，不新增设备请求或自动重试。
+8. 临时 O_PATH fd 逐项关闭，不保存一整表的新 anchor；自身继承 FD/cwd/root 仍必须检查，只有精确核对的自身当前枚举 dirfd 可沿用既定排除。真实测试必须覆盖自身临时句柄不造成扫描自循环。
+
+## 必须先完成的验证
+
+当前 17 项 `test_fd_object_model.py` 仅证明候选比较规则和反例，不证明 O_PATH、Android 权限或原生性能；不能据此部署。模型不导入设备 backend，审计钩子禁止 subprocess/socket。
+
+设计通过后，在既有 Linux VM 隔离 namespace 中运行原生实验（先记录 VM 状态，恢复原状态）：
+
+- 真正匿名 pipe、socket 持续替换但每项完整 pin/分类时应可完成，不接受 rc0/70任意都算通过。
+- 真实普通文件系统 named FIFO 和 UNIX socket 路径的 O_PATH 不能仅按类型获得豁免；proc magiclink 的 socket 对象与路径 inode 分开检查。protected tree 内出现特殊文件仍由原 tree 类型门拒绝。
+- 同号 stream→protected、普通对象→stream、伪 socket 字符串、magic/type不匹配、anon_inode/memfd变化、别名 inode 命中均按合同拒绝。
+- 获取前 FD 消失、权限拒绝、O_PATH不支持、保持 live 但无法分类时 STOP；不能仅把消失当无关 churn。
+- 扫描器自身继承 protected FD 必须拒绝，临时 anchor 不自造永远变化。
+- 持续普通文件 churn 必须 STOP；所有现有身份/代表退出/新增任务/32 MiB/5秒原生预算场景保留真实压测。
+- 完整新源码差异独审、Linux实际 O_PATH 参数和 fstatfs 原始证据、Mac模型/fixture、Linux动态、ARM禁用构建与单门候选均需分别记载。当前未开始 VM 或原生构建。
+
+无法证明任意瞬时 ABA、SCM_RIGHTS 队列或其它内核隐藏引用；旧方案也不具备这种原子证明。这个候选只能在既有“有界直接占用观察”的合同内，提高已认证非文件对象变化的兼容性，不承诺所有活进程必然放行。

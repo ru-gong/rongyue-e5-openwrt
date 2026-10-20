@@ -1,0 +1,71 @@
+"""Host-only archive tests in disposable roots; no current-state mutation."""
+import copy,json,tempfile,types,unittest
+from pathlib import Path
+from unittest.mock import patch
+import settle as s
+
+class Tests(unittest.TestCase):
+ def setUp(self):
+  self.tmp=tempfile.TemporaryDirectory(prefix='e5-prefix-settle-test-');self.addCleanup(self.tmp.cleanup)
+  self.root=Path(self.tmp.name).resolve();self.state=self.root/'state';self.state.mkdir();self.ledger=self.root/'ledger';self.ledger.write_bytes(b'ledger\n')
+  p=self.state/'UNCERTAIN.json';p.write_bytes(b'exact marker\n');active=self.state/'ACTIVE.json';active.write_bytes(b'exact active\n')
+  q=self.root/'evidence/stopped/STOP.json';q.parent.mkdir(parents=True);q.write_bytes(b'stop\n')
+  def pin(p):return {'bytes':p.stat().st_size,'sha256':s.sha(p.read_bytes())}
+  self.case={'serial':'DEVICE_SERIAL_REDACTED','txid':'314ff262fa18c842','boot_id':'00000000-0000-4000-8000-000000000001',
+             'files':{str(q.relative_to(self.root)):pin(q)},'ledger':pin(self.ledger),'uncertainty':pin(p),'active':pin(active),'original_stop':str(q),
+             'acknowledged_payload_bytes':208178731,'archive_rel':'host-stage-checkpoints/314ff262fa18c842'}
+  # Use the real reviewed durable/no-replace primitives, but replace only the
+  # historical-chain callbacks. All paths belong to this disposable root.
+  real=s.api();self.api=types.SimpleNamespace(**{n:getattr(real,n) for n in
+       ('read','exists','directory','sync','noreplace','durable','encoded')},validate_closed=lambda *x:None,normal_gate=lambda *x:None)
+  (self.root/'evidence/.e5-clean-directory-DEVICE_SERIAL_REDACTED.lock').touch();(self.state/'LOCK').touch()
+  for ctx in (patch.object(s,'ROOT',self.root),patch.object(s,'STATE',self.state),patch.object(s,'LEDGER',self.ledger),
+              patch.object(s,'case',return_value=self.case),patch.object(s,'api',return_value=self.api),
+              patch.object(s,'HOST_SETTLEMENT_ENABLED',True)):
+   ctx.start();self.addCleanup(ctx.stop)
+ def test_exact_marker_archived_and_stop_preserved(self):
+  s.settle();archive=self.state/self.case['archive_rel']
+  self.assertEqual((archive/'UNCERTAIN.json').read_bytes(),b'exact marker\n');self.assertFalse((self.state/'UNCERTAIN.json').exists())
+  self.assertEqual((archive/'ACTIVE.json').read_bytes(),b'exact active\n');self.assertFalse((self.state/'ACTIVE.json').exists());self.assertTrue((archive/s.RECEIPT).exists());self.assertFalse(s.receipt(self.case)['device_operation_or_freshness_granted'])
+ def test_changed_active_refused(self):
+  (self.state/'ACTIVE.json').write_text('{}')
+  with self.assertRaises(RuntimeError):s.settle()
+ def test_changed_marker_refused(self):
+  (self.state/'UNCERTAIN.json').write_bytes(b'different\n')
+  with self.assertRaises(RuntimeError):s.settle()
+ def test_changed_evidence_refused(self):
+  p=self.root/next(iter(self.case['files']));p.write_bytes(b'different')
+  with self.assertRaises(RuntimeError):s.settle()
+ def test_completed_old_stage_refused(self):
+  (self.root/'evidence/stopped/COMPLETE.json').write_text('{}')
+  with self.assertRaises(RuntimeError):s.settle()
+ def test_receipt_failure_preserves_marker_and_requires_explicit_resume(self):
+  real=self.api.durable;self.api.durable=lambda *x:(_ for _ in ()).throw(OSError('simulated receipt failure'))
+  with self.assertRaises(OSError):s.settle()
+  archive=self.state/self.case['archive_rel'];self.assertTrue((archive/'UNCERTAIN.json').exists());self.assertFalse((archive/s.RECEIPT).exists())
+  self.api.durable=real
+  with self.assertRaises(RuntimeError):s.settle()
+  s.settle(resume=True);self.assertTrue((archive/s.RECEIPT).exists())
+ def test_foreign_archive_not_overwritten(self):
+  archive=self.state/self.case['archive_rel'];archive.mkdir(parents=True);(archive/'foreign').write_bytes(b'keep')
+  with self.assertRaises(RuntimeError):s.settle(resume=True)
+  self.assertEqual((archive/'foreign').read_bytes(),b'keep')
+ def test_settled_record_tamper_refused(self):
+  s.settle();archive=self.state/self.case['archive_rel'];(archive/s.RECEIPT).write_bytes(b'{}')
+  with self.assertRaises(RuntimeError):s.validate_settled()
+
+if __name__=='__main__':unittest.main(verbosity=2)
+
+class PartialTests(Tests):
+ def test_first_marker_only_moved_requires_explicit_resume(self):
+  real=self.api.noreplace
+  def move(a,b):
+   if a.name=='UNCERTAIN.json':raise OSError('simulated interruption after ACTIVE archive')
+   return real(a,b)
+  self.api.noreplace=move
+  with self.assertRaises(OSError):s.settle()
+  self.assertFalse((self.state/'ACTIVE.json').exists());self.assertTrue((self.state/'UNCERTAIN.json').exists())
+  self.api.noreplace=real
+  with self.assertRaises(RuntimeError):s.settle()
+  s.settle(resume=True)
+  self.assertTrue((self.state/self.case['archive_rel']/s.RECEIPT).exists())

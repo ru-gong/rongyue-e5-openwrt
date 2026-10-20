@@ -1,0 +1,163 @@
+"""Temporary host-only request and orchestration tests. No device processes."""
+import sys
+def deny(event, args):
+    if event.startswith(("subprocess.", "socket.")) or event in ("os.system", "os.exec", "os.posix_spawn"):
+        raise AssertionError("external operation prohibited: " + event)
+sys.addaudithook(deny)
+import copy
+from datetime import datetime, timezone, timedelta
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+import workflow as w
+
+
+class WorkflowTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name).resolve(); (self.root / "evidence").mkdir()
+        self.now = datetime.now(timezone.utc)
+        self.request = {"schema": "e5-nextphase-workflow-request-v1", "phase": "inventory", "serial": w.SERIAL,
+            "boot_id": "00000000-0000-4000-8000-000000000001", "txid": "0123456789abcdef",
+            "total_seconds": 600, "manifest_sha256": "a" * 64, "runner_sha256": w.hash_file(Path(w.__file__)),
+            "cold_ready": {"path": str(self.root / "SYNTHETIC-cold.json"), "sha256": "c" * 64},
+            "requirements": {"deployment": {}},
+            "inputs": {"roles": ["active", "stage"]}, "evidence_directory": str(self.root / "evidence/session"),
+            "user_confirmation": "SYNTHETIC TEMP FIXTURE ONLY", "technical_review": None}
+        self.patches = [patch.object(w, "ROOT", self.root), patch.object(w, "MANIFEST_SHA", "a" * 64)]
+        for p in self.patches: p.start(); self.addCleanup(p.stop)
+
+    def save(self, name, value):
+        path = self.root / name; raw = w.canonical(value) + b"\n"; path.write_bytes(raw)
+        return {"path": str(path), "sha256": w.sha(raw)}
+
+    def bind(self, request=None, *, reviewed=None, decision="EXACT_ONE_PHASE_ONLY"):
+        r = copy.deepcopy(request or self.request)
+        review = {"schema": "e5-nextphase-workflow-review-v1", "request_binding_sha256": w.request_binding(r),
+            "reviewer": "SYNTHETIC TEMP FIXTURE", "reviewed_at": (reviewed or self.now).isoformat(), "decision": decision}
+        r["technical_review"] = self.save("SYNTHETIC-review.json", review)
+        return self.save("SYNTHETIC-request.json", r)
+
+    def check(self, r=None, **kw):
+        return w.validate_request(self.bind(r, **kw), self.now)
+
+    def test_default_gate_precedes_request_read(self):
+        with patch.object(w, "validate_request", side_effect=AssertionError("must not read")):
+            with self.assertRaisesRegex(w.Refusal, "WORKFLOW_IO_DISABLED"):
+                w.execute({"path": "/nonexistent", "sha256": "0" * 64})
+
+    def test_one_exact_phase_request_accepted_offline(self):
+        self.assertEqual(self.check()["phase"], "inventory")
+
+    def test_missing_user_confirmation_refused(self):
+        r = copy.deepcopy(self.request); r["user_confirmation"] = ""
+        with self.assertRaisesRegex(w.Refusal, "confirmation"): self.check(r)
+
+    def test_arbitrary_phase_or_device_refused(self):
+        for key, value in (("phase", "wipe"), ("serial", "ANOTHERDEVICE")):
+            r = copy.deepcopy(self.request); r[key] = value
+            with self.assertRaises(w.Refusal): self.check(r)
+
+    def test_source_manifest_or_runner_drift_refused(self):
+        for key in ("manifest_sha256", "runner_sha256"):
+            r = copy.deepcopy(self.request); r[key] = "f" * 64
+            with self.assertRaises(w.Refusal): self.check(r)
+
+    def test_review_bound_to_all_inputs(self):
+        bound = self.bind(); r = json.loads(Path(bound["path"]).read_text())
+        r["inputs"] = {"roles": ["failed"]}; bound = self.save("changed.json", r)
+        with self.assertRaisesRegex(w.Refusal, "exact phase review"): w.validate_request(bound, self.now)
+
+    def test_expired_or_future_review_refused(self):
+        for offset in (-901, 1):
+            with self.assertRaisesRegex(w.Refusal, "exact phase review"):
+                self.check(reviewed=self.now + timedelta(seconds=offset))
+
+    def test_blanket_review_refused(self):
+        with self.assertRaisesRegex(w.Refusal, "exact phase review"): self.check(decision="ALL_FUTURE_PHASES")
+
+    def test_unknown_or_duplicate_roles_refused(self):
+        for roles in (["active", "active"], ["arbitrary"], []):
+            r = copy.deepcopy(self.request); r["inputs"] = {"roles": roles}
+            with self.assertRaisesRegex(w.Refusal, "roles"): self.check(r)
+
+    def test_existing_evidence_never_reused(self):
+        Path(self.request["evidence_directory"]).mkdir()
+        with self.assertRaisesRegex(w.Refusal, "fresh workflow"): self.check()
+
+    def test_evidence_cannot_escape_fixed_root(self):
+        r = copy.deepcopy(self.request); r["evidence_directory"] = str(self.root / "outside")
+        with self.assertRaisesRegex(w.Refusal, "fresh workflow"): self.check(r)
+
+    def test_evidence_symlink_refused(self):
+        (self.root / "evidence/session").symlink_to(self.root / "nonexistent")
+        with self.assertRaisesRegex(w.Refusal, "fresh workflow"): self.check()
+
+    def test_phase_budget_limits(self):
+        for phase, inputs, seconds in (("stage", {}, 3601), ("install", {"boot_request": {}}, 901),
+                                      ("inventory", {"roles": ["active"]}, 29)):
+            r = copy.deepcopy(self.request); r.update(phase=phase, inputs=inputs, total_seconds=seconds)
+            with self.assertRaisesRegex(w.Refusal, "time budget"): self.check(r)
+
+    def test_no_arbitrary_input_fields(self):
+        r = copy.deepcopy(self.request); r["inputs"]["shell"] = "forbidden"
+        with self.assertRaisesRegex(w.Refusal, "input set"): self.check(r)
+
+    def test_all_declared_phases_have_exact_input_contract(self):
+        for phase, inputs in (("backup", {"inventory": {}, "output": "/unexecuted"}), ("stage", {}),
+                              ("activate", {"directory_request": {}}), ("rollback", {"directory_request": {}}),
+                              ("install", {"boot_request": {}})):
+            r = copy.deepcopy(self.request); r.update(phase=phase, inputs=inputs)
+            if phase in {"stage", "activate", "rollback", "install"}:r["requirements"]["probe"]={}
+            if phase=="install":r["requirements"]["activation"]={}
+            self.assertEqual(self.check(r)["phase"], phase)
+
+    def test_missing_final_manifest_is_not_ready(self):
+        with patch.object(w, "MANIFEST_SHA", "0" * 64), self.assertRaisesRegex(w.Refusal, "not yet frozen"):
+            w.verify_materials()
+
+    def test_save_is_exclusive(self):
+        p = self.root / "out.json"; w.save_new(p, {"first": True})
+        with self.assertRaises(w.Refusal): w.save_new(p, {"second": True})
+        self.assertEqual(json.loads(p.read_text()), {"first": True})
+
+    def support_manifest(self):
+        m = {"candidate": {"path": "/synthetic-candidate", "sha256": "c" * 64}}
+        schemas = {"deployment_manifest": "e5-next-scanner-artifact-manifest-v1",
+                   "recovery_manifest": "e5-next-recovery-tools-v1",
+                   "nv_geometry": "e5-fixed-nine-nv-geometry-v1",
+                   "independent_candidate_review": "e5-independent-candidate-delivery-v1"}
+        for key, schema in schemas.items():
+            d = {"schema": schema}
+            if key == "independent_candidate_review":
+                d.update(decision="HOST_ARTIFACT_REVIEW_PASSED_ONLY", approved_to_flash=False,
+                         candidate={**m["candidate"], "bytes": 1})
+            m[key] = self.save(key + ".json", d)
+        return m
+
+    def test_all_supporting_bindings_verified(self):
+        w.verify_support_bindings(self.support_manifest())
+
+    def test_supporting_file_changed_refused(self):
+        m = self.support_manifest()
+        Path(m["nv_geometry"]["path"]).write_text("{}")
+        with self.assertRaisesRegex(w.Refusal, "bound JSON changed"):
+            w.verify_support_bindings(m)
+
+    def test_missing_supporting_binding_refused(self):
+        m = self.support_manifest(); del m["recovery_manifest"]
+        with self.assertRaisesRegex(w.Refusal, "missing supporting binding"):
+            w.verify_support_bindings(m)
+
+    def test_candidate_review_cannot_grant_execution_or_cover_other_candidate(self):
+        for changes in ({"approved_to_flash": True}, {"candidate": {"path": "/other", "sha256": "d" * 64}}):
+            m = self.support_manifest(); p = Path(m["independent_candidate_review"]["path"])
+            d = json.loads(p.read_text()); d.update(changes)
+            m["independent_candidate_review"] = self.save("modified-review.json", d)
+            with self.assertRaisesRegex(w.Refusal, "candidate review binding"):
+                w.verify_support_bindings(m)
+
+
+if __name__ == "__main__": unittest.main()

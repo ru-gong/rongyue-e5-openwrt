@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Inspect pinned HOST artifacts. No device, transport, mount, or execute API.
+
+The gzip is copied byte-for-byte into a temporary HOST file for read-only ext4
+inspection; it is deleted on exit. No input artifact or firmware is modified.
+The JSON is evidence for a future reviewed transaction, never a live request.
+"""
+import argparse
+import gzip
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import struct
+import tarfile
+import tempfile
+
+ROOT = Path(__file__).resolve().parents[2]
+BASE = "evidence/stage2-execution-20261013/final-install-bundle/"
+SOURCE = "materials/openwrt-build-20261013-569f13d4/source/"
+COMMIT = "569f13d4ce15585f70817c2a1e03bb574a84720b"
+RAW_BYTES = 2147483648
+RAW_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+PINS = {
+    "boot": ("boot.img", 67108864, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "rootfs_gz": ("openwrt.ext4.gz", 149230668, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "device_files_tar": ("device-files.tar", 60661760, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "device_files_provenance": ("device-files.provenance.json", 149346, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "install_conf": ("openwrt-install.conf", 123, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "fscrypt_probe": ("fscrypt-policy-probe", 716192, "0000000000000000000000000000000000000000000000000000000000000000"),
+    "runtime_audit": ("runtime-audit.json", 4257, "0000000000000000000000000000000000000000000000000000000000000000"),
+}
+SOURCE_PINS = {
+    "boot/init": "0000000000000000000000000000000000000000000000000000000000000000",
+    "device/openwrt_device_common/shared/staging.py": "0000000000000000000000000000000000000000000000000000000000000000",
+    "device/openwrt_device_common/shared/nv-prepare.py": "0000000000000000000000000000000000000000000000000000000000000000",
+    "device/openwrt_device_common/shared/nv-verify.py": "0000000000000000000000000000000000000000000000000000000000000000",
+}
+INNER_PINS = {
+    "opt/e5/t551m-nv-prepare": SOURCE_PINS["device/openwrt_device_common/shared/nv-prepare.py"],
+    "opt/e5/t551m-nv-verify": SOURCE_PINS["device/openwrt_device_common/shared/nv-verify.py"],
+    "opt/e5/vendor-start.sh": "0000000000000000000000000000000000000000000000000000000000000000",
+    "etc/init.d/e5-vendor": "0000000000000000000000000000000000000000000000000000000000000000",
+    "etc/uci-defaults/92-e5-default-boot": "0000000000000000000000000000000000000000000000000000000000000000",
+}
+ABSENT = ("opt/e5/nv", "etc/e5/install.conf", "etc/e5/device-files.stamp",
+          "etc/e5linux/default-boot", "etc/e5linux/boot-os-next",
+          "etc/config/openclash", "etc/init.d/openclash", "usr/share/openclash")
+
+
+class Reject(ValueError):
+    pass
+
+
+class Missing(FileNotFoundError):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise Reject(message)
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def regular(path):
+    require(stat.S_ISREG(path.lstat().st_mode), "not a regular host file: " + str(path))
+    return path
+
+
+def verify_file(path, size, expected):
+    regular(path)
+    require(path.stat().st_size == size, "host file length mismatch")
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(8 << 20), b""):
+            h.update(chunk)
+    require(h.hexdigest() == expected, "host file SHA mismatch: " + path.name)
+    return {"path": str(path), "bytes": size, "sha256": expected}
+
+
+class Ext4Reader:
+    """Bounded ext4 extent reader for this hash-pinned image; no journal replay."""
+    def __init__(self, stream, size):
+        self.f, self.size = stream, size
+        s = self.read(1024, 1024)
+        require(self.u16(s, 56) == 0xEF53, "not ext4")
+        self.bs = 1024 << self.u32(s, 24)
+        self.ipg, self.iz = self.u32(s, 40), self.u16(s, 88)
+        self.ds = max(32, self.u16(s, 254))
+        require(self.bs in (1024, 2048, 4096) and self.ipg > 0 and 128 <= self.iz <= self.bs,
+                "unsupported ext4 geometry")
+        require(self.ds in (32, 64), "unsupported group descriptor")
+        self.dt = (2 if self.bs == 1024 else 1) * self.bs
+
+    @staticmethod
+    def u16(b, n): return struct.unpack_from("<H", b, n)[0]
+    @staticmethod
+    def u32(b, n): return struct.unpack_from("<I", b, n)[0]
+
+    def read(self, offset, length):
+        require(0 <= offset <= self.size and 0 <= length <= self.size - offset, "extent out of image")
+        self.f.seek(offset)
+        data = self.f.read(length)
+        require(len(data) == length, "short image read")
+        return data
+
+    def inode(self, n):
+        require(n > 0, "bad inode")
+        g, j = divmod(n - 1, self.ipg)
+        d = self.read(self.dt + g * self.ds, self.ds)
+        block = self.u32(d, 8) + ((self.u32(d, 40) << 32) if self.ds >= 64 else 0)
+        return self.read(block * self.bs + j * self.iz, self.iz)
+
+    def extents(self, data, seen=None):
+        seen = set() if seen is None else seen
+        require(self.u16(data, 0) == 0xF30A, "not extents")
+        count, depth = self.u16(data, 2), self.u16(data, 6)
+        require(depth <= 5 and 12 + count * 12 <= len(data), "invalid extent header")
+        result = []
+        for k in range(count):
+            o = 12 + k * 12
+            if depth:
+                ptr = self.u32(data, o + 4) + (self.u16(data, o + 8) << 32)
+                require(ptr not in seen, "extent cycle")
+                seen.add(ptr)
+                child = self.read(ptr * self.bs, self.bs)
+                require(self.u16(child, 6) == depth - 1, "extent depth mismatch")
+                result += self.extents(child, seen)
+            else:
+                length = self.u16(data, o + 4)
+                require(0 < length <= 32768, "unwritten or empty extent unsupported")
+                result.append((self.u32(data, o), length,
+                               self.u32(data, o + 8) + (self.u16(data, o + 6) << 32)))
+        return result
+
+    def data(self, n):
+        i = self.inode(n)
+        size = self.u32(i, 4) + (self.u32(i, 108) << 32)
+        require(size <= 32 << 20, "selected inode too large")
+        mode = self.u16(i, 0) & 0xF000
+        if mode == 0xA000 and size <= 60:
+            return i[40:40 + size]
+        require(self.u32(i, 32) & 0x80000, "non-extent inode unsupported")
+        b = bytearray(size)
+        end = 0
+        for logical, count, physical in sorted(self.extents(i[40:100])):
+            offset = logical * self.bs
+            require(offset >= end, "overlapping extents")
+            amount = min(count * self.bs, max(0, size - offset))
+            if amount:
+                b[offset:offset + amount] = self.read(physical * self.bs, amount)
+            end = offset + amount
+        return bytes(b)
+
+    def entries(self, n):
+        require(self.u16(self.inode(n), 0) & 0xF000 == 0x4000, "ancestor not a directory")
+        b, o, result = self.data(n), 0, {}
+        while o < len(b):
+            require(o + 8 <= len(b), "short directory entry")
+            child, length, namelen = self.u32(b, o), self.u16(b, o + 4), b[o + 6]
+            require(length >= 8 and length % 4 == 0 and o + length <= len(b)
+                    and namelen <= length - 8, "invalid directory entry")
+            name = b[o + 8:o + 8 + namelen].decode("utf-8", "strict")
+            if child and name not in (".", ".."):
+                require(name not in result and "/" not in name, "duplicate/invalid directory name")
+                result[name] = child
+            o += length
+        return result
+
+    def lookup(self, path):
+        parts = path.split("/")
+        require(all(x and x not in (".", "..") for x in parts), "invalid relative path")
+        node = 2
+        for name in parts:
+            entries = self.entries(node)
+            if name not in entries:
+                raise Missing(path)
+            node = entries[name]
+        return node
+
+    def file(self, path):
+        n = self.lookup(path)
+        require(self.u16(self.inode(n), 0) & 0xF000 == 0x8000, "not regular inner file: " + path)
+        return self.data(n)
+
+    def absent(self, path):
+        try:
+            self.lookup(path)
+        except Missing:
+            return True
+        return False
+
+    def empty_dir(self, path):
+        return self.entries(self.lookup(path)) == {}
+
+
+def check_pristine(fs):
+    for path in ABSENT:
+        require(fs.absent(path), "pristine image polluted: " + path)
+    for path in ("opt/e5/android", "etc/e5linux"):
+        require(fs.empty_dir(path), "pristine directory not empty: " + path)
+    checked = {}
+    for path, expected in INNER_PINS.items():
+        data = fs.file(path)
+        require(sha(data) == expected, "inner runtime differs: " + path)
+        checked[path] = expected
+    vendor = fs.file("etc/init.d/e5-vendor").decode()
+    require(vendor.index("/opt/e5/t551m-nv-prepare || return 1") <
+            vendor.index("instance modem_control"), "NV guard does not precede vendor")
+    return {"rootfs_checked_sha256": RAW_SHA, "inner_default_android": True,
+            "no_private_nv": True, "no_previous_origin": True,
+            "no_pending_update": True, "empty_vendor_runtime": True,
+            "no_install_conf": True, "no_W1_D1_OpenClash": True,
+            "selected_runtime_hashes": checked,
+            "scope": "exact pristine image only; does not attest current outer directory",
+            "default_meaning": "no inner Linux marker; fixed 92 script only changes default for explicit linux; installer must stage Android markers"}
+
+
+def inspect_gzip(path):
+    h, total = hashlib.sha256(), 0
+    with tempfile.TemporaryFile(prefix="e5-pristine-host-readonly-") as raw:
+        with gzip.open(regular(path), "rb") as source:
+            for block in iter(lambda: source.read(8 << 20), b""):
+                total += len(block)
+                require(total <= RAW_BYTES, "decompression exceeds fixed image size")
+                h.update(block)
+                raw.write(block)
+        require(total == RAW_BYTES and h.hexdigest() == RAW_SHA, "pristine raw SHA/size mismatch")
+        raw.flush()
+        return check_pristine(Ext4Reader(raw, total))
+
+
+def settings(path):
+    fields = {}
+    for line in regular(path).read_text().splitlines():
+        m = re.fullmatch(r"(E5_APN|E5_WIFI_SSID|E5_WIFI_KEY|E5_WIFI_CHANNEL|E5_DEFAULT_BOOT)='([^'\r\n]*)'", line)
+        require(m is not None and m[1] not in fields, "invalid or duplicate settings")
+        fields[m[1]] = m[2]
+    require(set(fields) == {"E5_APN", "E5_WIFI_SSID", "E5_WIFI_KEY", "E5_WIFI_CHANNEL", "E5_DEFAULT_BOOT"}, "missing settings")
+    require(fields["E5_DEFAULT_BOOT"] == "android", "default must stay Android")
+    require(8 <= len(fields["E5_WIFI_KEY"]) <= 63, "invalid Wi-Fi key length")
+    return {"default_boot": "android", "keys": sorted(fields), "secret_values_omitted": True}
+
+
+def verify_device_tar(path, provenance):
+    expected = {x["name"]: x for x in provenance["outputs"]}
+    require(len(expected) == len(provenance["outputs"]), "duplicate provenance member")
+    seen = set()
+    with tarfile.open(regular(path), "r:") as archive:
+        for member in archive:
+            name = member.name.removeprefix("./")
+            require(not name.startswith("/") and ".." not in name.split("/"), "unsafe tar name")
+            if member.isdir():
+                continue
+            require(member.isfile() and name in expected and name not in seen, "unexpected tar member/type")
+            require(not any(x in name for x in ("/nv/", "nr_fixnv", "nr_runtimenv", "nr_deltanv", "calinv", "nr_modem", "nr_phy")), "private NR/NV in vendor tar")
+            data = archive.extractfile(member).read()
+            require(len(data) == expected[name]["bytes"] and sha(data) == expected[name]["sha256"], "vendor tar member mismatch")
+            seen.add(name)
+    require(seen == set(expected), "missing vendor tar members")
+    require(provenance["source_commit"] == COMMIT and provenance["nv_included"] is False,
+            "vendor provenance mismatch")
+    return {"members_verified": len(seen), "no_NR_partition_images_or_NV": True,
+            "source": "this device original Android collection; unchanged converted runtime/WCN/GNSS/audio"}
+
+
+def make_candidate(root=ROOT):
+    artifacts = {k: verify_file(root / BASE / name, size, h) for k, (name, size, h) in PINS.items()}
+    artifacts["rootfs_gz"].update(raw_bytes=RAW_BYTES, raw_sha256=RAW_SHA)
+    source_checks = {}
+    for name, h in SOURCE_PINS.items():
+        p = regular(root / SOURCE / name)
+        require(sha(p.read_bytes()) == h, "pinned source changed: " + name)
+        source_checks[name] = h
+    conf = settings(Path(artifacts["install_conf"]["path"]))
+    vendor = verify_device_tar(Path(artifacts["device_files_tar"]["path"]),
+                               json.loads(Path(artifacts["device_files_provenance"]["path"]).read_text()))
+    attest = inspect_gzip(Path(artifacts["rootfs_gz"]["path"]))
+    outer = {name: {"kind": "copy_pinned_artifact", "artifact": k, "bytes": size, "sha256": h}
+             for k, (name, size, h) in PINS.items() if k in ("boot", "rootfs_gz", "device_files_tar", "install_conf", "fscrypt_probe")}
+    outer["fscrypt-probe"] = outer.pop("fscrypt-policy-probe")
+    outer["openwrt.ext4"] = {"kind": "exact_gzip_decompression", "artifact": "rootfs_gz", "bytes": RAW_BYTES, "sha256": RAW_SHA}
+    for name, value in (("boot-os", "openwrt\n"), ("openwrt-default-boot", "android\n")):
+        outer[name] = {"kind": "literal", "text": value, "bytes": len(value), "sha256": sha(value.encode())}
+    return {"schema": "e5-clean-author-candidate-v1", "status": "HOST_MATERIALS_CHECKED_LIVE_GATES_PENDING",
+            "approved_for_device_execution": False, "device_io": False, "vm_operations": False,
+            "source_disclosure": {"commit": COMMIT, "official_author_binary": False,
+              "variant": "fixed author source + existing boot/init diagnostic count=1024; upstream mobile4 kernel adaptations",
+              "W1_applied": False, "D1_applied": False, "OpenClash_added": False,
+              "source_hashes": source_checks},
+            "artifacts": artifacts, "attestation": attest, "vendor_validation": vendor,
+            "settings_validation": conf, "outer_file_set": outer,
+            "initialization_contract": {
+              "boot_os_selects": "openwrt", "default_after_trial": "android",
+              "vendor": "boot/init loads fixed device-files.tar from active e5linux before switch_root; archive has no NV",
+              "configuration": "90-e5 consumes outer openwrt-install.conf into /etc/e5/install.conf then removes outer conf; 92 retains Android default",
+              "nv": "first S20e5-vendor runs t551m-nv-prepare before all vendor daemons; BLKROSET physical 9 NV then copy live device sources into new /opt/e5/nv loops",
+              "origin": "factory-sha256.json initialized inside NEW rootfs from this first boot, never copied from old runtime",
+              "old_directory": "must remain intact under transaction-specific preserved name; never merge its rootfs, NV, config, pending-update or boot-choice files",
+              "runtime_changes": "first boot intentionally changes new rootfs and consumes install.conf; pristine hash is only a preboot image assertion"},
+            "pending_live_gates": {k: {"status": "pending", "observed": None} for k in
+              ("fresh_root_A_identity_and_boot_id", "AP_panic_risk_review", "current_B_misc_GPT_protected_hashes",
+               "actual_free_space_with_old_directory_retained", "old_directory_unmounted_no_loop_no_users_and_backup",
+               "outer_pending_updates_absent", "fresh_physical_9_NV_baseline_immediately_before_trial",
+               "first_boot_NV_origin_matches_fresh_baseline_RO_loops_and_verify", "SIM_cellular_functionality")}}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "research/author-clean-reinstall-20261014/candidate.json")
+    args = parser.parse_args()
+    candidate = make_candidate()
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    # Exclusive output: never replace a previous candidate or follow a symlink.
+    with args.output.open("x") as f:
+        json.dump(candidate, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    print(json.dumps({"output": str(args.output), "sha256": sha(args.output.read_bytes()),
+                      "device_execution_approved": False, "pristine_sha256": RAW_SHA}))
+
+
+if __name__ == "__main__":
+    main()

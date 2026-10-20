@@ -1,0 +1,43 @@
+# 722b lifecycle STOP 的离线归档与续接准备
+
+本目录只准备固定一次停止事件：序列号 DEVICE_SERIAL_REDACTED，事务 722b7e1f5956cc07，boot 00000000-0000-4000-8000-000000000001。默认 `HOST_CLOSURE_ENABLED=False`，原生归档器 `DEVICE_EXECUTION_ENABLED=0`。没有执行真实 closure、设备命令或修改真实共享标记/boot ledger；这不是现场成功或后续写入许可。
+
+## 固定事实与归档边界
+
+固定 CASE 引用真实 89 请求、88 COMPLETE、14 同 ACTIVE 内读回、6 项辅助写，以及最后 occupancy 的 rc70/errno116/PID17691/stat-read。六项已完成操作是四个新辅助文件上传、旧 7d 锁归档、新 722b 锁与 owner 创建；无 B/misc/rootfs 写。扫描器在 final-process-identities 失败，后置保护/保留物检查尚未运行，不能以已扫计数证明扫描成功或设备文件后态完全核实。
+
+新第三永久屏障为 `RECOVERY_REPAIR_TRANSITION.json`。已有 `RECOVERY_PENDING.json` 与 `RECOVERY_TRANSITION.json` 及其两层凭据全部保留。新的未来恢复临时门使用独立 `RECOVERY_LIFECYCLE_TRANSITION.json`，不会把旧永久屏障当作正在运行的恢复。旧消费者会拒绝新屏障。
+
+将来由主线程在独立审查完成后显式执行 host close 时，仅将精确的原 ACTIVE/UNCERTAIN 字节以原子 no-replace 方式移到 `state/lifecycle-stop-closures/722b7e1f5956cc07/`，保留所有证据，建立 NOT_READY receipt 和永久屏障；不删除记录、不写 ledger、不发送设备命令。创建、改名和目录 fsync 有明确失败点。`close` 默认拒绝重复归档；只有显式 `resume` 才可重验同一 CASE 后完成中断的 host 耐久化。未知/部分 `.preparing` 字节不被覆盖；恢复过程中出错继续保留现场。已完成的显式 resume 仅重验与同步，不能授权设备动作。
+
+`validate_closed` 验证固定三层 provenance 和 ledger 不变前缀；未来合法 ledger 追加不改写历史。`normal_gate`/`transport_gate` 继续拒绝新 ACTIVE、UNCERTAIN、RECOVERY_ONLY、未完成新临时恢复门、已退役 boot/tx。历史 snapshot 递归委托旧固定 verifier，只用于历史排除，不产生新鲜租约、成功扫描或执行授权。
+
+## 七份 overlay 的集成合同
+
+基础为固定 b56c RESULT。七个键必须全量绑定：core/{bounded_transport,bounded_boot_control,uncertainty_recovery,workflow,phase_evidence}.py、recovery/common.py、scanner/stage2_deploy.py。这里不是完整可运行新 bundle；主线程需用新 scanner/native ELF 及全部来源重新封 pin、清单，交独审后再机械启用。旧源码不变。
+
+新 stage2 OLD_TX 固定 722b7e1f5956cc07，OLD_BOOT 固定 00000000-0000-4000-8000-000000000001。保留物的前/后各 12 项只读检查覆盖：fad8→7d 的旧锁及 owner、四个 7d helper；7d→722b 的旧锁及 owner、四个 722b helper。CASE 固定路径、stat 原文、owner/sha 原文；它们不得覆盖/删除。源绑定 phase proof 必须重放前后共 24 条记录，并对齐实际 mutation 和成功 occupancy 的顺序。新失败仍停止，不自动重试。
+
+普通写范围保持六项：四个新 helper 上传、当前 722b 锁归档、新 tx 锁 owner 创建。分区/安装、目录切换、租约与每请求时限仍由原已审工具约束；本目录不扩大这些范围。新 helper 的真实权限/扫描结果、设备 metadata、新鲜 cold/原件证据和独立技术 review 仍需现场取得。
+
+## 原生归档器
+
+`native/lock_archive.c` 相对原 `tools/e5_partial_lock_archive_prepare_20261016/native/lock_archive.c` 仅 OLD_TX 从 7d125fa2bd1c4e63 改为 722b7e1f5956cc07。严格 tmp uid/gid 2000:2000、mode 0771，原 no-replace/身份/短 deadline/取消/父目录 fsync 不变。新代码默认禁用。生产 Android ARM 构建由另一代理提供并另行审核；本目录的 Mac HOST_TEST 成功不等于 Android 执行通过。
+
+## 可复核入口与测试
+
+默认 `python3 -B closure.py` 是纯 host plan，重算固定 CASE 和真实停止证据，绝不 close。`build_overlay.py` 是仅本机文件生成器，覆盖本准备目录自身的派生 overlay，不能调用设备或改变共享状态；其输出已封存，不需执行时临时开发。
+
+分别在本目录执行测试（均只操作新建临时夹具）：
+
+```
+python3 -B -m unittest -v test_closure.py test_consumers.py test_phase_retained.py test_stage_retained.py
+python3 -B -m unittest -v test_lock_archive.py
+python3 -B -m unittest -v test_native_metadata.py
+```
+
+最终结果 71 host + 34 native HOST_TEST + 6 生产 metadata 谓词 = 111 通过。覆盖中断/持久化故障、错误 CASE/证据/标记、旧消费者拒绝、新 UNKNOWN 不豁免、历史 snapshot、三层永久屏障、新恢复临时门、12 项保留物前后完整合同及 OLD_TX/旧归档不覆写。生产谓词测试直接提取完整 ancestor-metadata 表达式，未把 HOST_TEST 跳过 UID 的分支当作覆盖。
+
+保留的早期失败日志是测试装载/夹具问题：tests-closure-01.log 为首次测试入口导入失败；tests-metadata-01.log 为固定 850B fixture 尚未复制。后续分别在 tests-closure-02.log、tests-metadata-02.log 修正后通过；没有隐藏或改写失败日志。PLAN_VERIFICATION.json 记录实际 plan 只读核验及真实 state/ledger 前后哈希相同。
+
+独立审查和 ARM 构建在独立 DELIVERY 中补引用，不回写已封存 source/CASE/清单。仅本准备材料通过不能宣布设备可继续或已装 OpenWrt。

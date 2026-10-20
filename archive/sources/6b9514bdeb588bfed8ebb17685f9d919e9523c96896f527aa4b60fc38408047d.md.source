@@ -1,0 +1,25 @@
+# Empty-directory no-replace probe — offline preparation only
+
+Production `DEVICE_EXECUTION_ENABLED` is fixed to 0. This revision and the static ARM binary are disabled. No enabled probe has been compiled or executed; no device operation occurred. The new paths require the supplementary scope confirmation and a separately reviewed activation copy before any device test. Existing enabled v3 tools were not modified.
+
+CLI (unsigned decimal identity/deadline fields):
+
+`probe TXID BOOT_UUID OPID32 DEADLINE_MS DATADEV DATAINO LOCKDEV LOCKINO`
+
+TXID is exactly 16 lowercase hexadecimal characters, OPID exactly 32. The absolute production deadline uses CLOCK_BOOTTIME and may be at most 6000 ms ahead; HOST_TEST uses CLOCK_MONOTONIC. JSONL schema is `e5-noreplace-probe-v1`; events are BEGIN, PHASE and RESULT. Only exit 0 plus RESULT complete=true/outcome=COMPLETED with all success flags and expected identities is native success. The independent host readback remains required.
+
+Production requires uid 0, `/data` F2FS, exact DATADEV/DATAINO and LOCKDEV/LOCKINO, same filesystem for the complete `/data/local/tmp/e5-clean-directory.lock` chain, no-follow opens, and a singleton regular mode-0600 owner file containing exactly TXID plus newline. The lock is uid-0/mode-0700. Each mutation checks current boot, the chain's identities and owner again. All three target names must initially be absent, including no dangling symlinks:
+
+- `probe-source.<txid>`: created empty mode 0700.
+- `probe-destination.<txid>`: created empty mode 0700.
+- `probe-renamed.<txid>`: initially absent; never independently created.
+
+The first no-replace rename attempts source→existing destination, requires EEXIST and both original empty inodes unchanged. The second attempts source→missing renamed, requires source absence and renamed preserving the original source inode, then directory and parent fsync. There is no overwrite-capable fallback. Linux uses renameat2(RENAME_NOREPLACE); Darwin HOST_TEST uses renameatx_np(RENAME_EXCL).
+
+Only the continuing successful path removes destination and renamed using rmdir semantics, immediately checking the expected identity and emptiness, then fsyncs the parent and rechecks all three names absent. On any failure, signal or deadline the program stops; it does not continue cleanup or undo prior actions. An error after one successful cleanup leaves the remaining directory. Any committed action before a lost acknowledgement is UNKNOWN; missing success is never permission to retry. SIGTERM/INT/HUP/PIPE installation failures are checked. Cancellation signals are masked only around the final pending-signal/deadline admission and individual mutation syscall, and checked again afterwards. Uninterruptible kernel I/O still cannot be guaranteed to complete within the deadline.
+
+The host wrapper's supplementary ordinary-file scope is `/data/local/tmp/e5-clean-noreplace-probe.<txid>` for this fourth helper, uploaded and hash/identity-verified separately. The native program never uploads itself, writes owner/configuration/partition data, runs a subprocess, reboots, changes `/data/e5linux`, or opens block devices. Host verification must independently confirm the same boot/A state, lock/data identities, owner and absent three names after success.
+
+The identity checks preceding rename/unlink are not an atomic inode lock. This probe relies on the single-operator transaction lock and absence of interfering root writers. It does not claim resistance to arbitrary concurrent privileged namespace mutation or prove whole-filesystem power-loss safety.
+
+Mac and local ARM Linux each passed 38 real temporary-filesystem tests, including malformed identity/owner/symlink/hardlink paths, pre-existing targets, EEXIST+missing-target success, TERM/INT/HUP, deadline, fsync faults and partial cleanup stop behavior. HOST_TEST is confined to canonical `/tmp/e5-noreplace-test-*/data` (Darwin `/private/tmp` equivalent), refuses `/data`, and uses synthetic boot evidence. The disabled production probe refuses before accessing device paths. The first Linux compile rejected nine compact lines for misleading indentation; only newlines were changed, the failure log is retained, and the suites then passed again. Static disabled output can optimize away production routines; HOST_TEST exercises routines but does not validate Android F2FS/SELinux or actual kernel support. The local Colima VM is stopped.

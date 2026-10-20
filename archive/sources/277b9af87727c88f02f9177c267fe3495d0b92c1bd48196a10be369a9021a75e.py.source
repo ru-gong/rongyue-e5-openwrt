@@ -1,0 +1,56 @@
+"""Host-only activation copy, not device execution. Default plan; reviewed pins required."""
+import sys
+def sentinel(event,args):
+    if event.startswith(('subprocess.','socket.','os.exec','os.spawn','os.posix_spawn')) or event=='os.system':
+        raise RuntimeError('external process/network forbidden')
+sys.addaudithook(sentinel)
+import hashlib,importlib.util,json,re
+from pathlib import Path
+HERE=Path(__file__).resolve().parent
+PREPARATION=Path(__file__).resolve().parents[2]/'tools/e5_lifecycle_bundle_prepare_20261016'
+GENERATOR_SHA='0'*64
+PREP_RESULT_SHA='0'*64
+PREP_MANIFEST_SHA='0'*64
+PREPARATION_REVIEW=None
+PREPARATION_REVIEW_SHA='0'*64
+sha=lambda raw:hashlib.sha256(raw).hexdigest()
+
+def load():
+    source=PREPARATION/'build_bundle.py'
+    if GENERATOR_SHA=='0'*64 or sha(source.read_bytes())!=GENERATOR_SHA:raise RuntimeError('generator not frozen')
+    spec=importlib.util.spec_from_file_location('_tmpfix_activation_generator',source)
+    module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+def create(confirmation,confirmation_sha):
+    b=load();a=b.a
+    a.need(PREP_RESULT_SHA!='0'*64 and PREP_MANIFEST_SHA!='0'*64 and PREPARATION_REVIEW_SHA!='0'*64 and PREPARATION_REVIEW is not None,'preparation review not frozen')
+    base=json.loads(a.read(PREPARATION/'prepared/RESULT.json',PREP_RESULT_SHA))
+    manifest=json.loads(a.read(PREPARATION/'MANIFEST.json',PREP_MANIFEST_SHA))
+    for item in manifest['files'].values():b.bound(item)
+    a.read(PREPARATION_REVIEW,PREPARATION_REVIEW_SHA)
+    request=json.loads(a.read(confirmation,confirmation_sha))
+    a.need(set(request)=={'schema','action','activation_id','prepared_result_sha256','prepared_manifest_sha256','review_sha256','confirmed_by','device_execution_authorized'},'copy confirmation fields')
+    a.need(request['schema']=='e5-lifecycle-host-copy-v1' and request['action']=='COPY_RESEALED_FOUR_PACKAGES_ONLY' and request['device_execution_authorized'] is False,'host-only copy scope')
+    a.need(request['prepared_result_sha256']==PREP_RESULT_SHA and request['prepared_manifest_sha256']==PREP_MANIFEST_SHA and request['review_sha256']==PREPARATION_REVIEW_SHA,'copy sources/review')
+    a.need(isinstance(request['confirmed_by'],str) and request['confirmed_by'].strip() and re.fullmatch('[a-f0-9]{16}',request['activation_id'] or ''),'named copy confirmation and unique ID')
+    cfg,_,_,_=b.load_inputs()
+    original={k:b.bound(v) for k,v in base['files'].items()}
+    ident=request['activation_id']
+    dest={group:b.ROOT/'tools'/(a.DEST_STEMS[group]+ident) for group in base['directories']}
+    resealed=b.reseal(original,base,dest,cfg,disabled=False)
+    for key,item in base['files'].items():a.need(b.bound(item)==original[key],'prepared source drift')
+    result=b.publish(resealed,original,b.ROOT/'tools'/('e5_activation_bundle_'+ident),{
+        'activation_id':ident,'host_writes_disabled':False,'observer_bytes_preserved_enabled_not_invoked':True,
+        'preparation_result':{'path':str(PREPARATION/'prepared/RESULT.json'),'sha256':PREP_RESULT_SHA},
+        'preparation_review':{'path':str(PREPARATION_REVIEW),'sha256':PREPARATION_REVIEW_SHA},
+        'host_copy_confirmation':{'path':str(Path(confirmation)),'sha256':confirmation_sha},
+        'enabled_copy_independent_review_required':True})
+    for key,item in base['files'].items():a.need(b.bound(item)==original[key],'prepared source drift during copy')
+    return {'activation_id':ident,'result_sha256':sha(a.encode(result)),'directories':result['directories'],'device_io_performed':False}
+
+def main(argv=None):
+    args=sys.argv[1:] if argv is None else argv
+    if args in ([],['plan']):return {'status':'PLAN_ONLY','copy_created':False,'device_io_performed':False,'review_bound':PREPARATION_REVIEW_SHA!='0'*64}
+    if len(args)==3 and args[0]=='copy':return create(Path(args[1]).absolute(),args[2])
+    raise SystemExit('plan | copy CONFIRMATION_JSON SHA256')
+if __name__=='__main__':print(json.dumps(main(),ensure_ascii=False,sort_keys=True))

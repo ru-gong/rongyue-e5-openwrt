@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Prepare fixed read-only requests or inspect saved stdout. No transport/execution API."""
+import argparse
+import json
+from pathlib import Path
+import re
+import uuid
+
+DEVICE_EXECUTION_IMPLEMENTED = False
+# Full scripts are DATA, intended for a separately reviewed root operator.
+# This file cannot run them: it imports no process, socket, USB or ADB interface.
+HEALTH_SCRIPT = r'''set -eu
+emit() { /system/bin/printf '%s\t%s\n' "$1" "$2"; }
+emit boot_id_start "$(/system/bin/cat /proc/sys/kernel/random/boot_id)"
+emit root_uid "$(/system/bin/id -u)"
+emit uptime "$(/system/bin/cat /proc/uptime)"
+emit serial "$(/system/bin/getprop ro.serialno)"
+emit model "$(/system/bin/getprop ro.product.model)"
+emit platform "$(/system/bin/getprop ro.board.platform)"
+emit build "$(/system/bin/getprop ro.build.display.id)"
+emit kernel "$(/system/bin/uname -r)"
+emit slot "$(/system/bin/getprop ro.boot.slot_suffix)"
+emit boot_completed "$(/system/bin/getprop sys.boot_completed)"
+emit verifiedbootstate "$(/system/bin/getprop ro.boot.verifiedbootstate)"
+emit flash_locked "$(/system/bin/getprop ro.boot.flash.locked)"
+emit sim_states "$(/system/bin/getprop gsm.sim.state)"
+emit ro_boot_reason "$(/system/bin/getprop ro.boot.bootreason)"
+emit sys_boot_reason "$(/system/bin/getprop sys.boot.reason)"
+emit zygote "$(/system/bin/getprop init.svc.zygote)"
+emit zygote_secondary "$(/system/bin/getprop init.svc.zygote_secondary)"
+emit surfaceflinger "$(/system/bin/getprop init.svc.surfaceflinger)"
+emit adbd "$(/system/bin/getprop init.svc.adbd)"
+emit data_mount "$(/system/bin/awk '$2 == "/data" { print $1 "|" $3 "|" $4 }' /proc/mounts)"
+emit monitor "$(/system/bin/cat /proc/monitor_enable)"
+emit boot_id_end "$(/system/bin/cat /proc/sys/kernel/random/boot_id)"
+'''
+FIXED_REQUESTS = [
+    {'id':'lightweight-health','privilege':'existing-authorized-root','script':HEALTH_SCRIPT,'max_output_bytes':16384,'host_deadline_seconds':8},
+    {'id':'pstore-console','privilege':'existing-authorized-root','script':'set -eu\n/system/bin/head -c 262144 /sys/fs/pstore/console-ramoops-0\n','max_output_bytes':262144,'host_deadline_seconds':8},
+    {'id':'pstore-dmesg','privilege':'existing-authorized-root','script':'set -eu\n/system/bin/head -c 1048576 /sys/fs/pstore/dmesg-ramoops-0\n','max_output_bytes':1048576,'host_deadline_seconds':8},
+    {'id':'crash-buffer','privilege':'existing-authorized-root','script':'set -eu\n/system/bin/logcat -b crash -d -t 200 -v threadtime\n','max_output_bytes':262144,'host_deadline_seconds':8},
+    {'id':'main-system-log','privilege':'existing-authorized-root','script':'set -eu\n/system/bin/logcat -b main -b system -d -t 1000 -v threadtime\n','max_output_bytes':1048576,'host_deadline_seconds':8},
+    {'id':'process-state','privilege':'existing-authorized-root','script':'set -eu\n/system/bin/ps -A -o PID,PPID,STAT,NAME,WCHAN\n','max_output_bytes':262144,'host_deadline_seconds':8},
+]
+
+KEYS = {'boot_id_start','root_uid','uptime','serial','model','platform','build','kernel','slot','boot_completed',
+        'verifiedbootstate','flash_locked','sim_states','ro_boot_reason','sys_boot_reason','zygote',
+        'zygote_secondary','surfaceflinger','adbd','data_mount','monitor','boot_id_end'}
+
+def require(ok, text):
+    if not ok: raise ValueError(text)
+
+def parse_health(text):
+    require(isinstance(text,str) and len(text.encode())<=16384,'health output oversize/type')
+    rows={}
+    for line in text.splitlines():
+        k,sep,v=line.partition('\t')
+        require(sep and k in KEYS and k not in rows,'unknown/duplicate/malformed field')
+        rows[k]=v
+    require(set(rows)==KEYS,'missing field')
+    boot=rows['boot_id_start'];require(str(uuid.UUID(boot))==boot and rows['boot_id_end']==boot,'boot changed in snapshot')
+    require(re.fullmatch(r'[0-9]+',rows['root_uid']) is not None,'UID malformed')
+    uptime=rows['uptime'].split();require(len(uptime)==2 and re.fullmatch(r'[0-9]+(?:\.[0-9]+)?',uptime[0]) is not None,'uptime malformed')
+    m=re.fullmatch(r'hang_detect_enabled:\s*([0-9]+)\s*,hang_detect_timeout\s*=\s*([0-9]+)\s*s\s+hang_detect_counter:\s*(-?[0-9]+)\s*',rows['monitor'])
+    require(m is not None,'unrecognized monitor output; do not infer healthy')
+    enabled,timeout,counter=map(int,m.groups())
+    require(enabled==1 and timeout>0 and counter>0,'monitor disabled/expired/invalid: stop')
+    require(rows['root_uid']=='0' and rows['slot']=='_a','not root Android A')
+    require(rows['boot_completed']=='1','boot not complete')
+    require(rows['zygote']=='running' and rows['surfaceflinger']=='running' and rows['adbd']=='running','core service not running')
+    mount=rows['data_mount'].split('|');require(len(mount)==3,'data mount missing/ambiguous')
+    require(mount[0]=='/dev/block/mmcblk0p70' and mount[1]=='f2fs' and 'rw' in mount[2].split(','),'unexpected data mount')
+    return {'boot_id':boot,'uptime_seconds':float(uptime[0]),'root_uid':int(rows['root_uid']),
+            'slot':rows['slot'],'boot_completed':True,'monitor':{'enabled':enabled,'timeout_seconds':timeout,'counter':counter},
+            'raw_fields':rows,'snapshot_only':True,'stable_over_time':False,'panic_root_cause_resolved':False,
+            'approved_to_restore':False}
+
+def plan():
+    return {'schema':'e5-android-triage-prepare-v1','device_execution_implemented':False,'approved_to_execute':False,
+            'scripts_are_data_only':True,'live_adb_argv':None,'requests':FIXED_REQUESTS,
+            'schedule':{'health_seconds_from_first_sample':list(range(0,601,30)),
+                        'first_health_after_cold_boot_uptime_max_seconds':120,
+                        'other_requests':'once after initial health; optional final capture only if responsive'},
+            'operator_enforced_bounds':['Run one request at a time; no unattended retry. Each timeout aborts the batch.',
+                'Deadlines/output limits are a contract for a future transport, NOT implemented enforcement here.',
+                'Use one fully quoted root shell, preserve exact stdout/stderr/exit/start/end timestamps and boot IDs.',
+                'User confirms no SIM and cold start; a new boot ID alone does not prove cold power removal.',
+                'Archive old pstore before interpreting new boot; presence of historical panic is not automatically a new panic.',
+                'Only after a reviewed ten-minute same-boot window should GPT/B/misc/protection reads be considered.',
+                'No block reads, partition writes, binder dumpsys calls, process signals, property/config writes, fsck, AT, monitor ioctls, reboot or watchdog bypass in this plan.'],
+            'handoff':'Use tools/e5_resume_prepare_20261013 only after separate fresh partition evidence and independent review; do not synthesize its risk/panic booleans from this parser.'}
+
+def main(argv=None):
+    ap=argparse.ArgumentParser(description=__doc__);ap.add_argument('mode',choices=['plan','parse-health']);ap.add_argument('--saved-stdout',type=Path);args=ap.parse_args(argv)
+    if args.mode=='plan':
+        require(args.saved_stdout is None,'plan takes no input');result=plan()
+    else:
+        p=args.saved_stdout;require(p is not None and p.is_file() and not p.is_symlink() and p.stat().st_size<=16384,'unsafe local stdout file')
+        result=parse_health(p.read_text())
+    print(json.dumps(result,ensure_ascii=False,indent=2));return 0
+
+if __name__=='__main__':raise SystemExit(main())

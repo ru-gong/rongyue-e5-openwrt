@@ -1,0 +1,175 @@
+"""Fake-transport tests; all real socket and child-process APIs are forbidden."""
+import ast
+import base64
+import contextlib
+import errno
+import io
+import json
+from pathlib import Path
+import socket
+import sys
+import unittest
+from unittest.mock import patch
+
+
+def deny_external(event, args):
+    if event.startswith("socket.") or event.startswith("subprocess.") or event in ("os.system", "os.exec", "os.posix_spawn", "pty.spawn"):
+        raise AssertionError("real external operation forbidden: " + event)
+
+
+sys.addaudithook(deny_external)
+import observer as o
+
+
+class Clock:
+    def __init__(self): self.ns = 123_000_000_000
+    def now(self): return self.ns
+    def advance(self, seconds): self.ns += int(seconds * 1_000_000_000)
+
+
+class FakeSocket:
+    def __init__(self, clock, chunks=(), connect_error=None):
+        self.clock, self.chunks, self.connect_error = clock, list(chunks), connect_error
+        self.closed, self.timeout, self.address = False, None, None
+        self.recv_calls, self.send_bytes = 0, 0
+    def connect(self, address):
+        self.address = address
+        if self.connect_error: raise self.connect_error
+    def settimeout(self, seconds):
+        assert seconds > 0
+        self.timeout = seconds
+    def recv(self, size):
+        self.recv_calls += 1
+        if not self.chunks:
+            self.clock.advance(self.timeout)
+            raise socket.timeout()
+        chunk = self.chunks.pop(0)
+        if isinstance(chunk, BaseException): raise chunk
+        if len(chunk) > size:
+            self.chunks.insert(0, chunk[size:])
+            chunk = chunk[:size]
+        return chunk
+    def close(self): self.closed = True
+    def send(self, data): self.send_bytes += len(data); raise AssertionError("send forbidden")
+    def sendall(self, data): self.send_bytes += len(data); raise AssertionError("sendall forbidden")
+    def sendmsg(self, *args): raise AssertionError("sendmsg forbidden")
+    def shutdown(self, *args): raise AssertionError("shutdown not part of observer")
+    def makefile(self, *args): raise AssertionError("socket file wrapper forbidden")
+
+
+class Tests(unittest.TestCase):
+    def capture(self, chunks=(), **kwargs):
+        c=Clock(); peer=FakeSocket(c,chunks); out=io.BytesIO(); calls=[]
+        def factory(*args):
+            calls.append(args); self.assertEqual(args,(socket.AF_UNIX,socket.SOCK_STREAM)); return peer
+        code=o.observe(out,socket_factory=factory,clock=c.now,utc=lambda:'2026-10-13T00:00:00.000000+00:00',sleep=c.advance,**kwargs)
+        rows=[json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertTrue(peer.closed);self.assertEqual(peer.send_bytes,0)
+        self.assertEqual(peer.address,b'\0modemd');self.assertEqual(len(calls),1)
+        self.assertEqual([r['seq'] for r in rows],list(range(len(rows))))
+        self.assertEqual(sorted(r['monotonic_ns'] for r in rows),[r['monotonic_ns'] for r in rows])
+        self.assertTrue(all(r['time_utc'] for r in rows))
+        return code,rows,out.getvalue(),peer,c
+
+    def test_fragmented_nul_and_nonutf8_exact_roundtrip(self):
+        chunks=[b'CP As',b'sert\x00rat,band',b'\x00\xff\xfe',b'\nDUMP COMPLETE\x00blocked',b'']
+        code,rows,raw,peer,c=self.capture(chunks)
+        rec=[r for r in rows if r['event']=='recv']
+        self.assertEqual([base64.b64decode(r['base64']) for r in rec],chunks[:-1])
+        self.assertEqual(b''.join(base64.b64decode(r['base64']) for r in rec),b''.join(chunks))
+        self.assertEqual(rows[-1]['reason'],'eof');self.assertEqual(code,0)
+
+    def test_eof_never_reconnects(self):
+        code,rows,raw,peer,c=self.capture([b''])
+        self.assertEqual(peer.recv_calls,1);self.assertEqual(rows[-1]['raw_bytes'],0)
+        self.assertEqual(rows[-1]['reason'],'eof')
+
+    def test_read_error_never_reconnects(self):
+        code,rows,raw,peer,c=self.capture([OSError(errno.ECONNRESET,'reset')])
+        self.assertEqual(code,4);self.assertEqual(rows[-1]['reason'],'receive_error')
+        self.assertEqual(peer.recv_calls,1)
+
+    def test_connect_failures_bounded_and_zero_sends(self):
+        c=Clock();peers=[];out=io.BytesIO()
+        def factory(*args):
+            s=FakeSocket(c,connect_error=OSError(errno.ECONNREFUSED,'no listener'));peers.append(s);return s
+        code=o.observe(out,socket_factory=factory,clock=c.now,utc=lambda:'UTC',sleep=c.advance)
+        rows=[json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertEqual(code,3);self.assertEqual(len(peers),5)
+        self.assertTrue(all(p.closed and p.send_bytes==0 and p.recv_calls==0 for p in peers))
+        self.assertEqual(rows[-1]['reason'],'connection_failed')
+
+    def test_connect_wait_stops_at_deadline(self):
+        c=Clock();out=io.BytesIO();peers=[]
+        def factory(*args):
+            s=FakeSocket(c,connect_error=OSError(errno.ECONNREFUSED,'refused'));peers.append(s);return s
+        o.observe(out,duration=.25,socket_factory=factory,clock=c.now,utc=lambda:'UTC',sleep=c.advance)
+        self.assertEqual(len(peers),1);self.assertEqual(c.ns,123_250_000_000)
+        self.assertEqual(json.loads(out.getvalue().splitlines()[-1])['reason'],'duration_limit')
+
+    def test_failed_connect_then_success_no_reconnect_after_eof(self):
+        c=Clock();out=io.BytesIO();peers=[]
+        def factory(*args):
+            s=FakeSocket(c,[b'event\0',b''],OSError(errno.ECONNREFUSED,'absent') if not peers else None)
+            peers.append(s);return s
+        code=o.observe(out,socket_factory=factory,clock=c.now,utc=lambda:'UTC',sleep=c.advance)
+        rows=[json.loads(x) for x in out.getvalue().splitlines()]
+        self.assertEqual(code,0);self.assertEqual(len(peers),2)
+        self.assertTrue(all(s.closed and s.send_bytes==0 for s in peers))
+        self.assertEqual(rows[-1]['reason'],'eof')
+        self.assertEqual(rows[-1]['connect_attempts'],2)
+
+    def test_stdout_failure_closes_without_reconnect(self):
+        c=Clock();peer=FakeSocket(c,[b'notification'])
+        class BrokenSink(io.BytesIO):
+            def write(self,data):
+                if b'"event":"recv"' in data: raise BrokenPipeError()
+                return super().write(data)
+        out=BrokenSink()
+        with self.assertRaises(BrokenPipeError):
+            o.observe(out,socket_factory=lambda *args:peer,clock=c.now,utc=lambda:'UTC',sleep=c.advance)
+        self.assertTrue(peer.closed);self.assertEqual(peer.send_bytes,0)
+        self.assertNotIn(b'"event":"end"',out.getvalue())
+
+    def test_time_limit_on_silent_peer(self):
+        code,rows,raw,peer,c=self.capture([],duration=2.25)
+        self.assertEqual(code,0);self.assertEqual(rows[-1]['reason'],'duration_limit')
+        self.assertEqual(c.ns,125_250_000_000);self.assertEqual(peer.recv_calls,3)
+
+    def test_exact_raw_limit_preserves_read_bytes(self):
+        code,rows,raw,peer,c=self.capture([b'x'*10000],max_raw=5001)
+        data=b''.join(base64.b64decode(r['base64']) for r in rows if r['event']=='recv')
+        self.assertEqual(data,b'x'*5001);self.assertEqual(rows[-1]['raw_bytes'],5001)
+        self.assertEqual(rows[-1]['reason'],'raw_limit');self.assertEqual(peer.recv_calls,2)
+
+    def test_output_budget_stops_before_unlogged_recv(self):
+        code,rows,raw,peer,c=self.capture([b'\0'*20000],max_output=4096)
+        rec=[r for r in rows if r['event']=='recv'];data=b''.join(base64.b64decode(r['base64']) for r in rec)
+        self.assertLessEqual(len(raw),4096);self.assertEqual(rows[-1]['reason'],'output_limit')
+        self.assertEqual(len(data),rows[-1]['raw_bytes']);self.assertEqual(len(rec),peer.recv_calls)
+        self.assertEqual(data,b'\0'*len(data));self.assertGreater(len(data),0)
+
+    def test_cancel_closes_peer_and_records_stop(self):
+        code,rows,raw,peer,c=self.capture([KeyboardInterrupt()])
+        self.assertEqual(code,130);self.assertEqual(rows[-1]['reason'],'cancelled')
+
+    def test_invalid_limits_before_socket(self):
+        for args in [(0,1,4096),(601,1,4096),(float('nan'),1,4096),(1,0,4096),(1,1048577,4096),(1,1,4095),(1,1,2097153)]:
+            with self.subTest(args=args),self.assertRaises(ValueError):
+                o.observe(io.BytesIO(),*args,socket_factory=lambda *a: self.fail('socket constructed'))
+
+    def test_preparation_cli_hard_gate_and_contract(self):
+        with contextlib.redirect_stdout(io.StringIO()) as output,patch.object(o,'observe',side_effect=AssertionError('engine must not run')):
+            self.assertEqual(o.main(['observe']),2)
+            self.assertEqual(o.main(['contract']),0)
+        self.assertIn('PREPARATION_HARD_DISABLED',output.getvalue())
+
+    def test_production_ast_has_only_receive_transport_operations(self):
+        tree=ast.parse(Path(o.__file__).read_text())
+        calls={n.func.attr for n in ast.walk(tree) if isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and isinstance(n.func.value,ast.Name) and n.func.value.id=='peer'}
+        self.assertEqual(calls,{'settimeout','connect','recv','close'})
+        self.assertFalse(any(isinstance(n,ast.Call) and isinstance(n.func,ast.Attribute) and n.func.attr in {'send','sendall','sendto','sendmsg','shutdown','makefile','writev'} for n in ast.walk(tree)))
+        self.assertFalse(any(isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id in {'open','exec','eval'} for n in ast.walk(tree)))
+
+
+if __name__=='__main__': unittest.main(verbosity=2)

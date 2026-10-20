@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""LIVE ordinary-file plaintext/persistence acceptance; root operator only.
+
+before creates one fixed directory and two regular files. after is device-read
+only. Neither mode formats, writes block devices, retries, removes, or reboots.
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+
+WORK = Path(__file__).resolve().parents[2]
+CORE = WORK / "tools/e5_android_install_live_20261013/e5_install.py"
+CORE_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+ADB = Path("/opt/homebrew/Caskroom/android-platform-tools/37.0.1/platform-tools/adb")
+ADB_SHA = "0000000000000000000000000000000000000000000000000000000000000000"
+REMOTE = "/data/local/tmp/e5-plaintext-verify-20261013"
+PROBE = REMOTE + "/fscrypt-policy-probe"
+NONCE = REMOTE + "/nonce.bin"
+NONCE_BYTES = 4096
+
+
+def load_core():
+    if CORE.is_symlink() or hashlib.sha256(CORE.read_bytes()).hexdigest() != CORE_SHA:
+        raise RuntimeError("frozen backend changed; no device access")
+    spec = importlib.util.spec_from_file_location("e5_plaintext_frozen_core", CORE)
+    e = importlib.util.module_from_spec(spec); spec.loader.exec_module(e)
+    e.require(e.LIVE_DISABLED is False, "wrong backend gate")
+    return e
+
+
+def probe_bytes(e):
+    data = e.regular(CORE.parent / "fscrypt-policy-probe").read_bytes()
+    e.require(e.digest(data) == e.PROBE_SHA256, "static probe changed")
+    return data
+
+
+def state(e, d):
+    boot_id = d.shell("cat /proc/sys/kernel/random/boot_id").decode().strip()
+    e.require(re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",boot_id), "invalid kernel boot_id")
+    mounts = d.shell("cat /proc/mounts").decode()
+    rows = [x.split() for x in mounts.splitlines() if len(x.split())>=4 and x.split()[1]=="/data"]
+    e.require(len(rows)==1 and rows[0][2]=="f2fs" and "rw" in rows[0][3].split(","), "data is not rw F2FS")
+    # Mount source text is untrusted: use the audited quoting helper.
+    source = d.shell("readlink -f " + e.shlex.quote(rows[0][0])).decode().strip()
+    e.require(source == "/dev/block/mmcblk0p70", "data is not bare p70")
+    crypto = {k:d.shell("getprop "+k).decode().strip() for k in
+              ("ro.crypto.state","ro.crypto.type","ro.crypto.metadata.enabled")}
+    return {"boot_id":boot_id,"mount":rows[0],"resolved_data_source":source,"crypto_properties":crypto}
+
+
+def policies(e, d):
+    for path in ("/data/local/tmp", REMOTE):
+        d.shell(f"test -d {path}; test ! -L {path}; test \"$(readlink -f {path})\" = {path}")
+    d.verify_file(PROBE,len(probe_bytes(e)),e.PROBE_SHA256)
+    result = {}
+    # /data/ is deliberate: the fixed C probe accepts /data/ paths, not /data.
+    for path in ("/data/", "/data/local/tmp/", REMOTE, NONCE):
+        output = d.shell(PROBE+" "+path).strip()
+        e.require(output==b"unencrypted", "fscrypt policy is encrypted or unknown: "+path)
+        result[path] = "ENODATA:unencrypted"
+    return result
+
+
+def new_journal(e, evidence):
+    evidence = Path(evidence); evidence.mkdir(mode=0o700,parents=False,exist_ok=False)
+    e.fsync_directory(evidence.parent);e.fsync_directory(evidence)
+    return evidence,e.Journal(evidence/"journal.jsonl")
+
+
+def before(e,d,evidence):
+    profile = e.load_profile(); data = probe_bytes(e)
+    evidence,j = new_journal(e,evidence)
+    try:
+        j.event("START_ORDINARY_FILES_ONLY",serial=e.SERIAL,remote_directory=REMOTE)
+        d.preflight()
+        initial = state(e,d)
+        nonce = os.urandom(NONCE_BYTES); nonce_sha = e.digest(nonce)
+        e.durable_write(evidence/"nonce.bin",nonce)
+        e.require((evidence/"nonce.bin").read_bytes()==nonce,"host nonce persistence mismatch")
+        d.shell(f"test -d /data/local/tmp; test ! -L /data/local/tmp; "
+                f"test \"$(readlink -f /data/local/tmp)\" = /data/local/tmp; "
+                f"test ! -e {REMOTE}; test ! -L {REMOTE}; umask 077; mkdir {REMOTE}")
+        for target,payload,mode in ((PROBE,data,"700"),(NONCE,nonce,"600")):
+            d.shell(f"test ! -e {target}; test ! -L {target}; umask 077; cat > {target}; chmod {mode} {target}; sync",payload)
+            d.verify_file(target,len(payload),e.digest(payload))
+        checks = policies(e,d)
+        e.require(d.shell("cat "+NONCE)==nonce,"nonce binary readback mismatch")
+        final = state(e,d)
+        e.require(final["boot_id"]==initial["boot_id"],"reboot happened during before check")
+        e.require(d.protected_hashes()==profile["protected_hashes"],"protected chain changed")
+        proof={"schema":1,"status":"BEFORE_PASSED_REBOOT_REQUIRED","serial":e.SERIAL,
+               "helper_sha256":e.file_hash(Path(__file__)),"core_sha256":CORE_SHA,
+               "profile_sha256":e.PROFILE_SHA256,"probe_sha256":e.PROBE_SHA256,
+               "remote_directory":REMOTE,"nonce_bytes":NONCE_BYTES,"nonce_sha256":nonce_sha,
+               "state":final,"policies":checks,"protected_hashes":profile["protected_hashes"]}
+        raw=(json.dumps(proof,indent=2)+"\n").encode()
+        e.durable_write(evidence/"before.json",raw)
+        j.event("COMPLETE_BEFORE_NO_REBOOT",before_sha256=e.digest(raw))
+        return {"before_manifest":str(evidence/"before.json"),"sha256":e.digest(raw),"status":proof["status"]}
+    except BaseException as error:
+        j.event("STOP_NO_RETRY_NO_REBOOT",error_type=type(error).__name__,reason=str(error));raise
+    finally:j.close()
+
+
+def load_before(e,path,sha):
+    path=e.regular(path);p=e.pinned_json(path,sha);profile=e.load_profile()
+    e.require(p["schema"]==1 and p["status"]=="BEFORE_PASSED_REBOOT_REQUIRED" and p["serial"]==e.SERIAL,
+              "invalid before identity/status")
+    e.require(p["helper_sha256"]==e.file_hash(Path(__file__)) and p["core_sha256"]==CORE_SHA and
+              p["profile_sha256"]==e.PROFILE_SHA256 and p["probe_sha256"]==e.PROBE_SHA256,
+              "before source/probe binding changed")
+    e.require(p["remote_directory"]==REMOTE and p["nonce_bytes"]==NONCE_BYTES and
+              p["protected_hashes"]==profile["protected_hashes"],"before scope/profile mismatch")
+    nonce=e.regular(path.parent/"nonce.bin").read_bytes()
+    e.require(len(nonce)==NONCE_BYTES and e.digest(nonce)==p["nonce_sha256"],"host nonce changed")
+    return p,nonce
+
+
+def after(e,d,proof,nonce,evidence):
+    evidence,j=new_journal(e,evidence)
+    try:
+        j.event("START_AFTER_DEVICE_READ_ONLY",serial=e.SERIAL)
+        d.preflight()
+        initial=state(e,d)
+        e.require(initial["boot_id"]!=proof["state"]["boot_id"],"same kernel boot_id: reboot not witnessed")
+        d.verify_file(NONCE,NONCE_BYTES,proof["nonce_sha256"])
+        e.require(d.shell("cat "+NONCE)==nonce,"nonce did not survive unchanged")
+        checks=policies(e,d)
+        final=state(e,d)
+        e.require(final["boot_id"]==initial["boot_id"],"reboot during after check")
+        e.require(d.protected_hashes()==proof["protected_hashes"],"protected chain changed")
+        result={"status":"PLAINTEXT_AND_REBOOT_PERSISTENCE_VERIFIED","serial":e.SERIAL,
+                "before_boot_id":proof["state"]["boot_id"],"state":final,"policies":checks,
+                "nonce_sha256":proof["nonce_sha256"],"protected_13_unchanged":True,
+                "device_block_writes":False,"reboot_performed_by_helper":False,
+                "scope":"This data root and test file; not all Android app directories or long-term F2FS stability"}
+        e.durable_write(evidence/"result.json",(json.dumps(result,indent=2)+"\n").encode())
+        j.event("COMPLETE_AFTER_DEVICE_READ_ONLY")
+        return result
+    except BaseException as error:
+        j.event("STOP_NO_RETRY_NO_REBOOT",error_type=type(error).__name__,reason=str(error));raise
+    finally:j.close()
+
+
+def main():
+    ap=argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("mode",choices=("before","after"));ap.add_argument("--evidence",required=True,type=Path)
+    ap.add_argument("--before",type=Path);ap.add_argument("--before-sha256")
+    args=ap.parse_args()
+    if args.mode=="after" and (args.before is None or args.before_sha256 is None):ap.error("after requires --before and --before-sha256")
+    e=load_core();profile=e.load_profile();probe_bytes(e)
+    old=load_before(e,args.before,args.before_sha256) if args.mode=="after" else None
+    d=e.AdbBackend(ADB,ADB_SHA,profile)
+    result=before(e,d,args.evidence) if args.mode=="before" else after(e,d,*old,args.evidence)
+    print(json.dumps(result,indent=2))
+
+
+if __name__=="__main__":main()

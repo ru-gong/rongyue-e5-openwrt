@@ -1,0 +1,3 @@
+# Enabled SIM copy
+
+Only observe/rearm/sim_nv gates are enabled. Generic recovery remains disabled and rejects. Source README/tests describe the historical preparation package; do not run its disabled-gate test suite against this live copy. No field request/review was created. Actual first-install, no-SIM overall acceptance, fresh SIM cold/NV/network evidence and independent BC32 review remain mandatory. No automatic reboot/retry.

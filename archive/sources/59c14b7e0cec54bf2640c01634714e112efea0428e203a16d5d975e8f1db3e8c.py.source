@@ -1,0 +1,81 @@
+"""Temporary synthetic state only; no device/process/network operations."""
+import importlib.util,json,unittest
+from pathlib import Path
+from unittest.mock import patch
+import closure as c
+p=c.ROOT/'tools/e5_closed_fd_stop_prepare_20261019/test_closure.py';sp=importlib.util.spec_from_file_location('_old_fixture_only',p);old=importlib.util.module_from_spec(sp);sp.loader.exec_module(old)
+class Fixture(old.Fixture):
+ def __init__(self):
+  super().__init__();v=self.case;v['schema']='e5-fixed-newslot-stage-stop-case-v1';v['large_files']={};v['phases']={'scanner':{'directory':'deployment','operations':v['deployment_operations']},'resume-stage':{'directory':'probe','operations':v['operations']}}
+  n=v['failed_scanner_result'];n.update(fds=4900,pid=1233,fd=248,fd_closed_observed=3,fd_closed_confirmed=0,detail='fd-final-coverage-new-slot');q=self.root/v['operations'][-1]['folder'];raw=c.encoded({'event':'PHASE'})*7+c.encoded(n);(q/'stdout.bin').write_bytes(raw);r=json.loads((q/'transport-result.json').read_bytes());r.update(stdout_bytes=len(raw),stdout_sha256=c.sha(raw));(q/'transport-result.json').write_bytes(c.encoded(r))
+  review={'decision':'STOP_DEVICE_OPERATIONS_NO_AUTOMATIC_RETRY','phase_mutations_dispatched':0,'block_writes_dispatched':False};self.save('probe/REVIEW.json',review);v['review']['sha256']=c.sha(c.encoded(review));self.reindex();self.e=c._Case(self.root,v,c.sha(c.encoded(v)),fixture=True);self.e.parent_view=old_view=self.e.parent_view or getattr(self,'prior',None)
+  # The prior view is held on the engine built by the original fixture.
+ def reindex(self):
+  if hasattr(self,'e') and self.e.parent_view is not None:self.saved_prior=self.e.parent_view
+  super().reindex()
+ def make(self):self.e.parent_view=self.saved_prior;return self.e
+class Tests(unittest.TestCase):
+ def setUp(self):self.f=Fixture();self.addCleanup(self.f.tmp.cleanup);self.e=self.f.make()
+ def test_full_raw_history_verified(self):self.assertEqual(self.e.verify()['last_phase_mutations'],0)
+ def test_close_preserves_markers_prior_and_ledger(self):
+  markers={n:(self.f.state/n).read_bytes() for n in c.MARKERS};ledger=self.e.ledger.read_bytes();prior=(self.f.state/'RECOVERY_PENDING.json').read_bytes();self.e.close()
+  for n,b in markers.items():self.assertEqual((self.e.archive/n).read_bytes(),b);self.assertFalse((self.f.state/n).exists())
+  self.assertEqual(self.e.ledger.read_bytes(),ledger);self.assertEqual((self.f.state/'RECOVERY_PENDING.json').read_bytes(),prior);self.assertTrue((self.f.state/c.PENDING).exists())
+ def test_disabled_before_lock(self):
+  self.e.fixture=False
+  with self.assertRaises(c.Refusal):self.e.close()
+  self.assertFalse((self.f.root/'GLOBAL.lock').exists())
+ def test_repeat_default_refused(self):
+  self.e.close()
+  with self.assertRaises(c.Refusal):self.e.close()
+ def test_exact_explicit_resume(self):self.assertEqual(self.e.close(),self.e.close(resume=True))
+ def test_new_completion_refused(self):
+  self.f.save('state/completed/foreign.json',{})
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_raw_change_refused(self):
+  self.f.save(self.f.case['deployment_operations'][0]['folder']+'/stdout.bin',b'changed')
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_new_mutation_on_failed_phase_refused(self):
+  op=self.f.case['operations'][0];p=self.f.root/op['folder']/'IN_FLIGHT.json';v=json.loads(p.read_bytes());v['mutating']=True;p.write_bytes(c.encoded(v));self.f.reindex()
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_timeout_not_settled(self):
+  op=self.f.case['operations'][-1];p=self.f.root/op['folder']/'transport-result.json';v=json.loads(p.read_bytes());v['failure']='timeout';p.write_bytes(c.encoded(v));self.f.reindex()
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_native_other_error_refused(self):
+  self.f.case['failed_scanner_result']['errno']=13
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_failed_phase_not_success(self):
+  self.f.save('probe/COMPLETE.json',{'complete':True});self.f.reindex()
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_prior_barrier_change_refused(self):
+  self.f.save('state/RECOVERY_PENDING.json',{'changed':True})
+  with self.assertRaises(c.Refusal):self.e.verify()
+ def test_retired_tx_refused_same_boot_new_tx_allowed(self):
+  v=self.e.close();c.assert_new_identity(v,self.f.case['boot_id'],'f'*16)
+  with self.assertRaises(c.Refusal):c.assert_new_identity(v,self.f.case['boot_id'],self.f.case['txid'])
+ def test_new_recovery_blocks_close(self):
+  self.f.save('state/'+c.TRANSITION,{})
+  with self.assertRaises(c.Refusal):self.e.close()
+ def test_fixture_real_root_refused(self):
+  with self.assertRaises(c.Refusal):c._Case(c.ROOT,self.f.case,'0'*64,fixture=True)
+ def test_large_file_verified(self):
+  p=self.f.root/'large';p.write_bytes(b'content');c.verify_large(p,self.f.pin(p))
+ def test_large_wrong_hash_refused(self):
+  p=self.f.root/'large';p.write_bytes(b'content')
+  with self.assertRaises(c.Refusal):c.verify_large(p,{'bytes':7,'sha256':'0'*64})
+ def test_large_symlink_refused(self):
+  p=self.f.root/'link';p.symlink_to(self.f.root/'probe/REVIEW.json')
+  with self.assertRaises(c.Refusal):c.verify_large(p,{'bytes':0,'sha256':'0'*64})
+ def test_interrupted_marker_rename_resumes_same_case(self):
+  def fail(n):
+   if n=='after_ACTIVE.json':raise RuntimeError('interrupted')
+  self.e.fault=fail
+  with self.assertRaises(RuntimeError):self.e.close()
+  self.assertTrue((self.f.state/c.PENDING).exists());self.assertFalse((self.e.archive/c.RECEIPT).exists());self.e.fault=None;self.e.close(resume=True)
+ def test_no_receipt_before_final_sync(self):
+  def fail(n):
+   if n=='before_receipt':raise RuntimeError('stop before receipt')
+  self.e.fault=fail
+  with self.assertRaises(RuntimeError):self.e.close()
+  self.assertTrue((self.f.state/c.PENDING).exists());self.assertFalse((self.e.archive/c.RECEIPT).exists())
+if __name__=='__main__':unittest.main(verbosity=2)

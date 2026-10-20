@@ -1,0 +1,44 @@
+"""Local regular-file tests only. Never executes init or any device command."""
+from pathlib import Path
+import hashlib
+import re
+import shutil
+import struct
+import subprocess
+import tempfile
+import unittest
+import e5_install as e
+
+class PersistCapTests(unittest.TestCase):
+    def test_patch_applies_to_fixed_init_without_touching_build_tree(self):
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td);(p/"boot").mkdir()
+            shutil.copyfile(e.ROOT/"upstream/boot/init",p/"boot/init")
+            result=subprocess.run(["patch","--dry-run","-p1","-i",str(e.ROOT/"boot-init-persist-cap.patch")],cwd=p,capture_output=True)
+            self.assertEqual(result.returncode,0,result.stderr.decode()+result.stdout.decode())
+    def test_local_dd_enforces_end_even_with_oversized_input(self):
+        # Invoke the system dd utility on isolated regular files, not the init.
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td);target=p/"fake-boot-file";source=p/"oversized-log"
+            target.write_bytes(b"A"*(64<<20));source.write_bytes(b"L"*(8<<20))
+            argv=["dd",f"if={source}",f"of={target}","bs=4096","seek=14336","count=1024","conv=notrunc"]
+            result=subprocess.run(argv,capture_output=True)
+            self.assertEqual(result.returncode,0)
+            data=target.read_bytes();self.assertEqual(len(data),64<<20)
+            self.assertEqual(data[:56<<20],b"A"*(56<<20))
+            self.assertEqual(data[56<<20:60<<20],b"L"*(4<<20))
+            self.assertEqual(data[60<<20:],b"A"*(4<<20))
+    def test_failed_input_does_not_extend_or_modify_target(self):
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td);target=p/"fake-boot-file";target.write_bytes(b"unchanged")
+            result=subprocess.run(["dd",f"if={p/'missing'}",f"of={target}","bs=4096","seek=14336","count=1024","conv=notrunc"],capture_output=True)
+            self.assertNotEqual(result.returncode,0);self.assertEqual(target.read_bytes(),b"unchanged")
+    def test_layout_guard_rejects_payload_over_log_start(self):
+        with tempfile.TemporaryDirectory() as td:
+            p=Path(td)/"synthetic-boot";data=bytearray(64<<20);data[:8]=b"ANDROID!"
+            struct.pack_into("<II",data,8,56<<20,4096);struct.pack_into("<I",data,40,4)
+            data[-64:-60]=b"AVBf";original=4096+(56<<20)+4096
+            struct.pack_into(">QQQ",data,len(data)-64+12,original,original,4096);p.write_bytes(data)
+            with self.assertRaises(e.Refusal):e.validate_boot_layout(p)
+
+if __name__=="__main__":unittest.main(verbosity=2)

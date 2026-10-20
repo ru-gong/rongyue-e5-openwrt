@@ -1,0 +1,21 @@
+"""Real frozen adapter contract check; external processes/network forbidden."""
+import hashlib,json,sys,threading,time,types
+from pathlib import Path
+H=Path(__file__).resolve().parent;R=H.parents[1];CORE=R/'tools/e5_nextphase_core_live_69b2a5b04287f071'
+def audit(event,args):
+ if event.startswith(('subprocess.','os.system','os.exec','os.posix_spawn','socket.')):raise RuntimeError('host-only audit denied '+event)
+sys.addaudithook(audit);sys.path.insert(0,str(H));import resume as r
+c=r.setup();mfest=json.loads((H/'MANIFEST.json').read_bytes())
+for n,b in mfest['source_pins'].items():assert hashlib.sha256((H/n).read_bytes()).hexdigest()==b['sha256']
+assert (H/'resume_enabled.py').read_bytes()==(H/'resume.py').read_bytes().replace(b'DEVICE_RESUME_ENABLED=False',b'DEVICE_RESUME_ENABLED=True')
+state=R/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED';ledger=R/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+def snapshot():
+ return {'markers':{p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in state.glob('*.json')},'completions':sorted(p.name for p in (state/'completed').iterdir()),'ledger':hashlib.sha256(ledger.read_bytes()).hexdigest()}
+before=snapshot();sys.path.insert(0,str(CORE));fam=r.obj(c.c['source_family']);w=r.load('_smoke_workflow',CORE/'workflow.py',fam['files']['core/workflow.py']['sha256']);m=w.verify_materials();m['_bound_manifest_sha256']=w.MANIFEST_SHA;w.verify_support_bindings(m);mods=w.load_modules(m)
+a=w.make_adapter(mods,m,{'txid':c.c['txid'],'boot_id':c.c['boot_id']},H/'never-created-smoke-evidence',threading.Event(),time.monotonic()+30)
+a.transport=types.SimpleNamespace(recovery_context=None,reconciliation_only=False,state=state,serial=w.SERIAL,boot_id=a.boot_id,txid=a.txid)
+fixed=r.load('_smoke_fixed',H/'bounded_stage_fixed.py',r.FIXED_STAGE_SHA)
+make=lambda n:mods['android_directory_adapter'].Artifact(Path(m['stage_inputs'][n]['path']),m['stage_inputs'][n]['bytes'],m['stage_inputs'][n]['sha256'])
+stage=fixed.BoundedStage(a);module,t=stage._contract({n:make(n) for n in mods['android_directory_adapter'].STAGE_INPUTS},make('openwrt.ext4'));assert module is mods['android_directory_adapter'];assert t is a.transport
+assert before==snapshot();assert not (H/'never-created-smoke-evidence').exists()
+print(json.dumps({'host_materials_and_real_adapter_contract':'PASS','external_processes_and_network':'denied','enabled_copy_gate_only':True,'device_state_and_ledger_unchanged':True,'real_device_io':False,'all_materials_verified':True},sort_keys=True))

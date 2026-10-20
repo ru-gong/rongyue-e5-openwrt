@@ -1,0 +1,71 @@
+# v3 有界文件适配器与持久传输边界
+
+这是离线准备版本。`android_directory_adapter.DEVICE_IO_DISABLED=True`，没有 CLI 或环境变量启用方式；默认导入/主入口不连接设备。原 v1/v2 未改。构造器仅绑定 Artifact 与计划，不触发设备 I/O：
+
+```
+AndroidDirectoryAdapter(adb, helper, txid, boot_id,
+    scanner=scanner_artifact, io_helper=io_artifact,
+    evidence_dir=new_host_directory,
+    cancel_event=threading.Event(), transaction_deadline=host_monotonic_deadline)
+```
+
+公共方法保持 acquire/upload_helper/stage/inspect/inventory_optional/backup_to_mac/check_baseline/fresh_gate/seal/move。stage 可额外接收已经核实的 `raw_image=Artifact(...)`；否则在 Mac 将固定 gzip 流式解压到新文件，完整核 2 GiB 大小和固定 SHA 后才创建设备 stage。旧 `_shell` 任意脚本入口已关闭，内部固定操作通过私有 `_request`。没有块分区写入、reboot、删除目录、自动回滚或自动重试 API。
+
+每请求最长 8 秒、输入最多 4 MiB、输出最多 16 MiB＋64 KiB、stderr 16 KiB。stdin 以 64 KiB 非阻塞渐进发送；stdout/stderr 同时按上限读取，不用 communicate 装入整个镜像。超时、SIGINT/SIGTERM、cancel_event、事务总截止、短输入/输出、错误退出码或任何 stderr 均停止。主机进程组被终止并有限等待回收；这不证明远端 syscall 已停止，远端状态仍可为 UNKNOWN。进程创建本身依赖主机 OS，不能声称内核阻塞的 spawn/kill/fsync 可被 Python 强制中断。
+
+`BoundedTransport.request(label, argv, payload=..., output_limit=..., validator=..., mutating=False, deadline_s=8, op_id=..., transaction_deadline=..., metadata=..., followup=...)` 在启动前写入并 fsync IN_FLIGHT。mutating 必须有 followup；初始 ACK 仅是中间结果。followup 接收 `(parsed_ack, request_part)`，其独立短读只记录 PART_VERIFIED，不释放 ACTIVE。全部读回与校验通过后才写 COMPLETE；丢 ACK、读回错误或后置主机校验失败均毒化实例并落持久 UNCERTAIN。
+
+生产共享状态固定为 `evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED/`。包含 `STATE_BINDING.json`、host flock 的 `LOCK`、操作中的 `ACTIVE.json`、未知后的 `UNCERTAIN.json`、以及 `completed/<op_id>.json`。任一 ACTIVE/UNCERTAIN（包括悬空链接）会阻止同目录的新实例；不能通过换 evidence 目录绕过。每次操作的脚本/argv SHA、输入 SHA/字节数、boot/serial/tx/op ID、原始两流、计时、传输结果和部分读取留在独立证据目录。成功只移除当前 ACTIVE 标记，原始 IN_FLIGHT 永久留在操作证据目录；未知标记没有清除 API。独立只读 reconciliation 与一次性恢复 grant 由根线程另外实现、审查，不是本模块提供的自由 override。
+
+读取采用固定 shell -T、root 引号、pipefail 和含 op/boot/path/offset/length/stat 的精确二进制封套。每段最多 16 MiB，另一个短请求读取同段并 SHA 对照；主机合并完整 SHA。baseline 只读原 B/misc/13 保护分区及固定 GPT 前缀；geometry 分分区短读。inspect 先后完整 metadata 清单一致且两次原生占用扫描成功，才返回原 session 的 inventory schema。
+
+inspect 可复用本实例已完整双读的文件 SHA：键绑定 boot ID、完整 stat（dev/inode/size/mode/uid/gid/nlink/mtime/ctime 的精确文本，包括纳秒、rdev/type），不含路径以支持同 inode rename。任一同 inode 元数据变化或错误清除缓存；新进程/新 boot 不继承缓存，也没有外部缓存导入入口。写后读回与 backup 不用缓存。它仍不是原子快照或对不可观察并发修改的证明，必须结合新鲜占用扫描。
+
+`backup_to_mac` 分块读取并二读 SHA 到新主机文件，再纯主机生成 tar、独立逐成员核 contents/type/uid/gid/mode。保留空目录；失败保留部分主机证据。外层 xattr/ACL/SELinux/atime 不承诺恢复，镜像内部元数据随原始字节保全。设备不再运行整 2 GiB sha/gzip/tar 请求。
+
+stage 仅固定 8 项候选。普通文件每块最多 4 MiB，通过根线程的 native_io `write-file`：先接收整块并核短远端期限，再固定 stage 内 O_EXCL 首块/O_NOFOLLOW 后续块、inode/offset/size 校验、fsync。主机同一持久操作内做独立字节读回与再次 SHA，再接受该块完成。首块已有文件、错 inode、短写、坏 ACK 都不会覆盖重试。scanner/helper/io 小程序只允许经 bounded bootstrap 上传到固定 localtmp 名称；bootstrap 超时亦 UNKNOWN，不续传。每次调用 scanner/io/helper 前核相应上传文件 SHA。
+
+全进程 mount/FD/cwd/root 和 global loop 清场由独立原生 scanner 保留，不能用只读备份 v2 的缩减扫描替代。scanner、rename helper 和 native_io 均另有短远端 BOOTTIME 期限和信号检查；seal/rename 调用必须使用本轮固定协议。rename helper 的 no-replace 与取消后 UNKNOWN 语义由其独审负责；host 不承诺 kill 保证阻塞 syscall 消失。
+
+本模块 22 项真实主机管道测试＋20 项 fake/临时文件测试通过。测试分别运行，测试审计钩子禁止真实设备/网络；临时文件写只在 host fixtures。实际多 GiB 全流性能、Android native ABI、实时 scanner coverage、文件系统 fsync 和现场冷启动/原 B/misc 门仍需未来明确批准下验证。本轮没有设备/VM 调用。不能把离线测试当成已刷写或已验证实机恢复。
+
+## Reviewed recovery transition hooks (still no device enable)
+
+`BoundedTransport` now accepts optional `recovery_context`,
+`reconciliation_only`, and `recovery_source_sha` constructor arguments. The
+last must match the regular, singleton local `uncertainty_recovery.py` bytes
+before either special mode is entered and before every such request. Normal
+mode does not import that module. Recovery mode calls its `validate_context`
+under the shared lock before every request and readback part. Context is exactly
+`{request_sha256, txid, boot_id}`; only `write-boot_b` and `write-misc32` may be
+marked mutating. The fixed caller still owns the actual command policy; a label
+is not proof of a command's semantics.
+
+`RECOVERY_PENDING.json` blocks all modes. `RECOVERY_ONLY.json` blocks ordinary
+mode. Neither transport hook stages, clears, or finishes a grant. Those actions
+remain with the separately pinned, independently reviewed recovery module.
+An unresolved new ACTIVE/UNCERTAIN also blocks the recovery context.
+
+Reconciliation-only accepts payload-free reads without a followup callback.
+Its own ACTIVE, UNCERTAIN, and completed records live in its new evidence
+directory. It holds the shared lock but leaves existing global ACTIVE,
+UNCERTAIN, and completed evidence unchanged. Any failed read poisons that
+instance and its local evidence. The policy backend must still restrict reads;
+this generic host-pipe transport cannot infer whether arbitrary argv are reads.
+The 30 transport tests include eight additional mode/pin/barrier tests with a
+mocked grant validator; the root integration review must exercise the real
+recovery validator and exact scope before any enabled use.
+
+Nonmutating shell requests now wrap the complete guard and fixed script in
+`busybox timeout -s TERM 6 /system/bin/sh -c`, with independent host deadline 8 s.
+Native mutations retain their internal absolute deadline. The remote timeout
+applet and target behavior still require the future read-only integration gate;
+TERM is not proof of termination of an uninterruptible remote syscall. The fixed
+fscrypt-probe file is created natively with mode 0700 and checked before write,
+while other stage files are 0600; no extra broad chmod operation was added.
+
+Before constructing or using real transport, the adapter now requires an explicit
+unset cancel_event and a finite future monotonic transaction deadline no more
+than 3600 seconds away. This is a phase budget: staging and final directory
+switch may be separately reviewed phases; it is not an automatic renewal.
+Missing, expired or nonfinite budgets fail before any transport/device call.

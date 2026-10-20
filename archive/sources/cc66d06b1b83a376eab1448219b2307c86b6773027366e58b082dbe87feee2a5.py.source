@@ -1,0 +1,70 @@
+"""Fixed, fully acknowledged host-validation STOP. No device operations."""
+import contextlib,fcntl,hashlib,json,os,stat,tempfile
+from pathlib import Path
+from host_inputs import PinnedInput,checked_path
+class Refusal(RuntimeError):pass
+def need(v,m):
+ if not v:raise Refusal(m)
+def sha(b):return hashlib.sha256(b).hexdigest()
+def enc(v):return (json.dumps(v,sort_keys=True,separators=(',',':'))+'\n').encode()
+def obj(p):return json.loads(Path(p).read_bytes())
+def exists(p):return p.exists() or p.is_symlink()
+def check_pin(v):
+ p=Path(v['path'])
+ with PinnedInput(p,v['bytes'],v['sha256']) as r:
+  for _ in range((v['bytes']+(1<<20)-1)//(1<<20)):r.read(min(1<<20,v['bytes']-r.count))
+  r.finish()
+ return p
+class Case:
+ def __init__(self,root,c,case_sha,*,fixture=False):
+  self.root=Path(root).resolve();self.c=c;self.sha=case_sha;self.fixture=fixture
+  if fixture:need(self.root.parent==Path(tempfile.gettempdir()).resolve() and self.root.name.startswith('e5-stage-host-test-'),'fixture root')
+  else:need(self.root==Path('/REDACTED_HOST_PATH') and c['requests']==82 and c['txid']=='855ae61b90f0f332' and c['boot_id']=='00000000-0000-4000-8000-000000000001','fixed case only')
+  self.state=self.root/c['state'];self.archive=self.state/'host-stage-input-stops'/c['txid']
+ def verify(self):
+  c=self.c;need(c['schema']=='e5-acknowledged-host-stage-stop-v1','case schema')
+  need(not exists(self.state/'ACTIVE.json') and not exists(self.state/'RECOVERY_ONLY.json') and not exists(self.state/'RECOVERY_CLOSED_FD_TRANSITION.json'),'active/unknown recovery exists')
+  need(not exists(self.archive),'case already settled or interrupted; no automatic resume')
+  for v in c['files']:check_pin(v)
+  need({p.name for p in (self.state/'completed').iterdir()}==set(c['completed']),'new shared completions')
+  for name,v in c['completed'].items():need(name==Path(name).name,'completion basename');check_pin(v)
+  check_pin(c['uncertain']);u=obj(c['uncertain']['path']);need(u['reason']=='bounded stage: Refusal: host input drift' and u['txid']==c['txid'] and u['boot_id']==c['boot_id'] and u['automatic_retry'] is False,'fixed host validation stop')
+  mutations=[]
+  for op in c['operations']:
+   p=Path(op['folder']);b=obj(p/'IN_FLIGHT.json');r=obj(p/'transport-result.json');done=obj(p/'COMPLETE.json')
+   need(b['serial']==c['serial'] and b['txid']==c['txid'] and b['boot_id']==c['boot_id'] and b['op_id']==op['op_id'],'request identity')
+   need(b['automatic_retry'] is False and b['recovery_context'] is None and b['reconciliation_only'] is False and b['deadline_seconds']==8,'bounded normal request')
+   raw=(p/'stdout.bin').read_bytes();err=(p/'stderr.bin').read_bytes()
+   need(not err and r['stdout_bytes']==len(raw) and r['stdout_sha256']==sha(raw),'raw return binding')
+   need(r['returncode']==0 and r['failure'] is None and r['host_child_reaped'] is True and r['stdin_bytes_sent']==b['payload_bytes'] and r['stderr_bytes']==0 and 0<=r['elapsed_seconds']<=8,'all requests acknowledged')
+   need(done['validated'] is True and done['status']=='COMPLETE' and all(done.get(k)==v for k,v in b.items() if k!='status'),'completion binding')
+   need((p/'COMPLETE.json').read_bytes()==(self.state/'completed'/(b['op_id']+'.json')).read_bytes(),'shared completion binding')
+   need(not exists(p/'UNCERTAIN.json'),'no uncertain request may be settled here')
+   if b['mutating']:mutations.append((b['label'],b['payload_bytes'],b['payload_sha256']))
+  need(len(c['operations'])==c['requests'] and mutations==[('bounded-create-stage',0,sha(b'')),('write-stage-chunk',8,sha(b'openwrt\n'))],'two exact committed mutations only')
+  return {'status':'EXACT_HOST_VALIDATION_STOP_VERIFIED','all_device_requests_completed':True,'requests':c['requests'],'device_mutations':2,'stage_payload_bytes':8,'block_writes_dispatched':False,'host_stop_settled':False,'new_device_authority':False}
+ def settle(self,api,*,enabled):
+  need(enabled,'settlement disabled before explicit continuation approval')
+  # Caller must hold the original global lock; same serial lock protects the host marker transition.
+  fd=os.open(self.state/'LOCK',os.O_RDWR|os.O_NOFOLLOW)
+  try:
+   st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_uid==os.getuid(),'unsafe serial lock');fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+   self.verify()
+   parent=self.archive.parent
+   if not exists(parent):parent.mkdir(mode=0o700);api.sync(parent.parent)
+   need(parent.is_dir() and not parent.is_symlink(),'archive parent');self.archive.mkdir(mode=0o700);api.sync(parent)
+   receipt={'schema':'e5-acknowledged-host-stop-settlement-v1','case_sha256':self.sha,'serial':self.c['serial'],'txid':self.c['txid'],'boot_id':self.c['boot_id'],'all_requests_completed':True,'only_two_known_stage_mutations':True,'stage_payload_bytes':8,'no_block_write':True,'device_retried':False,'old_uncertain_preserved':True,'new_device_authority':False}
+   api.durable(self.archive/'HOST_SETTLEMENT_BEGIN.json',enc(receipt))
+   check_pin(self.c['uncertain'])
+   api.noreplace(self.state/'UNCERTAIN.json',self.archive/'UNCERTAIN.json')
+   need((self.archive/'UNCERTAIN.json').read_bytes()==Path(self.c['uncertain']['path_snapshot']).read_bytes(),'archived marker differs')
+   for p in (self.archive,parent,self.state):api.sync(p)
+   api.durable(self.archive/'HOST_SETTLEMENT_COMPLETE.json',enc(receipt))
+   return receipt
+  except BaseException:
+   # A failed host transition must leave the original blocking marker in place.
+   # Preserve the archive and refuse all further automatic settlement attempts.
+   if not exists(self.state/'UNCERTAIN.json'):
+    api.durable(self.state/'UNCERTAIN.json',Path(self.c['uncertain']['path_snapshot']).read_bytes())
+   raise
+  finally:os.close(fd)

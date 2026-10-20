@@ -1,0 +1,204 @@
+"""Strict host-only raw-evidence validators. No transport calls or device approval."""
+import datetime as dt
+import json,re,shlex
+from pathlib import Path
+import importlib.util as _iu,sys as _sys
+_cp=Path(__file__).resolve().with_name('common.py');_key='_e5_sim_common'
+if _key not in _sys.modules:
+ _sp=_iu.spec_from_file_location(_key,_cp);_cm=_iu.module_from_spec(_sp);_sys.modules[_key]=_cm;_sp.loader.exec_module(_cm)
+c=_sys.modules[_key]
+if Path(c.__file__).resolve()!=_cp:raise RuntimeError('common module source conflict')
+observer=c.sibling('observe')
+require,read,obj,binding,sha,canonical,SERIAL,ADB_SHA,ADB=(getattr(c,k) for k in ('require','read','obj','binding','sha','canonical','SERIAL','ADB_SHA','ADB'))
+COLD_SOURCE=Path(observer.__file__).resolve()
+def cold_evidence(cold_binding,at,check_state=True,refresh=False):
+ source=read(COLD_SOURCE);cold=obj(cold_binding);folder=Path(cold_binding['path']).parent
+ require(Path(cold_binding['path']).name=='COMPLETE.json','cold completion filename')
+ require(not any((folder/n).exists() or (folder/n).is_symlink() for n in ('STOP','STOP.json')),'cold observation stopped')
+ require(len(re.findall(rb'^DEVICE_IO_ENABLED = (?:False|True)$',source,re.M))==1,'diagnostic gate shape')
+ source_hashes={sha(re.sub(rb'^DEVICE_IO_ENABLED = (?:False|True)$',b'DEVICE_IO_ENABLED = '+v,source,flags=re.M)) for v in (b'False',b'True')}
+ capture,triage=observer.load_sources()  # Imports pinned pure parsers only; never Observer/collect_process.
+ require(cold.get('schema')==('e5-next-sameboot-refresh-v1' if refresh else 'e5-next-cold-observation-v1') and cold.get('serial')==SERIAL,'cold diagnostic schema/serial')
+ request,snapshot=(observer.validate_refresh_request(cold['request'],check_state) if refresh else observer.validate_request(cold['request'],check_state))
+ require(cold.get('old_boot_id')==request['previous_boot_id'] and cold.get('state_snapshot')==request['state_snapshot'] and cold.get('purpose')==request['purpose'],'cold request/state/purpose')
+ require(cold.get('samples')==(2 if refresh else 21) and cold.get('health_window_completed') is True and cold.get('diagnostics_completed') is True and
+  cold.get('device_writes') is False and cold.get('block_reads') is False and cold.get('uncertainty_cleared') is False and cold.get('approved_to_flash') is False,'cold scope/completion')
+ sb=obj(binding(folder/'SOURCE_BINDING.json'))
+ require(sb.get('script_sha256') in source_hashes and sb.get('source_pins')==observer.PINS and sb.get('adb_sha256')==ADB_SHA and sb.get('old_boot_id')==request['previous_boot_id'] and
+  sb.get('serial')==SERIAL and sb.get('no_device_writes') is True and sb.get('state_snapshot')==request['state_snapshot'] and sb.get('request')==cold['request'] and sb.get('purpose')==request['purpose'],'cold producer source binding')
+ command_times={}
+ hashes={'COMPLETE.json':cold_binding['sha256'],'SOURCE_BINDING.json':binding(folder/'SOURCE_BINDING.json')['sha256']}
+ def command(label):
+  matches=list(folder.glob('*-'+label+'.stdout'));require(len(matches)==1,'cold raw command not unique');p=matches[0];stem=p.name[:-7]
+  raw=read(p);stderr=read(folder/(stem+'.stderr'));result=obj(binding(folder/(stem+'.result.json')));request=obj(binding(folder/(stem+'.request.json')));script=read(folder/(stem+'.sh.txt'))
+  require(result.get('failure') is None and result.get('returncode')==0 and not stderr and isinstance(result.get('elapsed_seconds'),(int,float)) and 0<=result['elapsed_seconds']<=8,'cold command failed')
+  require(result.get('stdout_sha256')==sha(raw) and result.get('stdout_bytes')==len(raw) and result.get('stderr_sha256')==sha(stderr) and result.get('stderr_bytes')==0,'cold raw/result changed')
+  require(request.get('host_deadline_seconds')==8 and request.get('expected_returncode')==0 and request.get('script_sha256')==sha(script) and len(raw)<=request['output_limit'],'cold request changed')
+  begin=c.timestamp(result['started_at']);finish=c.timestamp(result['finished_at']);require(begin<=finish<=at,'command timestamp future/order');command_times[label]=(begin,finish)
+  expected=[str(ADB),'-s',SERIAL,'shell','-T',capture.SU+' -c '+shlex.quote(capture.BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(script.decode()))]
+  require(request.get('argv')==expected and request.get('started_at')==result.get('started_at'),'cold argv/time changed')
+  for suffix in ('.stdout','.stderr','.result.json','.request.json','.sh.txt'):hashes[stem+suffix]=binding(folder/(stem+suffix))['sha256']
+  return raw,result,script
+ script=triage.HEALTH_SCRIPT.replace('emit boot_id_end','emit data_device_resolved "$(/system/bin/readlink -f /dev/block/by-name/userdata)"\nemit data_rdev "$(/system/bin/stat -c %t:%T /dev/block/mmcblk0p70)"\nemit data_sysdev "$(/system/bin/cat /sys/class/block/mmcblk0p70/dev)"\nemit boot_id_end')
+ expected_script=(observer.root_guard(capture,cold['boot_id'],request['purpose'])+script).encode();times=[];uptimes=[]
+ for i in range(2 if refresh else 21):
+  raw,result,actual_script=command(f'health-{i:02d}');require(actual_script==expected_script,'health command does not match pinned producer')
+  parsed=observer.parse_health(raw,triage,cold['boot_id'],request['purpose']);name=f'health-{i:02d}.parsed.json';row=obj(binding(folder/name))
+  require(row.get('snapshot')==parsed and row.get('captured_at')==result['started_at'],'cold parsed/raw differs');hashes[name]=binding(folder/name)['sha256']
+  t=dt.datetime.fromisoformat(row['captured_at']);require(t.tzinfo is not None and t<=at,'cold timestamp');times.append(t);uptimes.append(parsed['uptime_seconds'])
+ require((refresh or uptimes[0]<=120) and all(y>x for x,y in zip(uptimes,uptimes[1:])) and all(y>x for x,y in zip(times,times[1:])),'cold early/monotonic window')
+ span=(times[-1]-times[0]).total_seconds();require(span>=(2 if refresh else 600) and abs(cold['span_seconds']-span)<.001,'cold span differs')
+ pid_identities=[];guard=observer.root_guard(capture,cold['boot_id'],request['purpose'])
+ for phase in ('initial','final'):
+  for label,path,cap in (('pstore-console','/sys/fs/pstore/console-ramoops-0',262144),('pstore-dmesg','/sys/fs/pstore/dmesg-ramoops-0',1048576)):
+   body=f'''if test -e {path}; then
+ test -r {path}
+ printf 'PRESENT\\n'
+ {capture.BB} head -c {cap+1} {path}
+else
+ test ! -L {path}
+ printf 'MISSING\\n'
+fi
+'''
+   raw,_,actual=command(phase+'-'+label);require(actual==(guard+body).encode(),'pstore command does not match producer')
+   require(raw==b'MISSING\n' or (raw.startswith(b'PRESENT\n') and len(raw)-8<=cap),'pstore framing/cap')
+   name=phase+'-'+label+'.presence.json';presence=obj(binding(folder/name));require(presence=={'path':path,'present':raw.startswith(b'PRESENT\n'),'contents_bytes':max(0,len(raw)-8),'not_automatically_classified_as_new_panic':True},'pstore presence differs');hashes[name]=binding(folder/name)['sha256']
+  _,_,actual=command(phase+'-crash');require(actual==(guard+triage.FIXED_REQUESTS[3]['script']).encode(),'crash command does not match producer')
+  parsed={};values={}
+  for label,path,cap,parser in (('stat-before','/proc/1/stat',8192,observer.parse_pid1_stat),('stat-after','/proc/1/stat',8192,observer.parse_pid1_stat),('namespace-before','/proc/1/ns/mnt',80,observer.parse_namespace),('namespace-after','/proc/1/ns/mnt',80,observer.parse_namespace),('mountinfo','/proc/1/mountinfo',1048576,observer.parse_mountinfo)):
+   body=(f'readlink {path}\n' if '/ns/' in path else f'{capture.BB} head -c {cap+1} {path}\n')+f'test "$(cat /proc/sys/kernel/random/boot_id)" = {cold["boot_id"]}\n'
+   raw,result,actual=command(phase+'-pid1-'+label);require(actual==(guard+body).encode() and len(raw)<=cap,'PID1 command/cap does not match producer')
+   parsed[label]=parser(raw);values[label]={'sha256':sha(raw),'bytes':len(raw),'started_at':result['started_at']}
+  require(parsed['namespace-before']==parsed['namespace-after'] and parsed['stat-before']['pid']==parsed['stat-after']['pid']==1 and
+   parsed['stat-before']['starttime']==parsed['stat-after']['starttime'] and
+   parsed['stat-before']['flags'] & 0x00200000==parsed['stat-after']['flags'] & 0x00200000,'PID1 identity/namespace changed')
+  name=phase+'-pid1-diagnostic.json';pid=obj(binding(folder/name));require(pid.get('schema')=='e5-pid1-diagnostic-v1' and pid.get('boot_id')==cold['boot_id'] and
+   pid.get('device_writes') is False and pid.get('parsed')==parsed and pid.get('raw')==values,'PID1 evidence scope/raw differs');hashes[name]=binding(folder/name)['sha256']
+  pid_identities.append((parsed['stat-before']['starttime'],parsed['stat-before']['flags'] & 0x00200000,parsed['namespace-before']))
+ require(pid_identities[0]==pid_identities[1],'PID1 initial/final identity or namespace changed')
+ sequence=('pstore-console','pstore-dmesg','crash','pid1-stat-before','pid1-namespace-before','pid1-mountinfo','pid1-namespace-after','pid1-stat-after')
+ for phase,index in (('initial',0),('final',len(times)-1)):
+  previous=command_times[f'health-{index:02d}'][1]
+  for label in sequence:
+   start,finish=command_times[phase+'-'+label];require(start>=previous,'diagnostic sequence/health order');previous=finish
+  if phase=='initial':require(previous<=command_times['health-01'][0],'initial diagnostics outside first health interval')
+ for i in range(1,len(times)):require(command_times[f'health-{i:02d}'][0]>=command_times[f'health-{i-1:02d}'][1],'overlapping health requests')
+ require((cold['boot_id']==request['boot_id'] and cold.get('new_cold_observation') is False and cold.get('historical_cold_envelope')==request['prior_envelope']) if refresh else cold['boot_id'] not in c.excluded_boots(request,snapshot,at),'cold/refresh boot identity')
+ return cold,sha(canonical(hashes)),times[-1]
+
+PROFILE=c.ROOT/'tools/e5_android_install_live_20261013/device-profile.json'
+PROFILE_SHA='0000000000000000000000000000000000000000000000000000000000000000'
+PROTECTED=frozenset(('trustos_a','trustos_b','uboot_a','uboot_b','vbmeta_a','vbmeta_b','init_boot_a','init_boot_b','sml_a','sml_b','teecfg_a','teecfg_b','boot_a'))
+BB='/data/adb/magisk/busybox';SU='/debug_ramdisk/su';CHUNK=4<<20
+
+def profile():return json.loads(read(PROFILE,PROFILE_SHA))
+def source_variants(path,gate):
+ raw=read(path);prefix=gate.split(b'=')[0];pattern=rb'^'+re.escape(prefix)+rb'=(?:True|False)$';require(len(re.findall(pattern,raw,re.M))==1,'source gate shape');return {sha(re.sub(pattern,prefix+b'='+v,raw,flags=re.M)) for v in (b'True',b'False')}
+def review_people(review):
+ names=[review.get(k) for k in ('collector','reviewer')]
+ require(all(isinstance(v,str) and v.strip() for v in names) and names[0].strip()!=names[1].strip(),'named independent review required; names are not authentication')
+def lease(review,at,maximum=900):
+ start=c.timestamp(review['captured_at']);end=c.timestamp(review['expires_at'])
+ require(start<=at<end and 0<(end-start).total_seconds()<=maximum,'review lease invalid');return end
+
+def validate_cold(binding,now=None):
+ require(not any((Path(binding['path']).parent/n).exists() or (Path(binding['path']).parent/n).is_symlink() for n in ('INVALID_NOT_READY.json','INVALID_NOT_EXECUTABLE.json')),'invalid envelope directory')
+ return validate_cold_object(obj(binding),now or c.now())
+def historical_cold(envelope,at):
+ require(set(envelope)=={'schema','serial','boot_id','cold_request','cold_complete','cold_review','cold_refresh','readonly_result','original_review'} and envelope['schema']=='e5-next-directory-evidence-v1' and envelope['serial']==SERIAL,'evidence envelope fields')
+ cold,digest,ended=cold_evidence(envelope['cold_complete'],at,check_state=False);request,snapshot=observer.validate_request(envelope['cold_request'],False)
+ require(cold['request']==envelope['cold_request'] and cold['boot_id']==envelope['boot_id'],'cold envelope identity')
+ review=obj(envelope['cold_review']);review_people(review);captured=c.timestamp(review['captured_at']);expiry=lease(review,captured)
+ require(review.get('schema')=='e5-next-cold-independent-review-v1' and review.get('serial')==SERIAL and review.get('boot_id')==cold['boot_id'] and review.get('cold_complete')==envelope['cold_complete'] and review.get('cold_evidence_sha256')==digest and review.get('state_snapshot')==request['state_snapshot'] and review.get('purpose')==request['purpose'],'cold independent review binding')
+ require(review.get('decision')=='READY_FOR_READONLY_ONLY' and review.get('physical_cold_and_current_ui_confirmed') is True and review.get('all_21_raw_and_initial_final_logs_reviewed') is True and review.get('new_panic_or_unassessed_abnormality') is False and review.get('device_writes_allowed') is False,'cold review facts incomplete')
+ require(ended<=captured<=at and (captured-ended).total_seconds()<900,'historical cold review timing')
+ return {'schema':'e5-next-cold-validated-v1','serial':SERIAL,'boot_id':cold['boot_id'],'purpose':request['purpose'],'expires_at':min(expiry,ended+dt.timedelta(seconds=900)).isoformat(),'evidence_sha256':digest,'state_snapshot':request['state_snapshot'],'cold_complete':envelope['cold_complete'],'cold_review':envelope['cold_review'],'device_execution_allowed':False,'approved_to_flash':False}
+def validate_cold_object(envelope,at):
+ value=historical_cold(envelope,at)
+ if envelope['cold_refresh'] is None:
+  c.assert_state(obj(value['state_snapshot']));require(at<c.timestamp(value['expires_at']),'cold evidence lease expired');return value
+ pair=obj(envelope['cold_refresh']);require(set(pair)=={'schema','complete','review'} and pair['schema']=='e5-next-refresh-review-pair-v1','refresh pair fields')
+ current,digest,ended=cold_evidence(pair['complete'],at,refresh=True);request,snapshot=observer.validate_refresh_request(current['request']);c.normal_state(snapshot)
+ prior=obj(request['prior_envelope']);require(prior['cold_complete']==envelope['cold_complete'] and prior['cold_review']==envelope['cold_review'] and prior['cold_request']==envelope['cold_request'],'refresh historical source mismatch')
+ review=obj(pair['review']);review_people(review);expiry=lease(review,at)
+ require(review.get('schema')=='e5-next-refresh-independent-review-v1' and review.get('serial')==SERIAL and review.get('boot_id')==value['boot_id']==current['boot_id'] and review.get('complete')==pair['complete'] and review.get('raw_evidence_sha256')==digest and review.get('state_snapshot')==request['state_snapshot'] and review.get('purpose')==value['purpose']==request['purpose'],'refresh review binding')
+ require(review.get('decision')=='SAME_BOOT_READONLY_REFRESH' and review.get('current_ui_confirmed') is True and review.get('initial_final_logs_and_health_reviewed') is True and review.get('new_panic_or_unassessed_abnormality') is False and review.get('device_writes_allowed') is False,'refresh independent assessment missing')
+ require(ended<=c.timestamp(review['captured_at']) and 0<=(at-ended).total_seconds()<900,'refresh stale')
+ return {**value,'expires_at':min(expiry,ended+dt.timedelta(seconds=900)).isoformat(),'evidence_sha256':sha(canonical({'historical':value['evidence_sha256'],'refresh':digest})),'state_snapshot':request['state_snapshot'],'refresh_binding':envelope['cold_refresh'],'new_cold_claimed':False}
+
+def base(boot,purpose='directory',tx=None):
+ value=('set -eu\nset -o pipefail\n'+f'test "$(id -u)" = 0\ntest "$(cat /proc/sys/kernel/random/boot_id)" = {boot}\n'+f'test "$(getprop ro.serialno)" = {SERIAL}\n'+'test "$(getprop ro.product.model)" = E5\ntest "$(getprop ro.board.platform)" = ums9621\n'+'test "$(getprop ro.build.display.id)" = TS305_V03_20241128_2301\n'+'test "$(getprop ro.boot.slot_suffix)" = _a\ntest "$(getprop sys.boot_completed)" = 1\n'+'test "$(getprop ro.boot.verifiedbootstate)" = orange\ntest "$(getprop ro.boot.flash.locked)" = 0\n'+(observer.sim_guard() if purpose=='rearm-with-sim' else 'test "$(getprop gsm.sim.state)" = ABSENT,ABSENT\n'))
+ if purpose=='rearm-with-sim':
+  c.validtx(tx);lock='/data/local/tmp/e5-clean-directory.lock';value+=f'test -d {lock}; test ! -L {lock}; test -f {lock}/owner; test ! -L {lock}/owner; test "$(cat {lock}/owner)" = {tx}\n'
+ return value
+def part_info(part,p):
+ if part=='gpt':return {'node':'/dev/block/mmcblk0','dev':'179:0','bytes':32768,'start_lba':None}
+ require(part in PROTECTED|{'boot_b','misc'},'unknown partition');return p['partitions'][part]
+def guard(part,p):
+ info=part_info(part,p);node=info['node'];leaf=node.rsplit('/',1)[-1]
+ s=f'test -b {node}; test ! -L {node}\ntest "$(cat /sys/class/block/{leaf}/dev)" = {info["dev"]}\n'
+ if part!='gpt':s+=f'test "$(readlink -f /dev/block/by-name/{part})" = {node}\ntest "$(cat /sys/class/block/{leaf}/start)" = {info["start_lba"]}\ntest "$(cat /sys/class/block/{leaf}/size)" = {info["bytes"]//512}\ntest "$(blockdev --getsize64 {node})" = {info["bytes"]}\n'
+ major,minor=map(int,info['dev'].split(':'));return s+f'test "$(stat -c %t:%T {node})" = {major:x}:{minor:x}\n'
+def read_script(part,off,length,op,boot,p):
+ node=part_info(part,p)['node'];g=guard(part,p)
+ return g+f'i=$(stat -c %i {node}); d=$(stat -c %d {node})\n'+f'printf "E5READ3 {op} {part} {off} {length} %s %s\\n" "$i" "$d"\n'+f'{BB} dd if={node} bs=4096 skip={off//4096} count={length//4096} iflag=fullblock 2>/dev/null\n'+g+f'test "$(stat -c %i {node})" = "$i"; test "$(stat -c %d {node})" = "$d"\n'+f'test "$(cat /proc/sys/kernel/random/boot_id)" = {boot}\nprintf "\\nE5END3 {op} %s %s\\n" "$i" "$d"\n'
+def argv(script):return [str(ADB),'-s',SERIAL,'shell','-T',SU+' -c '+shlex.quote(BB+' timeout -s TERM 6 /system/bin/sh -c '+shlex.quote(script))]
+
+def validate_readonly(result_binding,at,purpose='directory'):
+ result=obj(result_binding);root=Path(result_binding['path']).parent
+ require(Path(result_binding['path']).name=='READONLY_RESULT.json' and result.get('schema')=='e5-next-readonly-v1' and result.get('serial')==SERIAL and result.get('purpose')==purpose and result.get('device_writes') is False and result.get('native_helpers_executed') is False and result.get('approved_to_restore') is False,'readonly result contract')
+ require(result.get('producer_source_sha256') in source_variants(c.HERE/('rearm.py' if purpose=='rearm-with-sim' else 'recovery.py'),b'REARM_IO_DISABLED=True' if purpose=='rearm-with-sim' else b'RECOVERY_IO_DISABLED=True') and result.get('source_pins')==c.PINS,'readonly producer binding')
+ snapshot=obj(result['state_snapshot']);c.assert_state(snapshot);c.validtx(result['txid']);c.validboot(result['boot_id'])
+ require(purpose=='rearm-with-sim' or result['txid'] not in snapshot['used_txids'],'read-only tx already used')
+ if purpose=='rearm-with-sim':c.normal_state(snapshot)
+ transport=root/'transport';tb=obj(result['transport_binding'])
+ require(result['transport_binding']['path']==str(transport/'binding.json') and tb=={'boot_id':result['boot_id'],'serial':SERIAL,'txid':result['txid'],'state_dir':str(c.STATE),'reconciliation_only':True,'recovery_context':None,'recovery_source_sha256':c.PINS['uncertainty_recovery']},'readonly transport binding')
+ require(not any((root/n).exists() or (root/n).is_symlink() or (transport/n).exists() or (transport/n).is_symlink() for n in ('STOP','STOP.json','ACTIVE.json','UNCERTAIN.json')),'readonly stopped/incomplete')
+ rec=obj(result['reconciliation']);require(result['reconciliation']['path']==str(root/'raw/reconciliation.json'),'reconciliation layout')
+ require(rec['schema']=='e5-boot-reconciliation-v3' and rec['serial']==SERIAL and rec['boot_id']==result['boot_id'] and rec['ledger_head']==snapshot['ledger_head'] and all(rec.get(k) is True for k in ('complete','protected_match','misc_outside_original_match','does_not_clear_poison')),'reconciliation facts')
+ c.remaining(rec,at);p=profile();required=PROTECTED|{'boot_b','misc','gpt'};require(set(rec['artifacts'])==required,'exact16 artifacts')
+ payloads={};digest_rows={}
+ for name in sorted(required):
+  item=rec['artifacts'][name];size=part_info(name,p)['bytes'];expected=rec['hashes'][name] if name in ('boot_b','misc') else p['gpt_prefix_sha256'] if name=='gpt' else p['protected_hashes'][name]
+  require(item=={'path':str(root/'raw'/(name+'.observed.bin')),'sha256':expected,'bytes':size},'artifact dimensions/path');payloads[name]=read(item['path'],expected,size)
+ if purpose=='rearm-with-sim':c.sibling('sim_nv').validate_capture(result['nv_baseline'],at,result['boot_id'],result['txid'],transport)
+ counts={name:[] for name in required};geometry={name:0 for name in required-{'gpt'}};identities={};seen=set()
+ for folder in sorted(x for x in transport.iterdir() if x.is_dir() and re.match(r'^\d{6}-',x.name)):
+  if purpose=='rearm-with-sim' and any(tag in folder.name for tag in ('-sim-nv-read-', '-sim-nv-hash-', '-sim-network-')):continue
+  receipt=obj(binding(folder/'COMPLETE.json'));raw=read(folder/'stdout.bin');err=read(folder/'stderr.bin');meta=obj(binding(folder/'transport-result.json'));flight=obj(binding(folder/'IN_FLIGHT.json'))
+  require(not (folder/'UNCERTAIN.json').exists() and receipt.get('schema')=='e5-bounded-transport-v1' and receipt.get('status')=='COMPLETE' and receipt.get('validated') is True and receipt.get('serial')==SERIAL and receipt.get('boot_id')==result['boot_id'] and receipt.get('txid')==result['txid'] and receipt.get('mutating') is False and receipt.get('reconciliation_only') is True and receipt.get('recovery_context') is None and receipt.get('payload_bytes')==0 and receipt.get('payload_sha256')==sha(b'') and receipt.get('deadline_seconds')==8 and receipt.get('automatic_retry') is False,'readonly receipt fields')
+  require(receipt['evidence_directory']==str(folder) and receipt['stdout_sha256']==sha(raw) and receipt['argv_sha256']==sha(canonical(receipt['argv'])) and all(receipt.get(k)==v for k,v in flight.items() if k!='status'),'request/complete mismatch')
+  require(meta.get('failure') is None and meta.get('returncode')==0 and 0<=meta['elapsed_seconds']<=8 and meta.get('host_child_reaped') is True and meta.get('stdin_bytes_sent')==0 and meta.get('stdout_bytes')==len(raw) and meta.get('stdout_sha256')==sha(raw) and not err and meta.get('stderr_bytes')==0,'failed raw request')
+  require(receipt['op_id'] not in seen,'duplicate operation');seen.add(receipt['op_id'])
+  label=receipt['label']
+  if label.startswith('geometry-'):
+   name=label[9:];require(name in geometry and raw==b'GEOMETRY_OK\n','unexpected geometry');geometry[name]+=1;script=guard(name,p)+"printf 'GEOMETRY_OK\\n'\n";limit=4096
+  elif label.startswith('read-'):
+   name=label[5:];require(name in required,'unexpected read target');head,sep,rest=raw.partition(b'\n');fields=head.decode('ascii').split();require(sep and len(fields)==7 and fields[0]=='E5READ3' and fields[2]==name and re.fullmatch('[0-9a-f]{32}',fields[1]) and all(x.isdigit() for x in fields[3:]),'read envelope')
+   op=fields[1];off,length,inode,dev=map(int,fields[3:]);require(off%4096==length%4096==0 and 0<length<=CHUNK and off+length<=len(payloads[name]),'read range');tail=f'\nE5END3 {op} {inode} {dev}\n'.encode();require(rest==payloads[name][off:off+length]+tail,'raw repeated read differs')
+   require(name not in identities or identities[name]==(inode,dev),'block identity drift');identities[name]=(inode,dev);counts[name].append((off,length));script=read_script(name,off,length,op,result['boot_id'],p);limit=length+1024
+  else:raise c.Refusal('unknown request in readonly capture')
+  require(receipt['argv']==argv(base(result['boot_id'],purpose,result['txid'])+script) and receipt['output_limit']==limit,'request not exact bounded read')
+  for file in ('COMPLETE.json','IN_FLIGHT.json','stdout.bin','stderr.bin','transport-result.json'):digest_rows[str(folder.name+'/'+file)]=binding(folder/file)['sha256']
+ require(all(v==2 for v in geometry.values()),'two complete geometry sweeps required')
+ for name,parts in counts.items():
+  expected=[(off,min(CHUNK,len(payloads[name])-off)) for off in range(0,len(payloads[name]),CHUNK)]
+  require(parts==expected+expected,'two ordered full reads required')
+ require(len(seen)==2*len(geometry)+2*sum((len(v)+CHUNK-1)//CHUNK for v in payloads.values()),'exact readonly request count')
+ orig=read(c.ORIGINAL_MISC,p['original_misc_sha256'],1<<20);misc=payloads['misc'];require(misc[:2048]+misc[2080:]==orig[:2048]+orig[2080:],'misc outside32 changed')
+ return result,rec,p,sha(canonical(digest_rows))
+
+def validate_original(binding,now=None):
+ at=now or c.now();env=obj(binding);cold=validate_cold(binding,at);require(cold['purpose'] in ('directory','recovery'),'SIM trial evidence cannot permit directory/recovery')
+ result,rec,p,digest=validate_readonly(env['readonly_result'],at,cold['purpose'])
+ require(result['cold_envelope']==binding_without_originals(env) and result['boot_id']==cold['boot_id'] and result['state_snapshot']==cold['state_snapshot'],'cold/read lineage differs')
+ require(rec['hashes']=={'boot_b':p['original_boot_b_sha256'],'misc':p['original_misc_sha256']},'original B/misc not restored')
+ review=obj(env['original_review']);review_people(review);expiry=lease(review,at)
+ require(review.get('schema')=='e5-next-originals-independent-review-v1' and review.get('serial')==SERIAL and review.get('boot_id')==cold['boot_id'] and review.get('readonly_result')==env['readonly_result'] and review.get('reconciliation')==result['reconciliation'] and review.get('raw_transport_evidence_sha256')==digest and review.get('decision')=='ORIGINALS_VERIFIED_READONLY' and review.get('device_writes_allowed') is False,'original independent review binding')
+ return {'schema':'e5-next-originals-validated-v1','serial':SERIAL,'boot_id':cold['boot_id'],'expires_at':min(c.timestamp(cold['expires_at']),expiry,c.timestamp(rec['captured_at'])+dt.timedelta(seconds=900)).isoformat(),'current_boot_b_sha256':rec['hashes']['boot_b'],'current_misc_sha256':rec['hashes']['misc'],'cold_evidence_sha256':cold['evidence_sha256'],'raw_transport_evidence_sha256':digest,'state_snapshot':cold['state_snapshot'],'readonly_result':env['readonly_result'],'device_execution_allowed':False,'approved_to_flash':False}
+
+def binding_without_originals(env):
+ return {k:env[k] for k in ('schema','serial','boot_id','cold_request','cold_complete','cold_review','cold_refresh')}|{'readonly_result':None,'original_review':None}
+def validate_directory_ready(binding,boot_id,now=None):
+ at=now or c.now();value=validate_original(binding,at);require(value['boot_id']==boot_id,'directory boot mismatch');env=obj(binding);request=obj(env['cold_request']);require(request['purpose']=='directory','directory purpose required');c.normal_state(obj(value['state_snapshot']))
+ return {**value,'schema':'e5-next-directory-ready-v1','status':'ORIGINALS_VERIFIED','evidence_binding':binding,'checked_at':at.isoformat()}

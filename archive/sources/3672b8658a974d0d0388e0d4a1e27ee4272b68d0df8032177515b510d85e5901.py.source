@@ -1,0 +1,19 @@
+"""Read-only actual-case replay. Explicitly forbids writes to real evidence/state."""
+import hashlib,json,os,sys,time
+from pathlib import Path
+HERE=Path(__file__).resolve().parent;ROOT=HERE.parents[1]
+def audit(event,args):
+ if event.startswith(('subprocess.','socket.')) or event in ('os.system','os.posix_spawn','os.fork','os.exec','pty.spawn'):raise AssertionError('external operation denied: '+event)
+ if event=='open' and isinstance(args[0],(str,bytes,os.PathLike)):
+  p=Path(os.fsdecode(args[0])).absolute();flags=args[2] or 0
+  if (flags & (os.O_WRONLY|os.O_RDWR|os.O_CREAT|os.O_TRUNC|os.O_APPEND)) and not p.is_relative_to(HERE):raise AssertionError('non-prepare write denied: '+str(p))
+ if event in ('os.rename','os.remove','os.rmdir','os.mkdir','os.unlink'):raise AssertionError('filesystem mutation denied: '+event)
+sys.addaudithook(audit)
+import closure
+state=ROOT/'evidence/e5-clean-v3-device-state-DEVICE_SERIAL_REDACTED';ledger=ROOT/'evidence/.bounded-boot-v3-DEVICE_SERIAL_REDACTED/ledger.jsonl'
+def snapshot():
+ out={str(p.relative_to(ROOT)):hashlib.sha256(p.read_bytes()).hexdigest() for p in state.rglob('*') if p.is_file()}
+ out[str(ledger.relative_to(ROOT))]=hashlib.sha256(ledger.read_bytes()).hexdigest();return out
+before=snapshot();start=time.monotonic();result=closure.verify_case();elapsed=time.monotonic()-start;after=snapshot();assert before==after
+report={'schema':'e5-postdeployment-probe-stop-actual-plan-v1','result':result,'elapsed_seconds':elapsed,'state_and_ledger_before':before,'state_and_ledger_after':after,'unchanged':before==after,'mode':'plan','close_or_resume_executed':False,'device_io_performed':False,'closure_source_sha256':hashlib.sha256((HERE/'closure.py').read_bytes()).hexdigest()}
+(HERE/'ACTUAL_PLAN_VERIFICATION.json').write_text(json.dumps(report,indent=2,sort_keys=True)+'\n');print(json.dumps({k:v for k,v in report.items() if k not in ('state_and_ledger_before','state_and_ledger_after')}))
