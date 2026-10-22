@@ -21,7 +21,7 @@ jobs:
       - name: Check public contents and inert system-switch references
         run: python scripts/check_publication.py
       - name: Install the Android compile SDK used by the reference UI
-        run: sdkmanager "platforms;android-33" "build-tools;35.0.0"
+        run: '"${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "platforms;android-33" "build-tools;35.0.0"'
       - name: Test Android menu matching, protocol and fixed command boundaries
         run: |
           python components/android-system-switch-ui/app/test_host.py
