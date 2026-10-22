@@ -1,0 +1,149 @@
+#!/bin/busybox sh
+# PUBLIC_REFERENCE_GUARD_BEGIN
+printf "%s\n" "Reference-only export: device execution is disabled." >&2
+exit 64
+# PUBLIC_REFERENCE_GUARD_END
+# TF-only, no persistent diagnostic writes, no filesystem repair, no root fallback.
+# Hardware/module and USB sequence derives from pinned e5-linux (MIT).
+/bin/busybox mkdir -p /bin /sbin /proc /sys /dev /run /tmp /root /etc /config /tfprobe /newroot
+/bin/busybox --install -s /bin
+export PATH=/bin:/sbin HOME=/root TERM=vt100
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs -o mode=0755 devtmpfs /dev || exec sh
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mkdir -p /dev/pts
+mount -t devpts -o mode=0620,ptmxmode=0666 devpts /dev/pts
+ln -sf pts/ptmx /dev/ptmx
+echo 4 > /proc/sys/kernel/printk
+echo /bin/mdev > /proc/sys/kernel/hotplug
+mdev -s
+BB=/bin/busybox
+TF_BINDING=/etc/e5-tf-binding.conf
+TF_DEV_PREFIX=/dev
+. /lib/e5-tf-common.sh
+log() { echo "E5-TF: $*" >> /run/stages; echo "<3>E5-TF: $*" > /dev/kmsg; }
+
+# MMC, USB NCM/ACM and PMIC watchdog are built in in the paired kernel.
+# Bring up the wired diagnostic path before touching the card filesystem.
+mount -t configfs configfs /config
+g=/config/usb_gadget/linux
+mkdir -p "$g/strings/0x409" "$g/configs/c.1/strings/0x409" "$g/functions/ncm.usb0" "$g/functions/acm.GS0"
+echo 0x0525 > "$g/idVendor"
+echo 0xa4a1 > "$g/idProduct"
+echo 0x0200 > "$g/bcdUSB"
+echo E5LINUX > "$g/strings/0x409/serialnumber"
+echo Unisoc > "$g/strings/0x409/manufacturer"
+echo 'E5 Linux USB Ethernet' > "$g/strings/0x409/product"
+echo 'Linux NCM + ACM console' > "$g/configs/c.1/strings/0x409/configuration"
+echo 250 > "$g/configs/c.1/MaxPower"
+echo 02:00:00:00:00:01 > "$g/functions/ncm.usb0/dev_addr"
+echo 02:00:00:00:00:02 > "$g/functions/ncm.usb0/host_addr"
+ln -s "$g/functions/ncm.usb0" "$g/configs/c.1/f1"
+ln -s "$g/functions/acm.GS0" "$g/configs/c.1/f2"
+udc=
+for n in $(seq 1 40); do
+    for u in /sys/class/udc/*; do [ -e "$u" ] && { udc=${u##*/}; break; }; done
+    [ -n "$udc" ] && break
+    sleep 1
+done
+[ -z "$udc" ] || echo "$udc" > "$g/UDC"
+# OpenWrt bridge hotplug attaches usb0 without toggling its NCM link.
+ifconfig usb0 up 2>/dev/null || log "usb0 initial link-up failed"
+ifconfig lo 127.0.0.1 up
+
+rescue() {
+    log "REFUSED $*; RAM serial rescue, no automatic restart"
+    umount /tfprobe 2>/dev/null || true
+    umount /newroot 2>/dev/null || true
+    ifconfig usb0 192.168.77.1 netmask 255.255.255.0 up
+    cat > /run/udhcpd.conf <<'DHCP'
+start 192.168.77.2
+end 192.168.77.9
+interface usb0
+option subnet 255.255.255.0
+option lease 600
+lease_file /run/udhcpd.leases
+pidfile /run/udhcpd.pid
+DHCP
+    udhcpd /run/udhcpd.conf
+    # A wired physical serial console only; no network shell service.
+    while :; do
+        if [ -c /dev/ttyGS0 ]; then
+            setsid sh -c 'exec sh </dev/ttyGS0 >/dev/ttyGS0 2>&1'
+        else sleep 2; fi
+    done
+}
+log "init-start release=$(uname -r)"
+tf_load || rescue binding
+[ "$(uname -r)" = "$TF_KERNEL_RELEASE" ] || rescue kernel
+found=0
+for n in $(seq 1 40); do
+    mdev -s
+    if tf_internal; then found=1; break; fi
+    sleep 1
+done
+[ "$found" = 1 ] || rescue internal-identity
+tf_userdata_protect || rescue userdata-protection
+log 'internal userdata unmounted and kernel-readonly'
+found=0
+for n in $(seq 1 40); do
+    mdev -s
+    if tf_card; then found=1; break; fi
+    sleep 1
+done
+[ "$found" = 1 ] || rescue card-identity
+mount -t ext4 -o ro,noload,noatime "$TF_ROOTDEV" /tfprobe || rescue card-readonly-mount
+tf_verify_root /tfprobe || rescue root-verification
+mkdir -p /lib/firmware
+cp -a /tfprobe/lib/firmware/. /lib/firmware/ || rescue firmware-copy
+umount /tfprobe || rescue readonly-unmount
+log 'root verified; firmware copied to RAM'
+
+loaded=0
+failed=0
+[ -s /etc/module-order ] || rescue module-order
+while read -r module; do
+    [ -n "$module" ] || continue
+    case "$module" in *[!a-zA-Z0-9_.-]*|.*) rescue invalid-module-name ;; esac
+    if insmod "/linux-modules/$module" 2>/run/insmod.err; then
+        loaded=$((loaded + 1))
+    else
+        failed=$((failed + 1))
+        log "module load failed: $module $(cat /run/insmod.err)"
+    fi
+done < /etc/module-order
+mdev -s
+log "modules loaded=$loaded failed=$failed"
+# Preserve the previously validated delayed WCN firmware handoff.
+if [ -d /sys/module/wcn_bsp ] && [ -d /sys/module/sprd_wlan_combo ]; then
+    for n in $(seq 1 15); do
+        phy=
+        for f in /sys/class/ieee80211/*; do [ -d "$f" ] && phy=1; done
+        [ -n "$phy" ] && break
+        sleep 1
+    done
+fi
+# Re-check card identity immediately before the only persistent mount.
+tf_card || rescue changed-card
+tf_userdata_check || rescue changed-userdata-protection
+mount -t ext4 -o rw,noatime "$TF_ROOTDEV" /newroot || rescue root-mount
+tf_verify_root /newroot || rescue changed-root
+errors="/sys/fs/ext4/${TF_DISK}p${TF_PART}/errors_count"
+[ -r "$errors" ] && [ "$(cat "$errors")" = 0 ] || rescue ext4-errors
+mkdir -p /run/e5linux
+printf '%s\n' "$TF_MISC" > /run/e5linux/misc-dev
+printf '%s\n' "$TF_ROOTDEV" > /run/e5linux/sd-root-dev
+printf '%s\n' 'tf-only direct-ext4 no-persistent-log no-auto-fsck' > /run/e5linux/init-features
+for bl in /sys/class/backlight/*/brightness /sys/class/backlight/*/bl_power; do
+    [ ! -e "$bl" ] || chmod 0666 "$bl"
+done
+log 'switch-root verified TF root'
+umount /config 2>/dev/null || true
+mkdir -p /newroot/dev /newroot/proc /newroot/sys /newroot/run
+mount --move /dev /newroot/dev || rescue move-dev
+mount --move /sys /newroot/sys || exec /bin/sh
+mount --move /run /newroot/run || exec /bin/sh
+mount --move /proc /newroot/proc || exec /bin/sh
+exec switch_root /newroot /sbin/init

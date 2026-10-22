@@ -1,0 +1,47 @@
+{
+  "date": "2026-10-23",
+  "scope": "Public reference source on host only",
+  "device_access": false,
+  "platform": "macOS arm64",
+  "python": "3",
+  "c_compiler": "Apple Clang",
+  "failed_tests": 0,
+  "fixture_only": true,
+  "limitations": [
+    "Not a device installation or broad hardware compatibility test",
+    "Public guards intentionally differ from the separately validated private installed build",
+    "Linux CI is a separate subsequent validation run"
+  ],
+  "results": [
+    {
+      "command": "python3 -B components/android-system-switch-ui/app/test_host.py",
+      "cases": 27,
+      "result": "PASS"
+    },
+    {
+      "command": "python3 -B components/android-system-switch-ui/app/test_backend_host.py",
+      "cases": 42,
+      "result": "PASS",
+      "root_process_started": false
+    },
+    {
+      "command": "python3 -B -m unittest discover -s components/android-system-switch-ui/backend -p 'test_*.py' -v",
+      "cases": 43,
+      "result": "PASS"
+    },
+    {
+      "command": "python3 -B -m unittest discover -s components/android-system-switch-ui/tests -p 'test_*.py' -v",
+      "cases": 4,
+      "result": "PASS"
+    },
+    {
+      "command": "python3 -B components/android-system-switch-ui/app/build.py",
+      "result": "PASS",
+      "jdk": 17,
+      "android_platform": 33,
+      "android_build_tools": "35.0.0",
+      "signed": false,
+      "output_committed": false
+    }
+  ]
+}

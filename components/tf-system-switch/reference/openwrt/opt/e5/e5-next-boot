@@ -1,0 +1,79 @@
+#!/bin/sh
+# PUBLIC_REFERENCE_GUARD_BEGIN
+printf "%s\n" "Reference-only export: device execution is disabled." >&2
+exit 64
+# PUBLIC_REFERENCE_GUARD_END
+# Bound TF root only; keeps the existing infoscreen command interface.
+set -eu
+umask 077
+BB=/usr/local/bin/busybox
+TF_BINDING=/etc/e5/tf-binding.conf
+TF_DEV_PREFIX=/dev
+. /opt/e5/tf-common.sh
+tf_load
+CONF=/etc/e5linux/default-boot
+REQUEST=/etc/e5/local-switch/return-to-linux
+BOOTCTL=/opt/e5/e5-tf-bootctl
+mode=${1:-status}
+[ "$#" -le 1 ] || exit 2
+case "$mode" in linux|android|--rearm|--confirm-return|status|next) ;; *) exit 2 ;; esac
+tf_internal
+[ -x "$BOOTCTL" ] || { tf_fail bootctl; exit 1; }
+"$BOOTCTL" check >/dev/null
+case "$mode" in
+    next) exec "$BOOTCTL" next ;;
+    status) printf 'default boot: %s\n' "$(cat "$CONF" 2>/dev/null || echo android)"; printf 'next boot: '; exec "$BOOTCTL" next ;;
+esac
+tf_running_root
+for p in /etc/e5 /etc/e5/local-switch /etc/e5linux; do [ -d "$p" ] && [ ! -L "$p" ] || { tf_fail marker-parent; exit 1; }; done
+for f in "$CONF" "$REQUEST"; do [ ! -L "$f" ] && { [ ! -e "$f" ] || [ -f "$f" ]; } || { tf_fail marker-type; exit 1; }; done
+tmp=$("$BB" mktemp -d /run/e5-tf-switch.XXXXXX)
+changed=0
+done_ok=0
+lockheld=0
+cleanup() {
+    rc=$?
+    trap - EXIT HUP INT TERM
+    if [ "$changed" = 1 ] && [ "$done_ok" != 1 ]; then
+        for name in default request; do
+            case "$name" in default) f=$CONF ;; request) f=$REQUEST ;; esac
+            if [ -f "$tmp/$name.before" ]; then "$BB" cp "$tmp/$name.before" "$f"; else "$BB" rm -f "$f"; fi
+        done
+        "$BB" sync
+    fi
+    "$BB" rm -f "$tmp/default.before" "$tmp/request.before" "$tmp/expected" "$tmp/native-before.bc32"
+    "$BB" rmdir "$tmp" 2>/dev/null || true
+    [ "$lockheld" != 1 ] || "$BB" rmdir /run/e5-tf-switch.lock
+    exit "$rc"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+"$BB" mkdir /run/e5-tf-switch.lock 2>/dev/null || { tf_fail switch-busy; exit 1; }
+lockheld=1
+printf 'e5-tf-return-v1\n%s\n%s\n' "$TF_INSTALL_ID" "$TF_KERNEL_RELEASE" > "$tmp/expected"
+if [ -e "$REQUEST" ]; then
+    "$BB" cmp -s "$REQUEST" "$tmp/expected" || { tf_fail invalid-return-request; exit 1; }
+fi
+case "$mode" in
+    --confirm-return)
+        if [ -e "$REQUEST" ]; then mode=linux
+        elif [ "$(cat "$CONF" 2>/dev/null)" = linux ]; then mode=--rearm
+        else echo 'default boot is not linux, nothing to do'; exit 0; fi ;;
+    --rearm) [ "$(cat "$CONF" 2>/dev/null)" = linux ] || { echo 'default boot is not linux, nothing to do'; exit 0; } ;;
+esac
+for entry in "$CONF:default" "$REQUEST:request"; do
+    f=${entry%:*}; name=${entry##*:}
+    [ ! -f "$f" ] || "$BB" cp "$f" "$tmp/$name.before"
+done
+changed=1
+if [ "$mode" = android ]; then target=android; native=android; else target=linux; native=arm; fi
+conf_tmp=$("$BB" mktemp /etc/e5linux/.default-boot.XXXXXX)
+printf '%s\n' "$target" > "$conf_tmp"
+"$BB" chmod 0600 "$conf_tmp"
+"$BB" mv -f "$conf_tmp" "$CONF"
+"$BB" rm -f "$REQUEST"
+"$BB" sync
+# Native transaction owns exactly misc@2048+32 with fresh CRC and rollback.
+"$BOOTCTL" "$native" "$tmp/native-before.bc32"
+done_ok=1
+printf 'default boot: %s\n' "$target"

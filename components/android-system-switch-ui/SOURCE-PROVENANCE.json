@@ -1,0 +1,229 @@
+{
+  "format": 1,
+  "scope": "Selected reference source export, not an installable device package",
+  "source_paths": "Repository-relative logical work paths; private binding/material/evidence inputs omitted",
+  "files": [
+    {
+      "path": "app/AndroidManifest.xml",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/AndroidManifest.xml",
+      "publication_changes": [
+        "Reference build label; not a production installation."
+      ],
+      "published_sha256": "37ae2303e510518bd2b7f83694e9a54532b5eebb002f6c323b38ad8a1edb450a"
+    },
+    {
+      "path": "app/build.py",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/build.py",
+      "publication_changes": [
+        "Portable JAVA_HOME/PATH and ANDROID_SDK_ROOT/ANDROID_HOME; public execution disabled metadata."
+      ],
+      "published_sha256": "c08d368c5c7571dda3bdf806b07e67583ced8fbbfba8139aee0fec345843d8a0"
+    },
+    {
+      "path": "app/test_host.py",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/test_host.py",
+      "publication_changes": [
+        "Portable JDK discovery."
+      ],
+      "published_sha256": "1bc9536ac4d9ac50c00578bc929869e7719c64266fcdfdf8b9f6f618ee392081"
+    },
+    {
+      "path": "app/test_backend_host.py",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/test_backend_host.py",
+      "publication_changes": [
+        "Portable JDK/SDK discovery; create ignored report directory."
+      ],
+      "published_sha256": "74a4dc54ba0e7c0b3fab5b8d460db0cab0f4cf537b4dc86426c04c01e9b9d5a5"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/BackendStatus.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/BackendStatus.java",
+      "publication_changes": [],
+      "published_sha256": "67caab3733d50d0d1fb2b5e17e630ea16bd132c89ffa8dc39ffb2d8594878f90"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/LockGate.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/LockGate.java",
+      "publication_changes": [],
+      "published_sha256": "92cfda5fc55b945c9c06d2e5e6c8b19ae047e2553aac4a7eb89f16c62379596d"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/MainActivity.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/MainActivity.java",
+      "publication_changes": [],
+      "published_sha256": "25382a86f97caec07ffd7425ab2a3ca3ecde2de3db8837f2ded2910c358c0958"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/MenuDiagnostic.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/MenuDiagnostic.java",
+      "publication_changes": [],
+      "published_sha256": "8c9dd63b6ac44a382934eaa2fb13a7e26b2709f36bcd04adca853a127a0aba9e"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/MenuMatcher.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/MenuMatcher.java",
+      "publication_changes": [],
+      "published_sha256": "b0ab3bc3b5a5925c784fcc5ebb60fafc02ff9dab43d325cd9a1363381a67bc7f"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/PowerMenuService.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/PowerMenuService.java",
+      "publication_changes": [],
+      "published_sha256": "0e72ff0658930f2c7599860bd7c900842937417a1fc739587e2f553cd57405f7"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/ProgressService.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/ProgressService.java",
+      "publication_changes": [],
+      "published_sha256": "c4dbc3c3c8bf72f820ab6724d0088d677bf8d5cbf46fd4062ab69c94bf7d46b8"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/RootSession.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/RootSession.java",
+      "publication_changes": [
+        "All root execution unconditionally disabled at open(); original implementation retained without a call site."
+      ],
+      "published_sha256": "7fb50b92b663a3f67025243809d859f032525256b8c0df9796fcaaa544a507ea"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/StatusPresentation.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/StatusPresentation.java",
+      "publication_changes": [],
+      "published_sha256": "30fcec134072ea673aa379d9f9d79eb1d135f7abe5b233af6ed001da59027a3f"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/SwitchBackend.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/SwitchBackend.java",
+      "publication_changes": [],
+      "published_sha256": "a678e6b7086cb33da7bbbe3bd13b54881bb91f4b6609570178f592dd2154b9d1"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/VerifiedPowerMenu.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/src/cn/e5/switchui/VerifiedPowerMenu.java",
+      "publication_changes": [],
+      "published_sha256": "b78e30c53e83d4a1a19dd4a36b29ad599f7db7fbfaf16d6d2690d25d27f72564"
+    },
+    {
+      "path": "app/res/values/styles.xml",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/res/values/styles.xml",
+      "publication_changes": [],
+      "published_sha256": "381303068b82632cc2ae5ae634a2b5514211d17a7d3219525fc5049306c3609a"
+    },
+    {
+      "path": "app/res/xml/accessibility_service.xml",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/res/xml/accessibility_service.xml",
+      "publication_changes": [],
+      "published_sha256": "8cccae318b75c7ddf9f77d3519de29bb564418f4418715810c5ad14a52edb517"
+    },
+    {
+      "path": "app/tests/BackendSafetyTest.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/tests/BackendSafetyTest.java",
+      "publication_changes": [
+        "Add three reflection tests that every root open mode unconditionally refuses."
+      ],
+      "published_sha256": "5dff240299229abbb389fffc19736a47eb49d16f8bdadc17f43cbd3f4dff4165"
+    },
+    {
+      "path": "app/tests/UiSafetyTest.java",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/tests/UiSafetyTest.java",
+      "publication_changes": [],
+      "published_sha256": "e46b6800732fbb526fc6c614ba4d0e8fecfeb5b2327509b0bb93f0ac03865a51"
+    },
+    {
+      "path": "backend/reference/action.sh",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/module-v6/action.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before source body; no binding files or executable helpers published."
+      ],
+      "published_sha256": "9f0671abf646bf6ac263891800044b2c3e4ff642ffd293ba037a0ceacdb857be"
+    },
+    {
+      "path": "backend/reference/switch.sh",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/module-v6/switch.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before source body; no binding files or executable helpers published."
+      ],
+      "published_sha256": "c4eef0000228809aa7f948de6bc153d02057b1591f2772f0dd739f40b9f43d62"
+    },
+    {
+      "path": "backend/reference/tf-common.sh",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/module-v6/tf-common.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before source body; no binding files or executable helpers published."
+      ],
+      "published_sha256": "80054f4d8159f21c9bbf3667a60486068a84b93da13e6a281774086d2751909d"
+    },
+    {
+      "path": "backend/reference/customize.sh",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/module-v6/customize.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before source body; no binding files or executable helpers published."
+      ],
+      "published_sha256": "c8a7ae35ee9521ef68957199dde28160bc4781e5c20051242b66d909685df508"
+    },
+    {
+      "path": "backend/reference/ui-common.sh",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/module-v6/ui-common.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before source body; no binding files or executable helpers published."
+      ],
+      "published_sha256": "da4a51e3a4c276ce529b0f01f350f7db94c04bde6a6ff9c23626d7f2b7d8d730"
+    },
+    {
+      "path": "backend/reference/ui-backend.sh",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/module-v6/ui-backend.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before source body; no binding files or executable helpers published."
+      ],
+      "published_sha256": "14480860903dd1029641c92c9a357b620e6955c17718b017696dc9aa8d67d1e8"
+    },
+    {
+      "path": "backend/reference/ui-worker.sh",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/module-v6/ui-worker.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before source body; no binding files or executable helpers published."
+      ],
+      "published_sha256": "e1afdae2b45c45558db06516e60999944305b4457da4fe14d5b24d7fb7e92eb9"
+    },
+    {
+      "path": "backend/reference-baseline/switch.sh",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/module-v5/module/switch.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal; pre-progress source comparison only."
+      ],
+      "published_sha256": "7942dd38770a9c96683b3fa2ef39f6d0171df0eaa910188c874a7fa4020077c7"
+    },
+    {
+      "path": "backend/ui-stream.c",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/ui-stream.c",
+      "publication_changes": [
+        "Default executable is unconditional status-64 stub; original observer restricted to explicit host-fixture compilation."
+      ],
+      "published_sha256": "6fcf4b50cc9d00bb780e33ce795ba46230a5ba4a8633aaa14a23eea858f9834e"
+    },
+    {
+      "path": "backend/test_backend.py",
+      "upstream_work_path": "tools/e5_android_switch_ui_20261022/backend/test_backend.py",
+      "publication_changes": [
+        "Strip exact publication stop guard only in isolated temporary fixture copies; omit private artifact comparison; explicit fixture compilation."
+      ],
+      "published_sha256": "813d650f6ba565b5ab70c375b4fc08ac512d8d2d8c8745631b29a3f403fe3d03"
+    },
+    {
+      "path": "backend/test_zram.py",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/test_android_module_v4_zram.py",
+      "publication_changes": [
+        "Retain 15 synthetic zram guard cases; omit private version-artifact comparison; strip public guard in temp fixtures."
+      ],
+      "published_sha256": "c3c35ca141193fef912a8c04c9309579705357a17afccd1598b5e1b51808b443"
+    },
+    {
+      "path": "backend/test_namespace.py",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/test_android_module_v5_namespace.py",
+      "publication_changes": [
+        "Retain 10 fake-BusyBox namespace cases; omit private module artifact comparison; strip public guard in temp fixtures."
+      ],
+      "published_sha256": "5b754179bbf5049011b8312aeb9440a0909630f35b448255e4aadf2e75c71415"
+    }
+  ]
+}

@@ -2,71 +2,64 @@
 
 [中文](README.md) · [Project introduction](docs/project-intro.en.md)
 
-OpenWrt network management and on-device controls for the Rongyue E5: share a cellular connection over Wi-Fi, check signal and data usage, control OpenClash from the built-in screen, and switch between Android and OpenWrt.
+A cellular hotspot, on-device network controls and Android / OpenWrt switching on the Rongyue E5. The built-in screen shows signal and data usage, manages the hotspot, and controls OpenClash routing modes and proxy selection.
+
+**OpenWrt now runs from a TF (microSD) card; Android remains on internal storage.** Routine switching uses the device's screen without a computer or reflashing. Keep the provisioned card inserted while using OpenWrt.
 
 ## Features
 
-- **Portable hotspot:** share the cellular connection with phones, computers and other devices connected to the E5's Wi-Fi.
-- **Hotspot screen controls:** change the password and refresh its QR code, view clients, traffic and connection time, disconnect clients, and manage a blacklist.
-- **On-device status:** view connectivity, signal strength, radio band, data usage, battery level, temperatures and memory usage.
-- **OpenClash screen controls:** change routing modes, select a proxy and run manual HTTPS latency checks.
-- **System switching:** reboot into Android from the OpenWrt screen, then use a Magisk module in Android to reboot back into OpenWrt.
+- **Portable hotspot:** share cellular connectivity with phones and computers over Wi-Fi.
+- **Screen dashboard:** view connectivity, signal, radio band, traffic, battery, temperatures and memory usage.
+- **OpenClash controls:** choose four routing modes, save a proxy selection and run manual HTTPS latency checks.
+- **Hotspot management:** change the password and refresh its QR code, inspect clients and traffic, disconnect, block or unblock clients.
+- **System switching:** enter Android from the OpenWrt screen; return through an additional entry below Android's power menu and make OpenWrt the default.
 
-![Overview, signal, OpenClash, data usage and system-switch screens](docs/images/e5-interface-overview.png)
+![Overview, signal, OpenClash, traffic and system-switch screens](docs/images/e5-interface-overview.png)
 
 ## Control OpenClash on the device
 
-Open **Apps → OpenClash** to see the service status, routing mode and selected proxy. Use touch or the direction and confirm keys to:
+Open **Apps → OpenClash** and use touch or the direction and confirm keys to:
 
-- Switch between **Direct, GFW, Mainland whitelist and Global** modes.
-- Select a proxy from the list; the selection is saved and applied automatically.
-- Choose **Test all** to see each proxy's HTTPS request latency and test time.
+- Choose **Direct, GFW, Mainland whitelist or Global** mode.
+- Select a proxy; the selection is saved and applied.
+- Choose **Test all** to view HTTPS request latency and the test time for each proxy.
 
-Mode and proxy changes do not require a device reboot. Latency tests run on request and do not automatically select a different proxy.
+Mode and proxy changes do not require a device reboot. Tests run on request and do not automatically change the selected proxy.
 
 ![OpenClash status, routing controls and proxy selection](docs/images/e5-openclash-focus.png)
 
-## Manage the hotspot and its clients
-
-Open **Hotspot → Change hotspot password** and use the screen keyboard or
-physical number keys. Saving refreshes the join QR code; clients must reconnect
-with the new password.
-
-Open **Hotspot → Manage clients / Blacklist** to view connected devices,
-upload/download totals and rates, and connection or observation time. Counters
-start after discovery, include proxy/local traffic, reset after restart, and
-are not cellular billing figures. Clients can be disconnected or added to a
-persistent blacklist, with an unblock control in the blacklist tab.
-
-The current plugin is **1.0.3-local**. Its [source and integration guide](components/hotspot-screen/README.md)
-list compatibility requirements, 19 host-only tests, and the deferred separate
-reconnection-after-unblock device test.
-
 ## Switch between Android and OpenWrt
 
-| Direction | Control |
+| Direction | Control and default behavior |
 | --- | --- |
-| OpenWrt → Android | Built-in screen: Advanced → System → Switch to Android |
-| Android → OpenWrt | Magisk → Modules → E5 System Switch · Enter OpenWrt → Action |
+| OpenWrt → Android | **Advanced → System → Switch to Android**, then confirm; ordinary Android reboots stay in Android |
+| Android → OpenWrt | Hold the power button, choose **Return to OpenWrt / Set as default** below the original menu, then confirm; validation is followed by an automatic reboot and restoration of the OpenWrt default |
 
-Switching reboots the device and interrupts its hotspot connection. Once installation is complete, routine switching needs no computer, microSD card or reflashing.
+![Additional OpenWrt entry below Android's power menu](docs/images/e5-android-power-menu.png)
+
+The return flow shows actual stages and elapsed time. Closing and reopening the page displays the same task. One full return on this device took about **11 minutes**; this is an observation, not a deadline. Submit once, keep power connected and wait for the automatic reboot. Do not manually reboot or remove the card during the operation. Switching interrupts the hotspot; cellular and network services also need time to start.
+
+See the [usage and TF architecture guide](docs/tf-system-switch.en.md). The Android app is `1.0-local`; the local switching module is `1.1.3-tf-local`.
+
+## Hotspot password and client controls
+
+**Hotspot → Change hotspot password** supports the screen keyboard and physical number keys. Saving refreshes the QR code; clients must reconnect. **Manage clients / Blacklist** shows connection state, upload/download totals and rates, and connection or observation time, with disconnect, block and unblock controls.
+
+Counters start after discovery, include proxy and local traffic, and reset on restart. They are not cellular billing figures. See the [hotspot plugin guide](components/hotspot-screen/README.md) for implementation and validation limits.
 
 ## Documentation and source
 
 - **Project introduction:** [English](docs/project-intro.en.md) / [中文](docs/project-intro.zh-CN.md)
-- **OpenClash screen plugin:** [Source, build instructions and compatibility requirements](components/openclash-screen/README.md)
-- **Hotspot screen plugin:** [Password, QR code, client accounting and blacklist](components/hotspot-screen/README.md)
-- **System switching:** [Usage and implementation reference](components/system-switch/README.md)
-- **Development history:** [English timeline](docs/history/timeline.en.md) / [中文记录](docs/history/timeline.zh-CN.md)
-- **Development source:** [Source catalog by stage](archive/CATALOG.md) · [Host tools and tests](tools/README.md)
-- **Validation:** [Device tests, known issues and screenshot notes](docs/validation.md)
+- **Switching and architecture:** [English](docs/tf-system-switch.en.md) / [中文](docs/tf-system-switch.zh-CN.md)
+- **Screen plugins:** [OpenClash](components/openclash-screen/README.md) · [Hotspot controls](components/hotspot-screen/README.md)
+- **Current switching implementation:** [Android menu and progress UI](components/android-system-switch-ui/README.md) · [TF boot and switching reference](components/tf-system-switch/README.md)
+- **Development history:** [English](docs/history/timeline.en.md) / [中文](docs/history/timeline.zh-CN.md) · [Historical source catalog](archive/CATALOG.md)
+- **Validation:** [Device observations and limits](docs/validation.md) · [Host tools](tools/README.md)
 
-## Project status
+## Status and sources
 
-This repository documents the integration and development work on one Rongyue E5. Known storage reliability issues and remaining tests are detailed in the [validation record](docs/validation.md). Published system-switching code is a sanitized implementation reference; the repository does not provide a complete firmware image or an installable switching module.
+This is an integration project for one E5. TF migration, switching in both directions, default boot behavior and the new Android entry have device evidence. The exact scope of screen, client-network and stability validation is recorded in [validation](docs/validation.md). Migration and successful connectivity tests do not establish that historical intermittent disconnections are permanently fixed.
 
-## Sources and license
+This repository provides source and sanitized implementation references, not complete firmware or a switching package ready for another device. Public boot and switching scripts refuse device operations by default. Private bindings, configuration and backups are excluded. The [former installation without a TF card](components/system-switch/README.md) is retained only as historical reference.
 
-The base system and screen UI build on [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and [Enceka/infoscreen](https://github.com/Enceka/infoscreen). This project adds hotspot and OpenClash screen controls and device-specific system-switching integration using [OpenClash](https://github.com/vernesong/OpenClash), [Mihomo](https://github.com/MetaCubeX/mihomo) and [Magisk](https://github.com/topjohnwu/Magisk).
-
-Original code and documentation use the [MIT License](LICENSE). Third-party works retain their own copyrights and licenses; see the [third-party notices](THIRD_PARTY_NOTICES.md) for exact versions and attribution.
+The base system and screen framework come from [Enceka/e5-linux](https://github.com/Enceka/e5-linux) and [Enceka/infoscreen](https://github.com/Enceka/infoscreen), with [OpenClash](https://github.com/vernesong/OpenClash), [Mihomo](https://github.com/MetaCubeX/mihomo) and [Magisk](https://github.com/topjohnwu/Magisk). Original project code and documentation use the [MIT License](LICENSE). Third-party works retain their copyrights and licenses; see [sources and licensing](THIRD_PARTY_NOTICES.md).

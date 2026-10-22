@@ -1,0 +1,10 @@
+#!/bin/sh /etc/rc.common
+# PUBLIC_REFERENCE_GUARD_BEGIN
+printf "%s\n" "Reference-only export: device execution is disabled." >&2
+exit 64
+# PUBLIC_REFERENCE_GUARD_END
+START=99
+start() {
+    # The helper validates the exact running card and kernel before any rearm.
+    /opt/e5/e5-next-boot --confirm-return 2>&1 | logger -t e5-boot-ok
+}

@@ -1,0 +1,17 @@
+#!/bin/sh
+# PUBLIC_REFERENCE_GUARD_BEGIN
+printf "%s\n" "Reference-only export: device execution is disabled." >&2
+exit 64
+# PUBLIC_REFERENCE_GUARD_END
+# Single bound TF OpenWrt root. Android/Linux choice is e5-next-boot.
+set -eu
+[ "$#" -le 1 ] || { echo 'TF single-root layout does not support root replacement or --once' >&2; exit 2; }
+case "${1:-status}" in
+    status)
+        echo 'boot-os: openwrt (TF)'
+        echo 'running: openwrt'
+        echo 'installed: openwrt(TF)'
+        ;;
+    openwrt) echo 'next boot: openwrt (TF); Android/Linux selection uses e5-next-boot' ;;
+    *) echo 'Only the bound TF OpenWrt root is installed; root replacement is disabled.' >&2; exit 1 ;;
+esac

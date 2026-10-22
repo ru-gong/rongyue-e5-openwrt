@@ -4,6 +4,7 @@ __pycache__/
 .venv/
 dist/
 build/
+build-sdk/
 .env
 .env.*
 *.private.*
@@ -16,5 +17,12 @@ build/
 *.tgz
 *.key
 *.pem
+*.apk
+*.aab
+*.dex
+*.jks
+*.keystore
+*.p12
+*.pfx
 known_hosts
 ssh-askpass*

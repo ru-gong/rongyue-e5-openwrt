@@ -6,16 +6,34 @@ permissions:
   contents: read
 jobs:
   publication-and-plugin:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
       - name: Install YAML runtime used by the plugin tests
         run: sudo apt-get update && sudo apt-get install -y ruby
       - name: Check public contents and inert system-switch references
         run: python scripts/check_publication.py
+      - name: Install the Android compile SDK used by the reference UI
+        run: sdkmanager "platforms;android-33" "build-tools;35.0.0"
+      - name: Test Android menu matching, protocol and fixed command boundaries
+        run: |
+          python components/android-system-switch-ui/app/test_host.py
+          python components/android-system-switch-ui/app/test_backend_host.py
+      - name: Test detached worker and status observer using isolated fixtures
+        run: python -m unittest discover -s components/android-system-switch-ui/backend -p 'test_*.py' -v
+      - name: Check that public Android and native entry points cannot access a device
+        run: python -m unittest discover -s components/android-system-switch-ui/tests -p 'test_*.py' -v
+      - name: Test TF boot control and userdata guards using isolated fixtures
+        run: python -m unittest discover -s components/tf-system-switch/tests -p 'test_*.py' -v
+      - name: Compile the unsigned reference UI without installing or publishing it
+        run: python components/android-system-switch-ui/app/build.py
       - name: Test modes, persistence, rollback and node operations
         run: python -m unittest discover -s components/openclash-screen -p 'test_*.py' -v
       - name: Test hotspot credentials, counters, rollback and native ACL behavior

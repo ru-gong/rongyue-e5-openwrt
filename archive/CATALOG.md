@@ -16,3 +16,22 @@ Browse original paths and sanitized sources by category. Dates and version label
 完整机器索引见 [index.json](index.json)，包含去重哈希、字节数、替换计数及源码候选排除原因。
 
 The full [index.json](index.json) includes deduplication hashes, byte counts, redaction counts, and reasons for excluded source candidates.
+
+## 后续 TF 与 Android 界面实现 / Later TF and Android UI work
+
+2026 年 10 月 23 日新增的核心实现按组件整理，独立于上述历史去重归档。
+每个组件的 `SOURCE-PROVENANCE.json` 记录逻辑来源路径、公开版本的修改和文件校验值；
+不包含设备绑定、固件、签名材料或原始设备记录。
+
+The later core implementations are organized as components, separately from the
+historical deduplicated archive. Each `SOURCE-PROVENANCE.json` maps logical source
+paths, publication changes and published file hashes. Device bindings, firmware,
+signing material and raw device records are excluded.
+
+- [Android 电源菜单、进度页与后台 / Android power-menu UI and progress backend](../components/android-system-switch-ui/README.md)
+- [TF 启动、系统选择与保护检查 / TF boot and system-switch references](../components/tf-system-switch/README.md)
+- [TF 方案与使用说明（中文）](../docs/tf-system-switch.zh-CN.md) / [TF design and usage (English)](../docs/tf-system-switch.en.md)
+
+这些是可审阅并运行隔离主机测试的参考源码，设备执行入口已停用，不是通用安装包。
+These references support source review and isolated host tests; device execution
+entry points are disabled and they are not general-purpose installation packages.

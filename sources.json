@@ -1,7 +1,7 @@
 {
-  "reviewed_on": "2026-10-20",
+  "reviewed_on": "2026-10-23",
   "timezone": "Asia/Shanghai",
-  "note": "Fixed revisions refer to the cited source or installed dependency as identified in THIRD_PARTY_NOTICES.md; current verification refs for mu300-linux and original spreadtrum_flash are not claimed as historical build inputs.",
+  "note": "Fixed revisions refer to the cited source or installed dependency as identified in THIRD_PARTY_NOTICES.md. The 2026-10-23 review adds Android/TF source attribution without silently upgrading earlier dependency pins. Current verification refs for mu300-linux and original spreadtrum_flash are not claimed as historical build inputs.",
   "sources": [
     {
       "component": "e5-linux",
@@ -12,7 +12,25 @@
       "sha256": "33f2068d58f9b43f9282b7621db24efdcf32b409a14fcc8d221efe22f5e83ce6",
       "license_file": "LICENSES/MIT-Enceka.txt",
       "distributed_upstream_binary": false,
-      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+      "scope": "MIT source excerpts and adaptations in historical references and new TF boot-control/init source; no complete upstream tree, kernel or binary bundled",
+      "adapted_sources": [
+        {
+          "path": "magisk/e5-linux-switch/bootctl.c",
+          "source_url": "https://github.com/Enceka/e5-linux/blob/569f13d4ce15585f70817c2a1e03bb574a84720b/magisk/e5-linux-switch/bootctl.c",
+          "source_sha256": "1434dc9d45cb7e146fbbcb5780b585c4d400003f95024db6e5aa4e1626aa34f1"
+        },
+        {
+          "path": "boot/init",
+          "source_url": "https://github.com/Enceka/e5-linux/blob/569f13d4ce15585f70817c2a1e03bb574a84720b/boot/init",
+          "source_sha256": "e8b0c8600f0bd39f20f73348bb3a1bde0cb9738dfd837050de8be621e724ed3d"
+        },
+        {
+          "path": "magisk/e5-linux-switch/switch.sh",
+          "source_url": "https://github.com/Enceka/e5-linux/blob/569f13d4ce15585f70817c2a1e03bb574a84720b/magisk/e5-linux-switch/switch.sh",
+          "source_sha256": "42fb04864e224a8a0cf3f65dfab1b3a10cfc3af142cdcb7182ffdf108784c70b"
+        }
+      ],
+      "public_component": "components/tf-system-switch"
     },
     {
       "component": "infoscreen",
@@ -56,7 +74,8 @@
       "sha256": "589ed823e9a84c56feb95ac58e7cf384626b9cbf4fda2a907bc36e103de1bad2",
       "license_file": "LICENSES/GPL-3.0-Magisk-canary-28103.txt",
       "distributed_upstream_binary": false,
-      "scope": "external dependency or cited source; see THIRD_PARTY_NOTICES.md for included excerpts"
+      "scope": "External Android root and module runtime; source examined for Action behavior, but Magisk/BusyBox/libsu implementation and binaries are not bundled",
+      "interface_reference_url": "https://github.com/topjohnwu/Magisk/blob/1e3edb888375c75777120a018637b5d945df6d15/docs/guides.md"
     },
     {
       "component": "mu300-linux",
@@ -101,6 +120,57 @@
       "sha256": "4a4d5c03ac503d809243f9d8de5517601e345990a85b6a59666c3f1caca02474",
       "distributed_upstream_binary": false,
       "scope": "external build system; distribution packages have separate licenses"
+    }
+  ],
+  "new_components": [
+    {
+      "path": "components/android-system-switch-ui",
+      "local_license": "MIT",
+      "copyright": "Copyright (c) 2026 ru-gong",
+      "scope": "Original Java/XML, fixed-command UI adapter, shell progress worker, C observer and tests; disabled sanitized reference source only",
+      "external_interfaces": [
+        "Android API 33 including platform org.json",
+        "Existing Magisk su / BusyBox command interface",
+        "Linux UAPI and libc"
+      ],
+      "bundled_upstream_implementation": false,
+      "bundled_binary": false
+    },
+    {
+      "path": "components/tf-system-switch",
+      "local_additions_license": "MIT",
+      "copyright": "Copyright (c) 2026 ru-gong",
+      "upstream_component": "e5-linux",
+      "upstream_license_file": "LICENSES/MIT-Enceka.txt",
+      "upstream_copyright": "Copyright (c) 2026 Enceka <enceka@yeah.net>",
+      "scope": "Adapted MIT boot-control/init source and local TF guards; disabled sanitized reference source only",
+      "bundled_binary": false
+    }
+  ],
+  "interface_and_build_references": [
+    {
+      "component": "Android SDK",
+      "api_level": 33,
+      "build_tools_version": "35.0.0",
+      "jdk_major_version": 17,
+      "source_url": "https://developer.android.com/studio/terms",
+      "license_scope": "Google Android SDK License Agreement plus separate licenses for individual open-source components; SDK is not relicensed by this project",
+      "checked_on": "2026-10-23",
+      "bundled": false
+    },
+    {
+      "component": "Android AccessibilityService API",
+      "source_url": "https://developer.android.com/reference/android/accessibilityservice/AccessibilityService",
+      "role": "API documentation only; no documentation examples or platform/vendor implementation copied",
+      "checked_on": "2026-10-23",
+      "bundled": false
+    },
+    {
+      "component": "Linux UAPI licensing boundary",
+      "source_url": "https://docs.kernel.org/process/license-rules.html",
+      "role": "Documentation of syscall/UAPI license exception; kernel headers and implementation are not vendored by these components",
+      "checked_on": "2026-10-23",
+      "bundled": false
     }
   ]
 }

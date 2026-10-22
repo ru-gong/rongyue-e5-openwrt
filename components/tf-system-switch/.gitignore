@@ -1,0 +1,9 @@
+build/
+app/build/
+app/build-sdk/
+__pycache__/
+*.pyc
+*.apk
+*.elf
+*.jks
+*.keystore

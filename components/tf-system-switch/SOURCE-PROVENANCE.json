@@ -1,0 +1,82 @@
+{
+  "format": 1,
+  "scope": "Selected reference source export, not an installable device package",
+  "source_paths": "Repository-relative logical work paths; private binding/material/evidence inputs omitted",
+  "files": [
+    {
+      "path": "reference/initramfs/init",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/bound-v3/initramfs/init",
+      "publication_changes": [
+        "Unconditional status-64 refusal before any device operation; generic USB MAC examples in init; bindings and manifests omitted."
+      ],
+      "published_sha256": "150338c719734328bc322a664fe734a74453c6f29ca81d35a091914de5fae11e"
+    },
+    {
+      "path": "reference/initramfs/tf-common.sh",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/bound-v3/initramfs/lib/e5-tf-common.sh",
+      "publication_changes": [
+        "Unconditional status-64 refusal before any device operation; generic USB MAC examples in init; bindings and manifests omitted."
+      ],
+      "published_sha256": "27538e76ce5eaff99d3d375a904ced8d369abf4badabc045ed56f147a3652304"
+    },
+    {
+      "path": "reference/openwrt/opt/e5/e5-next-boot",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/overlay-v4/root-overlay/opt/e5/e5-next-boot",
+      "publication_changes": [
+        "Unconditional status-64 refusal before any device operation; generic USB MAC examples in init; bindings and manifests omitted."
+      ],
+      "published_sha256": "ebaf6ca1c2ca9be48660aec7c89d3596f4af17a193e2e3403e966c3e90187e69"
+    },
+    {
+      "path": "reference/openwrt/opt/e5/e5-os",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/overlay-v4/root-overlay/opt/e5/e5-os",
+      "publication_changes": [
+        "Unconditional status-64 refusal before any device operation; generic USB MAC examples in init; bindings and manifests omitted."
+      ],
+      "published_sha256": "653fa746bf9c2cf15e494323e6973287277ae14ff35a55f34c89ecb73846ecbb"
+    },
+    {
+      "path": "reference/openwrt/etc/init.d/e5-boot-ok",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/overlay-v4/root-overlay/etc/init.d/e5-boot-ok",
+      "publication_changes": [
+        "Unconditional status-64 refusal before any device operation; generic USB MAC examples in init; bindings and manifests omitted."
+      ],
+      "published_sha256": "70fe05d485c4107ed11234e75ead1ab40d3c36b68e3a2b402a1382f4feab9c17"
+    },
+    {
+      "path": "native/bootctl.c",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/bootctl.c",
+      "publication_changes": [
+        "Default executable is unconditional status-64 stub; explicit synthetic fixture build only; bootctl test fd restricted to owned regular files without symlinks.",
+        "Split test-mode statements for GCC warning portability."
+      ],
+      "published_sha256": "2c5862e3f001399f77386b5ac06ec1d1310daaca184a557b9a096c42f1f6bbec"
+    },
+    {
+      "path": "native/tf-idle.c",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/tf-idle.c",
+      "publication_changes": [
+        "Default executable is unconditional status-64 stub; explicit synthetic fixture build only; bootctl test fd restricted to owned regular files without symlinks.",
+        "Split test-mode statements for GCC warning portability."
+      ],
+      "published_sha256": "38338334d0248c31d56e1f0682d448b451eed656687ba8ee16b6b4555228761a"
+    },
+    {
+      "path": "tests/test_boot_switch.py",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/test_boot_switch.py",
+      "publication_changes": [
+        "Only native fixture and isolated root-switch transaction tests; private preparation/import/artifact tests omitted; exact stop guard removed only from temporary mocks."
+      ],
+      "published_sha256": "4502bddfbc1d23edd4385f1b498e5da2d6adf51b569a231c55c01c43d9efac81"
+    },
+    {
+      "path": "tests/test_userdata_guard.py",
+      "upstream_work_path": "tools/e5_tf_migration_20261022/boot-switch/test_userdata_guard.py",
+      "publication_changes": [
+        "Exact stop guard removed only in synthetic temp tree; no device binding or block access.",
+        "Canonicalize temporary fixture root for macOS /var alias."
+      ],
+      "published_sha256": "61aa9694332ac657fdda525ed1c2c8e29f00943b22868969f38a9fb5c0e27faf"
+    }
+  ]
+}

@@ -1,0 +1,46 @@
+{
+  "format": 1,
+  "device_execution_enabled": false,
+  "guards": [
+    {
+      "path": "backend/reference/action.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/reference/customize.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/reference/switch.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/reference/tf-common.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/reference/ui-backend.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/reference/ui-common.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/reference/ui-worker.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/reference-baseline/switch.sh",
+      "kind": "unconditional-shell-exit-64-before-body"
+    },
+    {
+      "path": "backend/ui-stream.c",
+      "kind": "default-unconditional-exit-64; explicit synthetic fixture compilation only"
+    },
+    {
+      "path": "app/src/cn/e5/switchui/RootSession.java",
+      "kind": "open(String) unconditionally throws IOException; preserved process implementation has no caller"
+    }
+  ]
+}

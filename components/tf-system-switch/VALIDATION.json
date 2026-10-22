@@ -1,0 +1,22 @@
+{
+  "date": "2026-10-23",
+  "scope": "Public reference source on host only",
+  "device_access": false,
+  "platform": "macOS arm64",
+  "python": "3",
+  "c_compiler": "Apple Clang",
+  "failed_tests": 0,
+  "fixture_only": true,
+  "limitations": [
+    "Not a device installation or broad hardware compatibility test",
+    "Public guards intentionally differ from the separately validated private installed build",
+    "Linux CI is a separate subsequent validation run"
+  ],
+  "results": [
+    {
+      "command": "python3 -B -m unittest discover -s components/tf-system-switch/tests -p 'test_*.py' -v",
+      "cases": 40,
+      "result": "PASS"
+    }
+  ]
+}

@@ -1,24 +1,25 @@
 # 来源与第三方许可证 / Sources and third-party licenses
 
-核验日期 / Reviewed: **2026-10-20**. 版本与许可证以所引用提交的原文为准，而非仓库当前的徽章。固定 URL、原文文件及 SHA-256 见 [sources.json](sources.json)；原文保存在 [LICENSES](LICENSES/)。
+核验日期 / Reviewed: **2026-10-23**（新增 Android 界面与 TF 切换来源；保留原有依赖版本记录）。版本与许可证以所引用提交的原文为准，而非仓库当前的徽章。固定 URL、原文文件及 SHA-256 见 [sources.json](sources.json)；原文保存在 [LICENSES](LICENSES/)。
 
 Versions and licenses below are tied to the cited source revision, not inferred from a repository's current badge. Exact URLs and license-text hashes are recorded in [sources.json](sources.json).
 
 ## 本仓库的授权范围 / Scope of this repository's license
 
-[根目录 MIT 许可证](LICENSE)，Copyright (c) 2026 ru-gong，适用于本项目原创的热点及 OpenClash 屏幕插件、集成与检查工具、测试和整理文档。第三方代码、保留的上游片段和截图所展示的上游界面仍保留其原作者版权及对应许可证。本项目的 MIT 授权不能替代 OpenWrt、Linux、Mihomo、Magisk 等依赖自身的条款，也不为商标、厂商固件或其他未收录材料授予额外权利。
+[根目录 MIT 许可证](LICENSE)，Copyright (c) 2026 ru-gong，适用于本项目原创的热点及 OpenClash 屏幕插件、Android 切换界面与进度后台、TF 集成与检查工具、测试和整理文档。第三方代码、保留的上游片段和截图所展示的上游界面仍保留其原作者版权及对应许可证。本项目的 MIT 授权不能替代 OpenWrt、Linux、Mihomo、Magisk 等依赖自身的条款，也不为商标、厂商固件或其他未收录材料授予额外权利。
 
-The root MIT license, Copyright (c) 2026 ru-gong, covers this project's original OpenClash and hotspot screen plugins, integration and inspection tools, tests, and authored documentation. Third-party code, retained source excerpts, and upstream UI depicted in screenshots keep their original copyrights and licenses. It does not relicense external dependencies, trademarks, vendor firmware, or materials not included here.
+The root MIT license, Copyright (c) 2026 ru-gong, covers this project's original OpenClash and hotspot screen plugins, Android switch UI and progress backend, TF integration and inspection tools, tests, and authored documentation. Third-party code, retained source excerpts, and upstream UI depicted in screenshots keep their original copyrights and licenses. It does not relicense external dependencies, trademarks, vendor firmware, or materials not included here.
 
 ## 组件与来源 / Components and sources
 
 | 组件 / Component | 用途与版本 / Role and version | 许可证 / License | 本仓库分发范围 / Included here |
 | --- | --- | --- | --- |
-| **Enceka / e5-linux** | E5 的 Linux/OpenWrt 适配、启动控制及安装方案基础；[固定提交 569f13d4](https://github.com/Enceka/e5-linux/tree/569f13d4ce15585f70817c2a1e03bb574a84720b) | 脚本、工具与文档 [MIT](LICENSES/MIT-Enceka.txt)，Copyright (c) 2026 Enceka；内核/驱动保留各文件的 GPL/SPDX | 本地集成参考与历史脚本中的有限上游片段；不包含整机固件或上游完整树 / Local integration references and limited historical source excerpts; no complete firmware or upstream tree |
+| **Enceka / e5-linux** | E5 的 Linux/OpenWrt 适配、启动控制及安装方案基础；[固定提交 569f13d4](https://github.com/Enceka/e5-linux/tree/569f13d4ce15585f70817c2a1e03bb574a84720b) | 脚本、工具与文档 [MIT](LICENSES/MIT-Enceka.txt)，Copyright (c) 2026 Enceka；内核/驱动保留各文件的 GPL/SPDX | 历史片段及 TF 组件中的 bootctl、init 等改编参考源码；不包含固件或上游完整树 / Historical excerpts and adapted TF boot-control/init references; no firmware or complete upstream tree |
 | **Enceka / infoscreen** | 概览、信号、流量、设置等 E5 屏幕框架及 SDK；[固定提交 09b7ec82](https://github.com/Enceka/infoscreen/tree/09b7ec822e56062f1891136c78860d5e257493c6) | [MIT](LICENSES/MIT-Enceka.txt)，Copyright (c) 2026 Enceka | 界面截图与历史转换器中保留的少量 API/UI 片段；本地 OpenClash 插件调用已有 SDK，未打包 SDK / Screenshots and limited API/UI excerpts; existing SDK is referenced, not bundled |
 | **vernesong / OpenClash** | LuCI 代理管理与服务层，v0.48.002；[固定提交 e553e82e](https://github.com/vernesong/OpenClash/tree/e553e82e01c697aefbe1555261a503f425e00ccd) | [MIT](LICENSES/MIT-OpenClash-v0.48.002.txt)，Copyright (c) 2019-2026 vernesong | 外部依赖，未打包 OpenClash APK 或上游源码 / External dependency; no APK or upstream source bundled |
 | **MetaCubeX / Mihomo** | 实际代理核心，v1.19.32；[固定提交 88dcbf7f](https://github.com/MetaCubeX/mihomo/tree/88dcbf7f1614a67c3b36b848ee3592dfa92ada36) | 本机使用版本为 [GNU GPL v3](LICENSES/GPL-3.0-Mihomo-v1.19.32.txt) | 外部依赖；本地插件通过 HTTP API 控制既有核心，未打包核心或复制其实现 / External core accessed through its HTTP API; no core binary or implementation bundled |
-| **topjohnwu / Magisk** | Android root 与模块操作入口；canary 28103 / [1e3edb88](https://github.com/topjohnwu/Magisk/tree/1e3edb888375c75777120a018637b5d945df6d15) | [GNU GPL v3](LICENSES/GPL-3.0-Magisk-canary-28103.txt) | 外部运行环境；仅保留本项目失效、脱敏的模块参考脚本，未打包 APK / External runtime; only disabled, sanitized local module references are included |
+| **topjohnwu / Magisk** | Android root、模块操作入口与已有 BusyBox 环境；canary 28103 / [1e3edb88](https://github.com/topjohnwu/Magisk/tree/1e3edb888375c75777120a018637b5d945df6d15) | Magisk 本体 [GNU GPL v3](LICENSES/GPL-3.0-Magisk-canary-28103.txt)；随附外部组件按各自许可 | 外部运行环境；本地界面调用已有 su/模块命令，未打包 Magisk、BusyBox 或 libsu 源码/二进制 / External runtime; no Magisk, BusyBox or libsu implementation bundled |
+| **Android SDK / platform APIs** | 本地界面使用 API 33；构建参考为 SDK Platform 33、Build Tools 35.0.0、JDK 17 | SDK 按 [Google SDK 条款](https://developer.android.com/studio/terms)及各组件的独立许可；不是本项目 MIT 授权对象 | 仅原创 Java/XML 与构建参考；无 android.jar、工具链、第三方 JAR/AAR、厂商 SystemUI 源码或资源 / Original app source and build references only; no SDK or vendor implementation |
 | **OpenWrt** | 25.12.5 系统基础；[固定提交 f0a60eee](https://github.com/openwrt/openwrt/tree/f0a60eee2fe051741c643ea6118718aae1ef17fb) | 构建系统 [GPL-2.0-only](LICENSES/OpenWrt-v25.12.5-COPYING.txt)；[GPLv2 原文](LICENSES/GPL-2.0-OpenWrt-v25.12.5.txt)；软件包另按各自许可 | 外部系统，不包含 rootfs、内核或整套包 / External system; no rootfs, kernel, or package distribution bundled |
 | **dikeckaan / mu300-linux** | E5 上游 VBC 音频转换器所注明的移植来源；[项目](https://github.com/dikeckaan/mu300-linux) | [MIT](LICENSES/MIT-mu300-linux.txt)，Copyright (c) 2026 dikeckaan | 仅致谢与来源引用，未收录转换器或其输出 / Attribution and source reference only; no converter or output bundled |
 | **TomKing062 / spreadtrum_flash** | 历史备份/刷写工具基线 [5da19929](https://github.com/TomKing062/spreadtrum_flash/tree/5da19929d60296ed8ba69d28a67b1bb234607320) | 该分支固定提交未核实到完整、清晰的授权文本 / No clear complete license grant verified for this fork at the cited revision | **仅引用，不分发**该分支 C/C++ 源码、二进制、Lib 或含其源码的大段补丁 / **Reference only**, excluded from source archive |
@@ -41,9 +42,18 @@ The archive index maps original paths to sanitized source files. Hash naming and
 
 ## 系统切换与屏幕功能的致谢 / System-switch and screen attribution
 
-E5 的上游启动控制 helper 是 Enceka 的 [`magisk/e5-linux-switch/bootctl.c`](https://github.com/Enceka/e5-linux/blob/569f13d4ce15585f70817c2a1e03bb574a84720b/magisk/e5-linux-switch/bootctl.c)。本机使用记录中的 helper 未修改，SHA-256 为 `a1e4e50e45ad0dfa2cb4342b5233cabac9ffe3a0fafcdeac82b58087b06dd575`；本仓库**不打包该二进制或本机绑定的安装 ZIP**。本项目补充本机身份/完整性检查、启动目标处理及操作流程记录；它没有从零重新开发 E5 的 Linux 适配和屏幕框架。
+E5 的上游启动控制 helper 是 Enceka 的 [`magisk/e5-linux-switch/bootctl.c`](https://github.com/Enceka/e5-linux/blob/569f13d4ce15585f70817c2a1e03bb574a84720b/magisk/e5-linux-switch/bootctl.c)。**2026-10-20 的旧方案记录**使用未修改 helper，SHA-256 为 `a1e4e50e45ad0dfa2cb4342b5233cabac9ffe3a0fafcdeac82b58087b06dd575`；这不代表后续 TF 方案的 helper 没有修改。新的 TF helper 在该 MIT 实现上增加本地检查与启动目标处理，继续保留 Enceka 署名。本仓库**不打包这些二进制或本机绑定的安装 ZIP**，也不把 E5 的 Linux 适配和屏幕框架宣称为本项目原创。
 
-The boot-control helper comes from Enceka's pinned `bootctl.c`. Its locally recorded binary was unchanged; this repository does not bundle that binary or the device-bound installation ZIP. Local contributions add identity/integrity checks, integration, and documented operation. The underlying E5 Linux adaptation and screen framework are credited to their upstream authors.
+The **2026-10-20 historical configuration** used Enceka's unchanged boot-control helper. The later TF helper modifies that MIT implementation and retains Enceka's attribution; the historical statement does not describe the newer helper. Neither binary nor device-bound installation ZIP is bundled. The underlying E5 Linux adaptation and screen framework remain credited to their upstream authors.
+
+## 新增 Android / TF 源码的具体边界 / New Android and TF source scope
+
+- `components/android-system-switch-ui` 的 Java/XML、进度状态协议、一次提交的后台工作者与 `ui-stream.c` 是本项目新增代码，按根 MIT 许可发布。它使用 Android AccessibilityService、窗口、前台服务和平台 `org.json` 等接口；没有复制 Android/AOSP 或厂商 SystemUI 实现，也没有使用或打包 libsu 库。Magisk 的 Action 源码和 libsu 曾用于行为研究，研究缓存不在公开导出内。菜单类名、资源 ID 和匹配条件是兼容性引用，不是复制厂商资源文件。
+- `components/tf-system-switch` 的 `bootctl.c` 派生自上述固定 Enceka helper；启动 `init` 的硬件、模块与 USB 初始化段参考同提交的 [`boot/init`](https://github.com/Enceka/e5-linux/blob/569f13d4ce15585f70817c2a1e03bb574a84720b/boot/init)。Android 模块与 Linux 切换入口沿用 e5-linux 的集成约定；新增 TF 身份、完整性、占用与只读保护逻辑为本地补充。保留的上游内容仍按 [Enceka MIT 原文](LICENSES/MIT-Enceka.txt)授权，不把派生文件笼统标为全部原创。
+- `tf-idle.c` 和 `ui-stream.c` 使用 libc、`/proc`、ioctl 与 Linux UAPI，未复制内核驱动或 BusyBox 实现。接口使用和复制内核源码是不同范围；参见 [Linux 官方 UAPI / syscall 许可说明](https://docs.kernel.org/process/license-rules.html)。运行环境的 GPL 软件继续保留自己的许可证。本次不发布静态链接 ELF，因而不把本地工具链及 libc 的二进制再分发当作已完成事项。
+- 两个目录均是经过脱敏和强制停用的参考源码。移除设备绑定并不会消除原有版权；停用也不等于可安全恢复为通用安装器。没有 SDK、签名密钥、APK、ELF、实际启动/根镜像、卡 CID/UUID、分区哈希清单或原始验收日志。公开源码的许可不授予这些未收录材料的使用或再分发权。
+
+The Android app and progress worker are original MIT code using platform APIs and an existing Magisk runtime. No AOSP/SystemUI implementation, libsu library, SDK or BusyBox implementation is copied into these components. Enceka's MIT notice also applies to retained boot-control code and hardware/init adaptations in the TF component. Local guards and observers are additions, not a relicensing of upstream work. Linux UAPI use does not imply inclusion of kernel implementation code. Both components are sanitized, disabled reference source; no installable APK/ELF, private binding, signed release, firmware or raw acceptance evidence is distributed.
 
 OpenClash 屏幕插件的四模式控制、节点选择与 HTTPS 延迟操作依据 [Mihomo API 文档](https://wiki.metacubex.one/en/api/)和 [GLOBAL 策略组文档](https://wiki.metacubex.one/en/config/proxy-groups/built-in/)，调用已有核心接口。本项目是独立的设备集成与记录仓库，不代表这些上游项目的官方发布。
 

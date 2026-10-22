@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#176B52</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:statusBarColor">#F5F7F5</item>
+        <item name="android:navigationBarColor">#F5F7F5</item>
+        <item name="android:windowActionModeOverlay">true</item>
+    </style>
+    <string name="accessibility_description">只识别系统电源菜单，显示返回 OpenWrt 的确认入口。不会自动切换，不读取其他应用内容或通知，不联网。可随时在此关闭。</string>
+</resources>
